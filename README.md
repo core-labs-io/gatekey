@@ -118,10 +118,11 @@ continue to work, but will not have rate limiting, caching, or shared state.
   genuinely shared pool across that team's users; a user's personal limit
   (if configured) is additive on top of it. Two behaviors: immediate reject
   or queue-and-retry (configurable per rule). Admin console lets Org Admins
-  manage rules org-wide and Team Leads manage their own team's rules.
-  **Known gap:** only `requests_per_min` is enforced live today —
-  `tokens_per_min` is stored/validated but not yet checked on the hot path
-  (see Known limitations below).
+  manage rules org-wide and Team Leads manage their own team's rules. Both
+  `requests_per_min` and `tokens_per_min` are enforced live on the hot path
+  (`tokens_per_min` via a pre-emptive gate on prior usage plus a
+  retrospective atomic true-up after the real response — see Known
+  limitations below for one remaining edge case).
 - **Caching** — exact-match response caching with configurable TTL, opt-in
   per team (`cache_enabled`, default off) with an org-level kill switch,
   respecting DLP and residency boundaries. Cache keys include team_id,
@@ -220,6 +221,54 @@ silently skipped DLP redaction/blocking for financial data (fixed — the label
 short-circuit now only affects routing, never the underlying scan), and a
 plaintext-at-rest webhook URL for Shadow AI's enforcement callback (fixed —
 now the same AES-256-GCM envelope every other secret in this codebase uses).
+
+## What's included (Custom Model Registry)
+
+A standalone feature (not tied to a specific phase doc) that lets an Org
+Admin add a BYOK model the day a provider ships it — no Gatekey code
+release or redeploy required. See
+`gatekey/custom-model-registry-product-spec.md` and
+`gatekey/custom-model-registry-technical-design.md` for the full spec/design.
+
+- **Register a custom model** — name, provider (OpenAI, Anthropic, Vertex
+  AI, or OpenRouter — not Ollama, which has its own self-hosted registration
+  mechanism above), the provider's native model id, capability (chat or
+  embeddings — embeddings only for OpenAI/Vertex AI, since Anthropic/
+  OpenRouter expose no embeddings API), and real admin-entered USD-per-
+  million-token pricing (input required; output required for chat, forbidden
+  for embeddings). No new credential is stored — it routes through the
+  BYOK key already on file for that provider.
+- **One-time live verification gate** — a custom model is unusable until an
+  Org Admin clicks "Test model," which fires exactly one minimal real call
+  against the provider using the existing key. Success marks it verified and
+  routable; failure surfaces the real provider error (never swallowed) so a
+  typo is diagnosable immediately. Editing the native model id, provider, or
+  capability resets verified back to false. Never charges budget or writes a
+  usage-log row itself.
+- **Fully wired into the existing pipeline** — once verified, a custom model
+  is selectable in the org's Model Policy checklist (new "Custom" group) and
+  a team's model restrictions, appears in the end-user Model Access view,
+  and its cost is computed from its own real per-token rate (not an
+  estimate) into the same budget/dashboard figures every BYOK model uses. A
+  custom model rides its provider's existing Phase 4 failover/backup-group
+  support automatically.
+- **Shadowing detection** — if a later Gatekey release adds a static
+  registry model with the same name as an already-registered custom model,
+  the static entry always wins at request time (never a silent mix-up), an
+  `ERROR`-level log fires at startup naming the org and model, and the admin
+  console shows a "Shadowed by registry update" badge on the affected row.
+  No auto-remediation — the admin renames or removes it manually, matching
+  this codebase's existing "flag, never silently auto-resolve" convention.
+
+**Security review.** Passed a dedicated mandatory security review — see
+`backend/docs/design/custom-model-registry-security-review.md` — which
+independently reproduced and required fixes for two real issues found
+during implementation: a cross-table race condition in the name-collision
+guard between custom and self-hosted models (fixed via a row lock), and a
+resulting deadlock discovery between that lock and a pre-existing,
+differently-ordered lock in the org-settings endpoint (fixed codebase-wide,
+not just for this feature — see the review doc for the full list of
+endpoints that needed reordering).
 
 ## Repository layout
 
@@ -614,6 +663,18 @@ personal screens listed under "Non-admin console" never appear for it).
   policy. Org Admin (full) and Auditor (read-only) see the org-wide view; a
   Team Lead sees an own-team-scoped equivalent under "My Team."
 
+### Custom Model Registry Admin Screens
+
+- **Providers** (extended) — a new "Custom Models" card to register/edit/
+  remove/test a BYOK custom model (name, provider, native model id,
+  capability, pricing, verified badge + "Test model" button, "Shadowed by
+  registry update" warning badge). Org Admin full CRUD + verify; Auditor
+  read-only; not shown to Team Lead/Member.
+- **Model Policy** (extended) — a new "Custom" group in the allow/denylist
+  checklist, sourced from registered custom models; only verified models are
+  selectable (unverified ones show disabled with a "re-verify on Providers"
+  link).
+
 ## Non-admin console
 
 SSO sessions whose user is *not* an Org Admin get a role-appropriate nav
@@ -814,11 +875,19 @@ these (the UI hiding a control is never the only guard).
 - **Health checks are active synthetic checks**, not passive/traffic-derived
   — a scheduled job makes a real test request to each provider (using the
   key's real decrypted credential) every 5 minutes and records the result.
-- **`tokens_per_min` rate limiting is configured/validated but not yet
-  enforced** on the live request path — only `requests_per_min` is actually
-  checked per request today. This is a cost-shaping/availability gap, not a
-  budget-bypass risk: the existing hard budget-exhaustion cutoff still
-  applies regardless of rate-limit configuration.
+- ~~`tokens_per_min` rate limiting is configured/validated but not yet
+  enforced~~ **Closed** (hardening pass) — now genuinely enforced on the
+  live path via a pre-emptive gate on real prior usage plus a retrospective
+  atomic true-up (a Redis Lua script) once the real response's token count
+  is known. Remaining caveat: the atomic per-minute concurrency-safety bound
+  only holds when `requests_per_min` is *also* configured on the same rule —
+  a token-only rule (legal under the current schema) has no atomic
+  per-minute request-count gate, so its burst-overshoot exposure isn't
+  bounded the way the design intends. Set a `requests_per_min` value
+  alongside any `tokens_per_min` rule until this is tightened further. This
+  is a cost-shaping/availability gap either way, not a budget-bypass risk:
+  the hard budget-exhaustion cutoff always applies regardless of rate-limit
+  configuration.
 - **Rate-limit queue depth (for `queue_and_retry` teams) is not tracked or
   exposed** in the admin console — the live queue-and-retry path polls
   in-process rather than using a persisted, inspectable queue.
@@ -888,12 +957,13 @@ these (the UI hiding a control is never the only guard).
   PII detection. Gatekey does not call out to Microsoft Purview's or Google
   DLP's own classification APIs — the sensitivity-label mapping only trusts
   a caller-supplied label string your own tooling has already computed.
-- **Shadow AI's optional free-form ingestion metadata field has no size
-  limit enforced at the schema level** — the primary data-minimization
-  control (the destination-hostname allowlist) is unaffected, but this one
-  optional field's "connection metadata only" scope is a documented
-  convention for now, not a technically enforced one. Requires an
-  already-valid, org-issued ingestion token to exploit.
+- ~~Shadow AI's optional free-form ingestion metadata field has no size
+  limit enforced at the schema level~~ **Closed** (hardening pass) — a
+  4096-byte serialized-size cap is now enforced on `raw_metadata` at
+  request-validation time (a clean 422, never a silent truncation), so the
+  "connection metadata only" claim in
+  `backend/docs/policy/shadow-ai-data-handling.md` §2 is technically
+  enforced, not just a documented convention.
 - **Shadow AI detects via SASE/proxy-log ingestion only** — no browser
   extension in this release (deferred per the phase's own stated default,
   pending confirmation that a real design partner's security stack doesn't
@@ -902,9 +972,12 @@ these (the UI hiding a control is never the only guard).
   notification email and/or an outbound webhook your own SASE/SOAR tooling
   can act on, not Gatekey intercepting traffic itself (architecturally
   impossible from a passive log-ingestion detection mechanism).
-- **No per-self-hosted-endpoint cost/usage breakdown endpoint** — the admin
-  console shows an org-wide aggregate across all self-hosted endpoints
-  combined (clearly labeled as such), not a true per-endpoint figure.
+- ~~No per-self-hosted-endpoint cost/usage breakdown endpoint~~ **Closed**
+  (hardening pass) — `GET /v1/admin/self-hosted-providers/{id}/usage`
+  returns a real per-endpoint breakdown (requests/cost/latency), built on
+  the existing `usage_logs.self_hosted_provider_id` column and independently
+  verified to never cross-contaminate two different endpoints' figures or
+  BYOK traffic.
 - **"Validate demand before building all five" (the phase doc's own stated
   success criterion) was not run as a real exercise in this build** — all
   five sub-features were built per an explicit instruction to do so, using
@@ -913,6 +986,29 @@ these (the UI hiding a control is never the only guard).
   A real prioritization/feedback pass with actual pilot orgs remains a
   genuinely open, valuable next step, not something this build substitutes
   for.
+
+### Custom Model Registry
+
+- **No auto-discovery from a provider's own list-models API.** The admin
+  types the native model id by hand — deliberate, matching the static
+  registry's own "not a mirror" philosophy, not a v2 candidate.
+- **`ollama` is out of scope for this feature.** Ollama has its own,
+  separate, already-editable mechanism (register the model under an
+  existing Self-Hosted endpoint's model list instead).
+- **No org-vs-team scoping, no bulk import, no tiered pricing, no scheduled
+  re-verification, no price-staleness auto-detection, no versioning/
+  deprecation workflow** — one flat model at a time, one flat per-token rate
+  pair, manual on-demand verification only, admin fully responsible for
+  keeping the entered rate current, removal is a hard delete. All deliberate
+  v1 simplifications matching this codebase's existing patterns for the
+  identical tradeoffs elsewhere (e.g. self-hosted models' identical set of
+  simplifications).
+- **A downgrade/degradation policy configured to fall back to a custom (or
+  self-hosted) model name will fail rather than degrade** — the
+  degradation-target resolution path doesn't yet thread the custom-model or
+  self-hosted caches through. Pre-existing gap shared identically with
+  self-hosted models, not introduced or worsened by this feature; fails
+  closed (breaks the degradation attempt cleanly, never misroutes).
 
 ## Non-negotiables carried through these phases
 
