@@ -69,6 +69,7 @@ from gatekey.api.deps import (
     get_access_schedule_cache,
     get_caching_settings_cache,
     get_content_aware_rule_cache,
+    get_custom_model_route_cache,
     get_db_session,
     get_degradation_policy_cache,
     get_dlp_analyzer_engine,
@@ -130,6 +131,11 @@ from gatekey.services.degradation import DegradationPolicyCache
 from gatekey.services.encryption import KeyProvider
 from gatekey.services.model_policy import ContentAwareRuleCache, ModelPolicyCache, TeamModelPolicyCache
 from gatekey.services.provider_key_health import TeamFailoverOverrideCache
+from gatekey.services.custom_models import (
+    CustomModelCacheEntry,
+    CustomModelRouteCache,
+    compute_custom_model_cost,
+)
 from gatekey.services.rate_limit import RateLimitCache
 from gatekey.services.residency import ResidencyRuleCache
 from gatekey.services.response_cache import CachingSettingsCache, ResponseCache
@@ -250,6 +256,16 @@ async def _sse_event_stream(
     background_tasks: BackgroundTasks | None = None,
     self_hosted_provider_id: uuid.UUID | None = None,
     self_hosted_cost_basis_per_gpu_hour: Decimal | None = None,
+    # CMR-4 (Custom Model Registry): mirrors `self_hosted_cost_basis_per_
+    # gpu_hour` above - captured ONCE at the call site (never re-read from
+    # the cache again here), `None` for every non-custom-model request.
+    # Unlike self-hosted's cost basis, this carries the WHOLE cache entry
+    # (not just a single scalar) because `compute_custom_model_cost()` needs
+    # both `input_price_per_million_usd` and `output_price_per_million_usd`.
+    custom_model_cache_entry: CustomModelCacheEntry | None = None,
+    org_id: uuid.UUID | None = None,
+    rate_limit_store: SharedStateStore | None = None,
+    rate_limit_cache: RateLimitCache | None = None,
 ) -> AsyncIterator[bytes]:
     disconnected = False
     result_status = "ok"
@@ -320,6 +336,18 @@ async def _sse_event_stream(
                                 self_hosted_cost_basis_per_gpu_hour,
                                 wall_clock_latency_seconds=wall_clock_latency_seconds,
                             )
+                        elif custom_model_cache_entry is not None:
+                            # CMR-4: real per-token pricing (never the
+                            # self-hosted GPU-hour proxy) - mutually
+                            # exclusive with the branch above by
+                            # construction (technical design doc section
+                            # 2.2: a route can never have both `self_hosted_
+                            # provider_id` and `custom_model_id` set).
+                            precomputed_cost_usd = compute_custom_model_cost(
+                                custom_model_cache_entry,
+                                prompt_tokens=captured_usage.prompt_tokens,
+                                completion_tokens=captured_usage.completion_tokens,
+                            )
                         charge = await record_usage_charge(
                             session,
                             user_id=user_id,
@@ -334,6 +362,9 @@ async def _sse_event_stream(
                             background_tasks=background_tasks,
                             app=request.app if background_tasks is not None else None,
                             precomputed_cost_usd=precomputed_cost_usd,
+                            org_id=org_id,
+                            rate_limit_store=rate_limit_store,
+                            rate_limit_cache=rate_limit_cache,
                         )
                         cost_usd = charge.cost
                     except Exception:
@@ -429,6 +460,7 @@ async def create_chat_completion(
     caching_settings_cache: CachingSettingsCache = Depends(get_caching_settings_cache),
     degradation_policy_cache: DegradationPolicyCache = Depends(get_degradation_policy_cache),
     self_hosted_cache: SelfHostedModelRouteCache = Depends(get_self_hosted_model_route_cache),
+    custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     sensitivity_label: str | None = Header(default=None, alias="X-Gatekey-Sensitivity-Label"),
 ) -> ChatCompletionResponse | StreamingResponse:
@@ -474,9 +506,14 @@ async def create_chat_completion(
         # Phase 5 (5.5, AC5.5.4): `chat.py` is the ONLY gateway route that
         # ever passes `self_hosted_cache` here - see `resolve_route()`'s
         # docstring for why that's what structurally enforces "self-hosted
-        # models are chat-completions only" (completions.py/embeddings.py
-        # call `resolve_route(body.model)` with no second argument, unchanged).
-        route = resolve_route(body.model, self_hosted_cache)
+        # models are chat-completions only" (completions.py never passes
+        # either cache, unchanged - see its own module docstring note).
+        # CMR-4 (Custom Model Registry): keyword arguments, deliberately -
+        # `resolve_route()`'s docstring/technical design doc section 2.2
+        # flag the positional-argument hazard this avoids.
+        route = resolve_route(
+            body.model, self_hosted_cache=self_hosted_cache, custom_model_cache=custom_model_cache
+        )
         provider_for_log = route.provider
         self_hosted_provider_id_for_log = route.self_hosted_provider_id
         # Phase 5 (5.5): the self-hosted route's cost basis, captured ONCE
@@ -485,6 +522,14 @@ async def create_chat_completion(
         # non-self-hosted request.
         self_hosted_route_entry = (
             self_hosted_cache.get(body.model) if route.provider == "self_hosted" else None
+        )
+        # CMR-4: mirrors `self_hosted_route_entry` above, captured ONCE here
+        # - the sole discriminator is `route.custom_model_id is not None`
+        # (never `route.provider`, per the technical design doc section
+        # 2.2/8.1 flag 4 - a provider-string check would silently misfire
+        # against a static route to the same provider).
+        custom_model_route_entry = (
+            custom_model_cache.get(body.model) if route.custom_model_id is not None else None
         )
         check_model_policy(body.model, cache, team_cache, ctx.team_id)
         if route.capability != ModelCapability.CHAT:
@@ -688,6 +733,7 @@ async def create_chat_completion(
                     original_model=degradation_outcome.original_model,
                     idempotency_key=idempotency_key,
                     session=session,
+                    org_id=ctx.org_id,
                     user_id=ctx.user_id,
                     team_id=ctx.team_id,
                     service_account_key_id=service_account_key_id,
@@ -704,6 +750,16 @@ async def create_chat_completion(
                         if effective_route.provider == "self_hosted" and self_hosted_route_entry is not None
                         else None
                     ),
+                    # CMR-4: `effective_route.custom_model_id` (never
+                    # `.provider`) is the sole discriminator - see
+                    # `resolve_route()`'s docstring.
+                    custom_model_cache_entry=(
+                        custom_model_route_entry
+                        if effective_route.custom_model_id is not None
+                        else None
+                    ),
+                    rate_limit_store=shared_state_store,
+                    rate_limit_cache=rate_limit_cache,
                 ),
                 media_type="text/event-stream",
                 headers=response_headers,
@@ -764,6 +820,17 @@ async def create_chat_completion(
                 self_hosted_route_entry.cost_basis_per_gpu_hour,
                 wall_clock_latency_seconds=wall_clock_latency_seconds,
             )
+        elif effective_route.custom_model_id is not None and custom_model_route_entry is not None:
+            # CMR-4 (Custom Model Registry): real per-token pricing from the
+            # admin-entered rates, never an estimate - `custom_model_id`
+            # (never `.provider`) is the sole discriminator (technical
+            # design doc section 2.2/8.1 flag 4), mutually exclusive with
+            # the self-hosted branch above by construction.
+            precomputed_cost_usd = compute_custom_model_cost(
+                custom_model_route_entry,
+                prompt_tokens=provider_response.usage.prompt_tokens,
+                completion_tokens=provider_response.usage.completion_tokens,
+            )
         try:
             charge = await record_usage_charge(
                 session,
@@ -775,6 +842,9 @@ async def create_chat_completion(
                 background_tasks=background_tasks,
                 app=request.app,
                 precomputed_cost_usd=precomputed_cost_usd,
+                org_id=ctx.org_id,
+                rate_limit_store=shared_state_store,
+                rate_limit_cache=rate_limit_cache,
             )
             cost_usd = charge.cost
         except PricingEntryMissingError:

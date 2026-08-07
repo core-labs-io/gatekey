@@ -8,31 +8,41 @@
  * only VERIFIED endpoints' models are selectable (an unverified endpoint's
  * models are never in `SelfHostedModelRouteCache`, so the backend would
  * reject them as unknown - AC5.5.6/design doc section 2.3(d)).
+ *
+ * CMR-11 (Custom Model Registry technical design section 5, row 25): the
+ * checklist also gains a "Custom" group sourced from `listCustomModels()` -
+ * same only-verified-is-selectable rule as Self-Hosted, but rendered as a
+ * flat list since custom models aren't grouped by endpoint. A
+ * `shadowed_by_registry: true` model gets the same red "Shadowed" badge
+ * used on the Providers screen's Custom Models card, for visual consistency.
  */
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { ConsoleShell } from "@/components/ConsoleShell";
-import { useToast } from "@/components/ui";
+import { Badge, useToast } from "@/components/ui";
 import {
   ApiError,
   getModelPolicy,
+  listCustomModels,
   listSelfHostedProviders,
   MODELS_BY_PROVIDER,
   PROVIDER_LABELS,
   putModelPolicy,
+  type CustomModelResponse,
   type ModelPolicyMode,
   type ProviderName,
   type SelfHostedProviderResponse,
 } from "@/lib/api";
 
-const PROVIDERS: ProviderName[] = ["openai", "anthropic", "vertex_ai"];
+const PROVIDERS: ProviderName[] = ["openai", "anthropic", "vertex_ai", "ollama", "openrouter"];
 
 export default function ModelPolicyPage() {
   const toast = useToast();
   const [mode, setMode] = useState<ModelPolicyMode>("unconfigured");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selfHostedProviders, setSelfHostedProviders] = useState<SelfHostedProviderResponse[]>([]);
+  const [customModels, setCustomModels] = useState<CustomModelResponse[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -40,11 +50,12 @@ export default function ModelPolicyPage() {
 
   useEffect(() => {
     setLoading(true);
-    Promise.all([getModelPolicy(), listSelfHostedProviders()])
-      .then(([res, providers]) => {
+    Promise.all([getModelPolicy(), listSelfHostedProviders(), listCustomModels()])
+      .then(([res, providers, custom]) => {
         setMode(res.mode);
         setSelected(new Set(res.models));
         setSelfHostedProviders(providers);
+        setCustomModels(custom);
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load model policy."))
       .finally(() => setLoading(false));
@@ -55,6 +66,19 @@ export default function ModelPolicyPage() {
       const next = new Set(prev);
       if (next.has(model)) next.delete(model);
       else next.add(model);
+      return next;
+    });
+    setDirty(true);
+  }
+
+  function toggleGroup(models: string[]) {
+    const allSelected = models.every((model) => selected.has(model));
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const model of models) {
+        if (allSelected) next.delete(model);
+        else next.add(model);
+      }
       return next;
     });
     setDirty(true);
@@ -149,7 +173,19 @@ export default function ModelPolicyPage() {
 
             {PROVIDERS.map((provider) => (
               <div className="model-group" key={provider}>
-                <div className="model-group-title">{PROVIDER_LABELS[provider]}</div>
+                <div className="model-group-title">
+                  {PROVIDER_LABELS[provider]}
+                  <label className="model-checkbox" style={{ display: "inline-flex", marginLeft: 12, fontWeight: "normal" }}>
+                    <input
+                      type="checkbox"
+                      checked={MODELS_BY_PROVIDER[provider].every((model) => selected.has(model))}
+                      onChange={() => toggleGroup(MODELS_BY_PROVIDER[provider])}
+                      disabled={mode === "unconfigured"}
+                      style={{ width: "auto" }}
+                    />
+                    select all
+                  </label>
+                </div>
                 <div className="model-checkbox-grid">
                   {MODELS_BY_PROVIDER[provider].map((model) => (
                     <label className="model-checkbox" key={model}>
@@ -179,7 +215,18 @@ export default function ModelPolicyPage() {
                           - not verified yet, re-verify on{" "}
                           <Link href="/providers">Providers</Link> before adding these models
                         </span>
-                      ) : null}
+                      ) : (
+                        <label className="model-checkbox" style={{ display: "inline-flex", marginLeft: 12 }}>
+                          <input
+                            type="checkbox"
+                            checked={p.models.every((model) => selected.has(model))}
+                            onChange={() => toggleGroup(p.models)}
+                            disabled={mode === "unconfigured"}
+                            style={{ width: "auto" }}
+                          />
+                          select all
+                        </label>
+                      )}
                     </div>
                     <div className="model-checkbox-grid">
                       {p.models.map((model) => (
@@ -197,6 +244,64 @@ export default function ModelPolicyPage() {
                     </div>
                   </div>
                 ))}
+              </div>
+            ) : null}
+
+            {/* Phase CMR-11: flat "Custom" group sourced from listCustomModels() -
+                unlike Self-Hosted (grouped by endpoint), custom models are each
+                individually named/verified, so verification state is shown
+                per-checkbox rather than per-group. Only verified: true models
+                are selectable (an unverified custom model's name is never
+                accepted by PUT /v1/admin/model-policy, same rejection reason
+                self-hosted's unverified models get) - shown disabled with an
+                explanatory note rather than omitted, matching the Self-Hosted
+                group's existing convention above for a consistent pattern. */}
+            {customModels.length > 0 ? (
+              <div className="model-group">
+                <div className="model-group-title">
+                  Custom
+                  <label className="model-checkbox" style={{ display: "inline-flex", marginLeft: 12, fontWeight: "normal" }}>
+                    <input
+                      type="checkbox"
+                      checked={
+                        customModels.some((m) => m.verified) &&
+                        customModels.filter((m) => m.verified).every((m) => selected.has(m.name))
+                      }
+                      onChange={() => toggleGroup(customModels.filter((m) => m.verified).map((m) => m.name))}
+                      disabled={mode === "unconfigured" || !customModels.some((m) => m.verified)}
+                      style={{ width: "auto" }}
+                    />
+                    select all
+                  </label>
+                </div>
+                <div className="model-checkbox-grid">
+                  {customModels.map((m) => (
+                    <label className="model-checkbox" key={m.id}>
+                      <input
+                        type="checkbox"
+                        checked={selected.has(m.name)}
+                        onChange={() => toggleModel(m.name)}
+                        disabled={mode === "unconfigured" || !m.verified}
+                        style={{ width: "auto" }}
+                      />
+                      {m.name}
+                      {!m.verified ? (
+                        <span className="text-muted" style={{ fontFamily: "var(--sans)", fontSize: 12, fontWeight: "normal" }}>
+                          {" "}
+                          - not verified yet, re-verify on <Link href="/providers">Providers</Link>
+                        </span>
+                      ) : null}
+                      {m.shadowed_by_registry ? (
+                        <Badge
+                          tone="red"
+                          title="A newer Gatekey release now defines this same model name - live requests route to that static entry, not this custom mapping."
+                        >
+                          Shadowed
+                        </Badge>
+                      ) : null}
+                    </label>
+                  ))}
+                </div>
               </div>
             ) : null}
 

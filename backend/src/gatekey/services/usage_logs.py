@@ -409,3 +409,73 @@ async def get_phase4_dashboard_metrics(
         cost_saved_total_usd=cost_saved_caching_usd + cost_saved_degradation_usd,
     )
 
+
+# ============================================================================
+# Hardening pass item 6: per-self-hosted-endpoint usage/cost breakdown
+# (Phase 5 technical design's API-contract table named `GET /v1/admin/
+# self-hosted-providers/{id}/usage` - requests/estimated-cost/avg-latency per
+# endpoint - but it was never built; only the org-wide `provider=self_hosted`
+# aggregate on `get_usage_summary`/`get_phase4_dashboard_metrics` above
+# existed). `usage_logs.self_hosted_provider_id` (migration 0040) is already
+# sufficient - a plain `GROUP BY`-free single-provider filter, no new
+# migration needed.
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class SelfHostedProviderUsage:
+    self_hosted_provider_id: uuid.UUID
+    total_requests: int
+    total_estimated_cost_usd: Decimal
+    avg_latency_ms: float
+
+
+async def get_self_hosted_provider_usage(
+    session: AsyncSession,
+    self_hosted_provider_id: uuid.UUID,
+    *,
+    since: datetime,
+    until: datetime,
+) -> SelfHostedProviderUsage:
+    """Aggregate `usage_logs` for exactly one self-hosted endpoint
+    (`self_hosted_provider_id`, migration 0040) over `[since, until)` -
+    same half-open-interval/single-`GROUP BY`-free-totals-query convention
+    as `get_usage_summary`'s own totals query above.
+
+    `total_estimated_cost_usd` sums `usage_logs.cost_usd` - the SAME column
+    BYOK providers use, populated for self-hosted requests via `providers.
+    pricing.compute_self_hosted_cost()`'s `cost_basis_per_gpu_hour *
+    (wall_clock_latency_seconds / 3600)` estimate (see `api.v1.gateway.
+    common.record_usage_charge`'s `precomputed_cost_usd` parameter and
+    `db.models.usage_log`'s `self_hosted_provider_id` docstring) - this
+    function does not itself re-derive or re-estimate anything, it only
+    aggregates already-recorded figures. Callers (the admin endpoint) are
+    responsible for labeling this total "estimated" in the UI, matching
+    every other self-hosted cost figure in this codebase (AC5.5.7).
+
+    No `org_id` filter here (unlike `get_usage_summary`) - `self_hosted_
+    provider_id` alone already uniquely scopes to one org's endpoint (a
+    `SelfHostedProvider` row belongs to exactly one org, `DEFAULT_ORG_ID` in
+    this codebase's single-org model - see `services.self_hosted_providers`'
+    module docstring), and the caller (`api/v1/admin/self_hosted_providers.py`)
+    already 404s on an unknown/foreign `self_hosted_provider_id` before ever
+    reaching this function.
+    """
+    base_filter = [
+        UsageLog.self_hosted_provider_id == self_hosted_provider_id,
+        UsageLog.created_at >= since,
+        UsageLog.created_at < until,
+    ]
+    totals_stmt = select(
+        func.count(UsageLog.id),
+        func.coalesce(func.sum(UsageLog.cost_usd), 0),
+        func.coalesce(func.avg(UsageLog.latency_ms), 0),
+    ).where(*base_filter)
+    totals_row = (await session.execute(totals_stmt)).one()
+    return SelfHostedProviderUsage(
+        self_hosted_provider_id=self_hosted_provider_id,
+        total_requests=int(totals_row[0] or 0),
+        total_estimated_cost_usd=Decimal(totals_row[1] or 0),
+        avg_latency_ms=float(totals_row[2] or 0),
+    )
+

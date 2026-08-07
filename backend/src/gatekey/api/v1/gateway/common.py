@@ -111,6 +111,7 @@ from gatekey.services import response_cache as response_cache_service
 from gatekey.services import team_periods
 from gatekey.services.access_schedules import AccessScheduleCache
 from gatekey.services.audit import write_audit_entry
+from gatekey.services.custom_models import CustomModelRouteCache
 from gatekey.services.emergency_overrides import get_active_override
 from gatekey.services.model_policy import (
     ContentAwareRuleCache,
@@ -148,13 +149,18 @@ MAX_IDEMPOTENCY_KEY_LENGTH = 255
 
 
 def resolve_route(
-    model: str, self_hosted_cache: SelfHostedModelRouteCache | None = None
+    model: str,
+    self_hosted_cache: SelfHostedModelRouteCache | None = None,
+    *,
+    custom_model_cache: CustomModelRouteCache | None = None,
 ) -> ModelRoute:
     """Resolve `model` to a `ModelRoute`.
 
     The static `MODEL_REGISTRY` lookup (`resolve_model`) is ALWAYS tried
-    first, unconditionally - a self-hosted model id can never shadow an
-    existing static route (design doc section 7.3's edge-case table).
+    first, unconditionally - neither a self-hosted model id nor a custom
+    model name can ever shadow an existing static route (design doc section
+    7.3's edge-case table; Custom Model Registry technical design doc
+    section 2.1 guard #1's "static always wins, provably" NFR).
 
     Phase 5 (5.5, AC5.5.5): only when that lookup fails AND `self_hosted_
     cache` is not `None` does this fall back to an O(1), zero-I/O dict
@@ -167,11 +173,35 @@ def resolve_route(
     through to the same `ModelNotFoundError` as any other unknown model.
 
     `self_hosted_cache=None` (the default) is BYTE-FOR-BYTE the pre-Phase-5
-    behavior - `api/v1/gateway/completions.py`/`embeddings.py` call this
-    with no second argument at all, which is what structurally enforces
-    AC5.5.4's "self-hosted models are chat-completions only" constraint at
-    the call-site level, not just as a downstream capability check (only
-    `api/v1/gateway/chat.py` ever passes a real cache here).
+    behavior - `api/v1/gateway/completions.py` calls this with no cache
+    arguments at all, which is what structurally enforces AC5.5.4's
+    "self-hosted models are chat-completions only" constraint at the
+    call-site level, not just as a downstream capability check (only
+    `api/v1/gateway/chat.py` ever passes a real `self_hosted_cache` here).
+
+    Custom Model Registry (Admin-Managed BYOK Models, CMR-4): when that
+    static lookup fails AND `custom_model_cache` is not `None`, this ALSO
+    tries an O(1), zero-I/O dict lookup in the (pre-warmed)
+    `CustomModelRouteCache` - checked before the self-hosted fallback below
+    (the technical design doc's section 5 row 6 documents this ordering as
+    immaterial in practice, since the two caches' key sets are disjoint by
+    construction via the bidirectional collision guards in
+    `services.custom_models`/`services.self_hosted_providers` - a name can
+    never legitimately be present in both). If found, the resulting
+    `ModelRoute` carries the row's REAL BYOK `provider` value (never a
+    sentinel - see `ModelRoute.custom_model_id`'s own docstring) and the
+    row's OWN `capability` (not hardcoded `CHAT`) - this is what lets this
+    one fallback correctly serve both `chat.py` (capability=chat models)
+    and `embeddings.py` (capability=embeddings models) without either call
+    site needing a capability-specific variant. Every entry in the cache is,
+    by construction, already `verified = true` (see `CustomModelRouteCache`'s
+    own docstring), so an unverified custom model looks identical to an
+    unknown one from here, exactly mirroring the self-hosted precedent.
+    `custom_model_cache=None` (the default) is BYTE-FOR-BYTE pre-CMR-4
+    behavior - `api/v1/gateway/completions.py` never passes this, which is
+    the structural enforcement of the product spec's "custom models are
+    never routable at `/v1/completions`" non-goal (technical design doc
+    section 2.2/section 5 row 9).
 
     Raises `errors.ModelNotFoundError` (404) if `model` isn't registered -
     see `UnknownModelError`'s docstring for why the model name is safe to
@@ -181,6 +211,15 @@ def resolve_route(
     try:
         return resolve_model(model)
     except UnknownModelError as exc:
+        if custom_model_cache is not None:
+            custom_entry = custom_model_cache.get(model)
+            if custom_entry is not None:
+                return ModelRoute(
+                    provider=custom_entry.provider,
+                    capability=custom_entry.capability,
+                    native_model_id=custom_entry.native_model_id,
+                    custom_model_id=custom_entry.id,
+                )
         if self_hosted_cache is not None:
             entry = self_hosted_cache.get(model)
             if entry is not None:
@@ -978,6 +1017,9 @@ async def record_usage_charge(
     background_tasks: BackgroundTasks | None = None,
     app: FastAPI | None = None,
     precomputed_cost_usd: Decimal | None = None,
+    org_id: uuid.UUID | None = None,
+    rate_limit_store: SharedStateStore | None = None,
+    rate_limit_cache: rate_limit_service.RateLimitCache | None = None,
 ) -> budget_service.ChargeResult:
     """Charge the caller for actual provider-reported usage on `model`
     (Phase 1.4; Phase 2 team-aware).
@@ -1011,6 +1053,18 @@ async def record_usage_charge(
     `BackgroundTasks`, running only after the response has been sent. Both
     None (legacy callers/tests) = detection skipped, charge unchanged.
 
+    Hardening pass item 4 (AC4.2.4's post-response `tokens_per_min`
+    accounting - see `services.rate_limit.record_token_usage()`'s docstring
+    for the full mechanic/rationale): this is ALSO the single shared choke
+    point that wiring lives, for the identical reason BD-18's threshold
+    check does. `org_id`/`rate_limit_store`/`rate_limit_cache`, when ALL
+    THREE are provided (every real gateway route handler passes them; only
+    legacy/unit-test callers that construct this function directly may
+    omit them), increment the caller's token-rate-limit counter(s) by
+    `prompt_tokens + (completion_tokens or 0)` AFTER the charge succeeds.
+    Any one missing = skipped entirely, byte-for-byte pre-item-4 behavior -
+    never a partial/best-guess accounting attempt.
+
     Call this ONLY after a provider response with confirmed, complete usage
     has been received - see each gateway route handler for exactly where.
     `model` MUST be the exact same string already passed to
@@ -1031,20 +1085,32 @@ async def record_usage_charge(
             completion_tokens=completion_tokens,
             precomputed_cost_usd=precomputed_cost_usd,
         )
-        return budget_service.ChargeResult(cost=cost)
-    result = await budget_service.record_team_membership_usage_charge(
-        session,
-        team_id=team_id,
-        user_id=user_id,
-        model=model,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        precomputed_cost_usd=precomputed_cost_usd,
-    )
-    if background_tasks is not None and app is not None:
-        notifiers.schedule_threshold_alerts(
-            background_tasks, app, team_id=team_id, charge=result
+        result = budget_service.ChargeResult(cost=cost)
+    else:
+        result = await budget_service.record_team_membership_usage_charge(
+            session,
+            team_id=team_id,
+            user_id=user_id,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            precomputed_cost_usd=precomputed_cost_usd,
         )
+        if background_tasks is not None and app is not None:
+            notifiers.schedule_threshold_alerts(
+                background_tasks, app, team_id=team_id, charge=result
+            )
+
+    if org_id is not None and rate_limit_store is not None and rate_limit_cache is not None:
+        await rate_limit_service.record_token_usage(
+            rate_limit_store,
+            rate_limit_cache,
+            org_id=org_id,
+            team_id=team_id,
+            user_id=user_id,
+            total_tokens=prompt_tokens + (completion_tokens or 0),
+        )
+
     return result
 
 
@@ -1164,7 +1230,16 @@ async def check_rate_limit(
 def build_rate_limit_headers(decision: rate_limit_service.RateLimitDecision) -> dict[str, str]:
     """AC4.2.6/AC4.2.7: attached on EVERY request a rule applied to,
     limited or not - real sliding-window values, never estimates. Empty
-    when no rule was configured at all (`decision.configured=False`)."""
+    when no rule was configured at all (`decision.configured=False`).
+
+    Hardening pass item 4: this header shape stays exactly as it always
+    was (one generic `remaining`/`limit` pair, not per-counter-type
+    fields) - `decision` may now be EITHER a requests-axis or a
+    tokens-axis decision (whichever `services.rate_limit.check_and_
+    consume_rate_limit()` determined was closer to its own limit, when
+    both axes are configured - see that function's `_headroom_fraction()`
+    docstring), rather than always a requests-axis decision. No new
+    header contract was introduced for this."""
     if not decision.configured:
         return {}
     return {

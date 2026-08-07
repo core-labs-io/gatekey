@@ -716,24 +716,35 @@ _WINDOW_SECONDS = 60
 
 
 def _pool_rate_limit_key(
-    pool_rule: RateLimitRuleLike, team_id: uuid.UUID | None, user_id: uuid.UUID | None
+    pool_rule: RateLimitRuleLike,
+    team_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    *,
+    counter_type: str = "requests",
 ) -> str:
     """Resolve the Redis key for the (already-resolved) pool rule - see
     module note above for why this branches on `pool_rule.scope_type`
     rather than using one shape for every pool rule. `user_id` is only
     actually used (and must be non-`None`) for the ORG_DEFAULT_PER_USER
-    branch - the TEAM branch ignores it entirely (the whole point of Fix 2)."""
+    branch - the TEAM branch ignores it entirely (the whole point of Fix 2).
+
+    Hardening pass item 4: `counter_type` (`"requests"` default, or
+    `"tokens"`) selects which of the two independently-tracked counters this
+    key addresses - same key-format convention as `_rate_limit_key()`'s own
+    `counter_type` segment above, just applied to the pool/personal key
+    shapes `check_and_consume_rate_limit()` actually uses on the live path.
+    """
     if pool_rule.scope_type == RateLimitScopeType.TEAM:
         assert team_id is not None  # a TEAM-scoped rule is only ever resolved when team_id is set
-        return f"rate_limit:v1:pool:team:{team_id}:requests:1m"
+        return f"rate_limit:v1:pool:team:{team_id}:{counter_type}:1m"
     # ORG_DEFAULT_PER_USER - explicitly a per-user default, not a shared
     # org-wide pool (only the TEAM scope claims to be shared - see above).
     assert user_id is not None
-    return f"rate_limit:v1:pool:org:{user_id}:requests:1m"
+    return f"rate_limit:v1:pool:org:{user_id}:{counter_type}:1m"
 
 
-def _personal_rate_limit_key(user_id: uuid.UUID) -> str:
-    return f"rate_limit:v1:user:{user_id}:requests:1m"
+def _personal_rate_limit_key(user_id: uuid.UUID, *, counter_type: str = "requests") -> str:
+    return f"rate_limit:v1:user:{user_id}:{counter_type}:1m"
 
 
 async def load_effective_rate_limit_rules(
@@ -800,6 +811,25 @@ _UNCONFIGURED_DECISION = RateLimitDecision(
 )
 
 
+def _headroom_fraction(decision: RateLimitDecision) -> float:
+    """`remaining / limit` - used ONLY to pick which of several simultaneously-
+    PASSING decisions (Hardening pass item 4: now potentially a mix of
+    requests-axis and tokens-axis decisions, whose raw `limit`/`remaining`
+    magnitudes are not comparable - a `tokens_per_min` limit is typically
+    orders of magnitude larger than a `requests_per_min` one) is "closer to
+    its limit" for `X-RateLimit-*` header-reporting purposes (this module's
+    `RateLimitDecision`/`build_rate_limit_headers()` in `api.v1.gateway.
+    common` have always been a single generic remaining/limit pair, not
+    per-counter-type fields - see that function's docstring for the current
+    header contract this preserves). Never used to decide whether a request
+    is ALLOWED - that is decided purely by each individual check's own
+    pass/fail outcome, unaffected by this comparison. `limit <= 0` (a
+    configured zero-allowance rule) sorts as maximally "at its limit"."""
+    if decision.limit <= 0:
+        return 0.0
+    return decision.remaining / decision.limit
+
+
 async def check_and_consume_rate_limit(
     store: SharedStateStore,
     *,
@@ -813,51 +843,181 @@ async def check_and_consume_rate_limit(
     the org default-per-user rule) AND the personal user-scope rule
     (AC4.2.2/AC4.2.9) - exceeding EITHER trips the limit. Each configured
     side is checked+incremented via its own independent sliding-window
-    counter (see module note above for why); a request that fails the
-    second check after the first already incremented is accepted as a
-    minor, documented over-count against the first counter, the same
-    "fail toward availability, not toward perfect accounting" posture
-    `RateLimiter._check_counter`'s Redis-unavailable fail-open path already
-    takes elsewhere in this module.
+    counter (see module note above for why); a request that fails a LATER
+    check after an EARLIER one already incremented is accepted as a minor,
+    documented over-count against the earlier counter, the same "fail toward
+    availability, not toward perfect accounting" posture `RateLimiter.
+    _check_counter`'s Redis-unavailable fail-open path already takes
+    elsewhere in this module.
+
+    Hardening pass item 4 (AC4.2.1's `tokens_per_min` was previously
+    validated/stored but never enforced here - see this module's git-blame-
+    adjacent design doc section 4.3's own pseudocode, which this now
+    implements literally): for EACH configured rule (pool and/or personal),
+    BOTH axes are checked when configured -
+    - `requests_per_min`: pre-emptive, exactly as before - `store.
+      try_consume()` atomically increments-and-gates in one step (AC2.3).
+    - `tokens_per_min`: retrospective/gate-only (AC2.4's explicit "never
+      estimate/pre-charge tokens against the limit" - mirrors `services.
+      budget.check_budget_available()`'s own accepted "can only check
+      whether already over budget from PRIOR requests" semantics). This is
+      a pure `store.get_int()` READ, never incremented here - trips only
+      when tokens already consumed by prior requests in the current rolling
+      window are already at/over the limit. The actual increment happens
+      AFTER a successful provider response, via `record_token_usage()`
+      below (called from `api.v1.gateway.common.record_usage_charge()`,
+      the one shared choke point every gateway charge flows through) - this
+      function never touches the tokens counter's value, only reads it.
+
+    A rule can trip on EITHER axis independently; the first axis that trips
+    (checked in requests-then-tokens order per rule, pool rule before
+    personal rule - same rule-iteration order as before this change) ends
+    the loop immediately and returns that decision, exactly like the
+    pre-existing pool-vs-personal short-circuit. Every remaining passing
+    decision (whichever axis, whichever rule) competes for `best_passing`
+    via `_headroom_fraction()` (see its own docstring for why a raw
+    `remaining` comparison, correct when every check was request-count-only,
+    stops being meaningful once token-count decisions - typically far
+    larger raw numbers - are mixed in).
     """
     pool_rule = team_rule or org_rule
-    checks: list[tuple[RateLimitRuleLike, str]] = []
-    if pool_rule is not None and pool_rule.requests_per_min is not None:
-        checks.append((pool_rule, _pool_rate_limit_key(pool_rule, team_id, user_id)))
-    if user_rule is not None and user_rule.requests_per_min is not None:
-        checks.append((user_rule, _personal_rate_limit_key(user_id)))
+    # Each entry: (rule, requests_key, tokens_key) - a rule participates at
+    # all only when it configures at least one of the two axes.
+    checks: list[tuple[RateLimitRuleLike, str, str]] = []
+    if pool_rule is not None and (
+        pool_rule.requests_per_min is not None or pool_rule.tokens_per_min is not None
+    ):
+        checks.append(
+            (
+                pool_rule,
+                _pool_rate_limit_key(pool_rule, team_id, user_id, counter_type="requests"),
+                _pool_rate_limit_key(pool_rule, team_id, user_id, counter_type="tokens"),
+            )
+        )
+    if user_rule is not None and (
+        user_rule.requests_per_min is not None or user_rule.tokens_per_min is not None
+    ):
+        checks.append(
+            (
+                user_rule,
+                _personal_rate_limit_key(user_id, counter_type="requests"),
+                _personal_rate_limit_key(user_id, counter_type="tokens"),
+            )
+        )
 
     if not checks:
         return _UNCONFIGURED_DECISION
 
+    reset_at = datetime.now(timezone.utc) + timedelta(seconds=_WINDOW_SECONDS)
     best_passing: RateLimitDecision | None = None
-    for rule, key in checks:
-        limit = rule.requests_per_min
-        assert limit is not None  # guarded by the `is not None` filter above
-        try:
-            allowed, count = await store.try_consume(key, window_seconds=_WINDOW_SECONDS, limit=limit)
-        except Exception as exc:  # pragma: no cover - defensive, mirrors RateLimiter's own fail-open
-            logger.warning("rate_limit_enforce_error", extra={"error": str(exc)})
-            allowed, count = True, 0
-        remaining = max(0, limit - count)
-        reset_at = datetime.now(timezone.utc) + timedelta(seconds=_WINDOW_SECONDS)
-        decision = RateLimitDecision(
-            configured=True,
-            allowed=allowed,
-            remaining=remaining,
-            limit=limit,
-            reset_at=reset_at,
-            retry_after_seconds=0 if allowed else _WINDOW_SECONDS,
-            on_limit=rule.on_limit,
-            max_queue_wait_seconds=rule.max_queue_wait_seconds,
-            rule=rule,
-        )
-        if not allowed:
-            return decision
-        if best_passing is None or decision.remaining < best_passing.remaining:
-            best_passing = decision
+
+    for rule, requests_key, tokens_key in checks:
+        if rule.requests_per_min is not None:
+            limit = rule.requests_per_min
+            try:
+                allowed, count = await store.try_consume(
+                    requests_key, window_seconds=_WINDOW_SECONDS, limit=limit
+                )
+            except Exception as exc:  # pragma: no cover - defensive, mirrors RateLimiter's own fail-open
+                logger.warning("rate_limit_enforce_error", extra={"error": str(exc)})
+                allowed, count = True, 0
+            decision = RateLimitDecision(
+                configured=True,
+                allowed=allowed,
+                remaining=max(0, limit - count),
+                limit=limit,
+                reset_at=reset_at,
+                retry_after_seconds=0 if allowed else _WINDOW_SECONDS,
+                on_limit=rule.on_limit,
+                max_queue_wait_seconds=rule.max_queue_wait_seconds,
+                rule=rule,
+            )
+            if not allowed:
+                return decision
+            if best_passing is None or _headroom_fraction(decision) < _headroom_fraction(best_passing):
+                best_passing = decision
+
+        if rule.tokens_per_min is not None:
+            token_limit = rule.tokens_per_min
+            try:
+                tokens_used = await store.get_int(tokens_key)
+            except Exception as exc:  # pragma: no cover - defensive, same fail-open posture
+                logger.warning("rate_limit_enforce_error", extra={"error": str(exc)})
+                tokens_used = 0
+            token_allowed = tokens_used < token_limit
+            decision = RateLimitDecision(
+                configured=True,
+                allowed=token_allowed,
+                remaining=max(0, token_limit - tokens_used),
+                limit=token_limit,
+                reset_at=reset_at,
+                retry_after_seconds=0 if token_allowed else _WINDOW_SECONDS,
+                on_limit=rule.on_limit,
+                max_queue_wait_seconds=rule.max_queue_wait_seconds,
+                rule=rule,
+            )
+            if not token_allowed:
+                return decision
+            if best_passing is None or _headroom_fraction(decision) < _headroom_fraction(best_passing):
+                best_passing = decision
+
     assert best_passing is not None
     return best_passing
+
+
+async def record_token_usage(
+    store: SharedStateStore,
+    cache: RateLimitCache,
+    *,
+    org_id: uuid.UUID,
+    team_id: uuid.UUID | None,
+    user_id: uuid.UUID,
+    total_tokens: int,
+) -> None:
+    """Post-response token-count accounting (Hardening pass item 4, design
+    doc section 4.4's exact mechanic) - the ONLY place this module's token
+    counters are ever incremented (`check_and_consume_rate_limit()` above
+    only ever READS them - AC2.4). Call this exactly once per successfully
+    charged request, AFTER the provider response's real token usage is
+    known - `api.v1.gateway.common.record_usage_charge()` is the single
+    shared choke point every gateway charge (all three routes, streaming and
+    non-streaming) flows through, so this is wired there, mirroring how
+    BD-18's threshold-alert check is wired exactly once in that same
+    function.
+
+    Increments the SAME pool/personal token keys `check_and_consume_rate_
+    limit()` reads, using the identical rule-resolution (`resolve_effective_
+    rate_limit_rules()`, cache-backed/zero-I/O) - a rule with no `tokens_
+    per_min` configured is silently skipped (nothing to accumulate against),
+    matching that function's own per-axis gating. `total_tokens <= 0` is a
+    no-op (an embeddings/chat request always reports a real prompt-token
+    count, but this guards defensively against a theoretical zero-usage
+    response rather than issuing a pointless `INCRBY 0`). Best-effort/fail-
+    open (catches and logs, never raises) - same posture as every other
+    Redis-backed operation in this module; a failure here must never turn an
+    already-successful, already-charged provider response into an error.
+    """
+    if total_tokens <= 0:
+        return
+    org_rule, team_rule, user_rule = resolve_effective_rate_limit_rules(
+        cache, org_id=org_id, team_id=team_id, user_id=user_id
+    )
+    pool_rule = team_rule or org_rule
+    try:
+        if pool_rule is not None and pool_rule.tokens_per_min is not None:
+            await store.incr_by(
+                _pool_rate_limit_key(pool_rule, team_id, user_id, counter_type="tokens"),
+                window_seconds=_WINDOW_SECONDS,
+                amount=total_tokens,
+            )
+        if user_rule is not None and user_rule.tokens_per_min is not None:
+            await store.incr_by(
+                _personal_rate_limit_key(user_id, counter_type="tokens"),
+                window_seconds=_WINDOW_SECONDS,
+                amount=total_tokens,
+            )
+    except Exception as exc:  # pragma: no cover - defensive, mirrors this module's other fail-open paths
+        logger.warning("rate_limit_token_accounting_error", extra={"error": str(exc)})
 
 
 async def log_rate_limit_rejection(

@@ -11,10 +11,13 @@ Gatekey is **not** a model host. It never performs inference itself — it
 mediates access to your existing provider keys under policy.
 
 This repository currently implements **Phase 1 (Core Gateway / MVP)**,
-**Phase 2 (Multi-Tenant Governance)**, and **Phase 3 (Security & Compliance
-Hardening)** — see `gatekey/phase-1-core-gateway.md`, `gatekey/phase-2-product-spec.md`,
-and `gatekey/phase-3-security-compliance.md` for the authoritative requirements
-and `gatekey/00-overview.md` for the overall phase roadmap.
+**Phase 2 (Multi-Tenant Governance)**, **Phase 3 (Security & Compliance
+Hardening)**, **Phase 4 (Reliability & Cost Efficiency)**, and **Phase 5
+(Differentiators)** — see `gatekey/phase-1-core-gateway.md`,
+`gatekey/phase-2-product-spec.md`, `gatekey/phase-3-security-compliance.md`,
+`gatekey/phase-4-technical-design.md`, and `gatekey/phase-5-technical-design.md`
+for the authoritative requirements, and `gatekey/00-overview.md` for the
+overall phase roadmap.
 
 ## What's included (Phase 1)
 
@@ -830,13 +833,11 @@ these (the UI hiding a control is never the only guard).
   model-access/content-classification/residency policy both at config time
   and again at request time, so a policy tightened after configuration can't
   be silently bypassed.
-- **A provider key's `failover_enabled`/`failover_target_id` can't be read
-  back through the admin API** once set — the configuration endpoint's own
-  response is currently the only place this state is ever returned, so the
-  admin console can't reliably show a pre-existing failover configuration
-  after a page reload in a new session. The backend still enforces whatever
-  was last configured correctly; this is a display/UX gap, not a
-  correctness or security issue.
+- ~~A provider key's `failover_enabled`/`failover_target_id` can't be read
+  back through the admin API~~ **Closed** (hardening pass) — `GET
+  /v1/admin/provider-keys` now returns both fields directly, so the Providers
+  screen shows accurate failover configuration on a fresh page load, not just
+  immediately after a save.
 - **Cache-lookup overhead (<10ms NFR target for a cache miss) measured
   higher (~30-36ms) than the target** in this project's Docker Desktop / WSL2
   development sandbox, even after warming the relevant config caches — the
@@ -856,7 +857,9 @@ these (the UI hiding a control is never the only guard).
   against without external anchoring, which is explicitly out of scope for
   this release (see below). Don't treat an "intact" verification result as
   proof nothing was ever deleted from the tail, only that nothing already in
-  the chain was altered or reordered.
+  the chain was altered or reordered. This limitation is now disclosed
+  directly in the admin console (a tooltip on the hash-chain integrity
+  badge), not just here (hardening pass).
 - **No external hash-chain anchoring/timestamping service integration** —
   ships as an in-database chain only in this release, per the phase's own
   stated scope; a fast-follow if a real regulated-industry deployment

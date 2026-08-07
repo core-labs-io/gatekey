@@ -15,10 +15,16 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gatekey.api.deps import get_model_policy_cache, get_self_hosted_model_route_cache, require_admin
+from gatekey.api.deps import (
+    get_custom_model_route_cache,
+    get_model_policy_cache,
+    get_self_hosted_model_route_cache,
+    require_admin,
+)
 from gatekey.db.session import get_db_session
 from gatekey.errors import GatekeyError
 from gatekey.schemas.model_policy import ModelPolicyPutRequest, ModelPolicyResponse
+from gatekey.services.custom_models import CustomModelRouteCache
 from gatekey.services.model_policy import (
     ModelPolicyCache,
     UnknownModelInPolicyError,
@@ -54,6 +60,7 @@ async def put_model_policy(
     session: AsyncSession = Depends(get_db_session),
     cache: ModelPolicyCache = Depends(get_model_policy_cache),
     self_hosted_cache: SelfHostedModelRouteCache = Depends(get_self_hosted_model_route_cache),
+    custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
 ) -> ModelPolicyResponse:
     """Full-replace upsert (AC-8). 422 `unknown_model_in_policy` if any
     `models` entry isn't a known `MODEL_REGISTRY` id - no DB write in that
@@ -73,7 +80,11 @@ async def put_model_policy(
     """
     try:
         snapshot = await set_policy(
-            session, payload.mode, payload.models, self_hosted_cache=self_hosted_cache
+            session,
+            payload.mode,
+            payload.models,
+            self_hosted_cache=self_hosted_cache,
+            custom_model_cache=custom_model_cache,
         )
     except UnknownModelInPolicyError as exc:
         raise GatekeyError(exc.message, code="unknown_model_in_policy", status_code=422) from None

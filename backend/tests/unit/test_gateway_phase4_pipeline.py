@@ -226,6 +226,127 @@ def test_rate_limit_queue_and_retry_times_out_as_429_soft_limit(monkeypatch: pyt
     assert response.headers["Retry-After"] == "0"
 
 
+def _make_token_rate_limit_rule(
+    *, tokens_per_min: int, on_limit: RateLimitOnLimit = RateLimitOnLimit.REJECT
+) -> RateLimitRuleSnapshot:
+    return RateLimitRuleSnapshot(
+        id=uuid.uuid4(),
+        scope_type=RateLimitScopeType.ORG_DEFAULT_PER_USER,
+        requests_per_min=None,
+        tokens_per_min=tokens_per_min,
+        on_limit=on_limit,
+        max_queue_wait_seconds=1,
+    )
+
+
+def test_tokens_per_min_allows_a_single_request_that_itself_exceeds_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC4.2.4/AC2.4 (Hardening pass item 4): a `tokens_per_min` gate is
+    necessarily retrospective - it can only ever act on ALREADY-consumed
+    tokens from PRIOR requests, never estimate/pre-charge the current
+    request's own not-yet-known usage. `_fake_response()` reports 10 total
+    tokens against a limit of 5 - the request is still allowed (never
+    blocked by its own future usage)."""
+    rule = _make_token_rate_limit_rule(tokens_per_min=5)
+
+    async def _fake_create(client, native_model_id, request, credential, *, timeout_seconds=60.0):  # noqa: ANN001, ARG001
+        return _fake_response(native_model_id)
+
+    monkeypatch.setattr(openai_mod, "create_chat_completion", _fake_create)
+
+    org_id = uuid.uuid4()
+    app = build_authenticated_app(monkeypatch, org_id=org_id)
+    with TestClient(app) as client:
+        app.state.rate_limit_cache.set_org_rule(org_id, rule)
+        response = client.post(
+            _CHAT_URL, json=_basic_body(), headers={"Authorization": "Bearer gk_sk_test"}
+        )
+    assert response.status_code == 200
+    assert response.headers["X-RateLimit-Limit"] == "5"
+    # A pure pre-request read, before this response's own 10 tokens land.
+    assert response.headers["X-RateLimit-Remaining"] == "5"
+
+
+def test_tokens_per_min_blocks_the_next_request_once_prior_usage_reaches_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of AC4.2.4: once a PRIOR request's real, provider-
+    reported usage has pushed the rolling-window total to/over the limit,
+    the NEXT request is blocked - proving the post-response `record_token_
+    usage()` accounting (wired into `record_usage_charge()`, the shared
+    charge choke point) actually feeds back into the live gate."""
+    rule = _make_token_rate_limit_rule(tokens_per_min=8)
+
+    async def _fake_create(client, native_model_id, request, credential, *, timeout_seconds=60.0):  # noqa: ANN001, ARG001
+        return _fake_response(native_model_id)  # usage: 5 prompt + 5 completion = 10 total
+
+    monkeypatch.setattr(openai_mod, "create_chat_completion", _fake_create)
+
+    async def _fake_log_rejection(session, **kwargs):  # noqa: ANN001, ARG001
+        return None
+
+    org_id = uuid.uuid4()
+    app = build_authenticated_app(monkeypatch, org_id=org_id)
+    monkeypatch.setattr(rate_limit_service, "log_rate_limit_rejection", _fake_log_rejection)
+    with TestClient(app) as client:
+        app.state.rate_limit_cache.set_org_rule(org_id, rule)
+
+        first = client.post(
+            _CHAT_URL, json=_basic_body(), headers={"Authorization": "Bearer gk_sk_test"}
+        )
+        assert first.status_code == 200  # allowed - see the "never pre-charges" test above
+
+        second = client.post(
+            _CHAT_URL, json=_basic_body(), headers={"Authorization": "Bearer gk_sk_test"}
+        )
+    assert second.status_code == 429
+    assert second.json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_requests_and_tokens_headers_reflect_whichever_axis_is_closer_to_its_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both axes configured on the same rule: plenty of request headroom
+    (100/min) but a much tighter token budget (15/min - `_fake_response()`'s
+    10-token usage already burns most of it after one request) - the
+    `X-RateLimit-*` headers on a still-ALLOWED request must reflect the axis
+    actually closer to tripping (tokens: 5/15 = 33% headroom) rather than
+    the requests axis (98/100 = 98% headroom), even though a naive
+    raw-`remaining`-count comparison (98 vs. 5) would pick the wrong one."""
+    rule = RateLimitRuleSnapshot(
+        id=uuid.uuid4(),
+        scope_type=RateLimitScopeType.ORG_DEFAULT_PER_USER,
+        requests_per_min=100,
+        tokens_per_min=15,
+        on_limit=RateLimitOnLimit.REJECT,
+        max_queue_wait_seconds=1,
+    )
+
+    async def _fake_create(client, native_model_id, request, credential, *, timeout_seconds=60.0):  # noqa: ANN001, ARG001
+        return _fake_response(native_model_id)
+
+    monkeypatch.setattr(openai_mod, "create_chat_completion", _fake_create)
+
+    org_id = uuid.uuid4()
+    app = build_authenticated_app(monkeypatch, org_id=org_id)
+    with TestClient(app) as client:
+        app.state.rate_limit_cache.set_org_rule(org_id, rule)
+        # First request: both axes still fully open - burns 1 request and
+        # (post-response) 10 of the 15-token budget.
+        client.post(_CHAT_URL, json=_basic_body(), headers={"Authorization": "Bearer gk_sk_test"})
+
+        # Second request: tokens axis has only 5/15 (33%) headroom left,
+        # requests axis still has 98/100 (98%) - tokens must win the header
+        # selection despite its smaller raw `remaining` number too.
+        second = client.post(
+            _CHAT_URL, json=_basic_body(), headers={"Authorization": "Bearer gk_sk_test"}
+        )
+    assert second.status_code == 200
+    assert second.headers["X-RateLimit-Limit"] == "15"
+    assert second.headers["X-RateLimit-Remaining"] == "5"
+
+
 # ---------------------------------------------------------------------------
 # Response caching
 # ---------------------------------------------------------------------------

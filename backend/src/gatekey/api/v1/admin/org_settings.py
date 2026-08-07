@@ -80,25 +80,32 @@ async def put_org_settings_endpoint(
     source_ip: str | None = Depends(get_source_ip),
 ) -> OrgSettingsResponse:
     old = await get_effective_org_settings(session)
-    # Upserts + locks the row, and runs the A3 sum-of-team-ceilings check
-    # (422 budget_ceiling_below_current_allocation passes through). Flushes,
-    # does not commit - the remaining field writes and the audit entry ride
-    # the same transaction/lock.
-    row = await set_org_budget_ceiling(session, budget_ceiling_usd=payload.budget_ceiling_usd)
-    row.currency = payload.currency
-    row.max_self_serve_key_expiration_days = payload.max_self_serve_key_expiration_days
-    row.personal_key_soft_cap = payload.personal_key_soft_cap
-    row.auto_provision_personal_key_on_approval = (
-        payload.auto_provision_personal_key_on_approval
-    )
-    await session.flush()
+    # Lock-ordering fix (CMR-14 security review): write the audit entry
+    # BEFORE taking the `org_settings` row lock. `write_audit_entry`, when
+    # the org's hash chain is enabled, takes `SELECT ... FOR UPDATE` on
+    # `compliance_settings`; `set_org_budget_ceiling` below takes
+    # `SELECT ... FOR UPDATE` on `org_settings`. `api/v1/admin/
+    # custom_models.py`'s and `self_hosted_providers.py`'s POST/PUT
+    # handlers already acquire compliance_settings before org_settings (the
+    # audit write happens first there too, since their service calls commit
+    # internally) - this handler previously acquired the two locks in the
+    # OPPOSITE order (org_settings first), which is a real, reproduced
+    # Postgres deadlock under concurrent admin usage with chaining enabled.
+    # Ordering both endpoints identically (compliance_settings, then
+    # org_settings) eliminates the cycle. `new_value` is built from the
+    # request payload (not the post-write row) since the row lock/upsert
+    # hasn't happened yet - identical to every value the upsert below will
+    # actually persist on success; if the ceiling check below rejects the
+    # write, the whole transaction (including this queued-but-uncommitted
+    # audit entry) rolls back with it - same "audit discarded on failure"
+    # discipline `custom_models.py`'s docstring describes.
     new_value = payload.model_dump()
     await write_audit_entry(
         session,
         actor=ctx,
         action="org_settings.update",
         target_type="org_settings",
-        target_id=str(row.org_id),
+        target_id=str(ctx.org_id),
         old_value={
             "budget_ceiling_usd": old.budget_ceiling_usd,
             "currency": old.currency,
@@ -109,5 +116,17 @@ async def put_org_settings_endpoint(
         new_value=new_value,
         source_ip=source_ip,
     )
+    # Upserts + locks the row, and runs the A3 sum-of-team-ceilings check
+    # (422 budget_ceiling_below_current_allocation passes through). Flushes,
+    # does not commit - the remaining field writes ride the same
+    # transaction/lock, and the audit entry above already rode it too.
+    row = await set_org_budget_ceiling(session, budget_ceiling_usd=payload.budget_ceiling_usd)
+    row.currency = payload.currency
+    row.max_self_serve_key_expiration_days = payload.max_self_serve_key_expiration_days
+    row.personal_key_soft_cap = payload.personal_key_soft_cap
+    row.auto_provision_personal_key_on_approval = (
+        payload.auto_provision_personal_key_on_approval
+    )
+    await session.flush()
     await session.commit()
     return _response(await get_effective_org_settings(session))

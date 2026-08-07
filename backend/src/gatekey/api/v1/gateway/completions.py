@@ -22,6 +22,21 @@ See `common.py`'s "Phase 4" section note for the exact pipeline ordering:
 from `call_provider_with_failover()`'s new return shape. Graceful
 degradation is explicitly OUT OF SCOPE here (AC4.4.7 - chat completions
 only) - this route never calls `check_and_apply_degradation()`.
+
+Custom Model Registry (Admin-Managed BYOK Models, CMR-4): deliberately NOT
+wired here, and never will be. `resolve_route(body.model)` below is called
+with NO cache arguments at all (neither `self_hosted_cache` - unchanged
+since Phase 5.5 - nor the new `custom_model_cache`) - this is the same
+call-site-level structural enforcement mechanism Phase 5.5 already
+established for "self-hosted models are chat-completions only"
+(AC5.5.4), reused here for the product spec's explicit non-goal (section
+7): "/v1/completions does not gain custom-model support." A custom model's
+capability is per-row (chat OR embeddings, admin's choice) - neither value
+has anything to do with this legacy, OpenAI-only, non-streaming endpoint,
+and the static registry itself has no completions-only models either, so
+there is no precedent this endpoint needs to extend. See the Custom Model
+Registry technical design doc section 2.2 ("Why completions.py is
+deliberately never touched") / section 5 row 9.
 """
 
 from __future__ import annotations
@@ -298,6 +313,9 @@ async def create_completion(
                 completion_tokens=response_obj.usage.completion_tokens,
                 background_tasks=background_tasks,
                 app=request.app,
+                org_id=ctx.org_id,
+                rate_limit_store=shared_state_store,
+                rate_limit_cache=rate_limit_cache,
             )
             cost_usd = charge.cost
         except PricingEntryMissingError:

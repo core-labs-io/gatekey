@@ -686,26 +686,41 @@ async def add_scim_group_members(
     delegates to `services.team_budget.create_team_membership`, whose
     headroom check is a no-op for a `None` request (module docstring).
     Idempotent: a user already a member is silently skipped, no error, no
-    duplicate audit entry."""
+    duplicate audit entry.
+
+    Lock-ordering fix (CMR-14 security review, broader systemic audit): the
+    audit entry is written BEFORE `create_team_membership`, which takes
+    `SELECT ... FOR UPDATE` on `teams` - see `api/v1/teams.py`'s
+    `add_member_endpoint`/`services/team_budget.py`'s module docstring
+    addendum. `membership_id` is generated here (mirroring
+    `custom_models.py`'s `custom_model_id` pattern) so `target_id` is known
+    before the lock."""
     for user_id in member_user_ids:
         if await get_membership(session, team_id=team.id, user_id=user_id) is not None:
             continue
-        try:
-            membership = await create_team_membership(session, team_id=team.id, user_id=user_id, budget_usd=None)
-        except IntegrityError:
-            raise ScimError(
-                400, "One or more member values reference an unknown user.", scim_type="invalidValue"
-            ) from None
+        membership_id = uuid.uuid4()
         await write_audit_entry(
             session,
             actor=actor,
             action="scim_group.member.add",
             target_type="team_membership",
-            target_id=str(membership.id),
+            target_id=str(membership_id),
             old_value=None,
             new_value={"team_id": str(team.id), "user_id": str(user_id)},
             source_ip=source_ip,
         )
+        try:
+            await create_team_membership(
+                session,
+                team_id=team.id,
+                user_id=user_id,
+                budget_usd=None,
+                membership_id=membership_id,
+            )
+        except IntegrityError:
+            raise ScimError(
+                400, "One or more member values reference an unknown user.", scim_type="invalidValue"
+            ) from None
     return team
 
 

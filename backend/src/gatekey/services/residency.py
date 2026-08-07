@@ -341,6 +341,31 @@ async def set_org_residency_rule(
     scope to, since it can affect any team). Best-effort: `CacheInvalidator`
     methods already fail open (catch, log, return 0) on a Redis-unreachable
     store - never raise, never block this write itself.
+
+    Hardening pass item 1 (found while writing a real end-to-end test of
+    this exact wiring, not by code reading): `execution_options={
+    "populate_existing": True}` on the upsert's own `execute()` call is
+    REQUIRED, not decorative. `api.v1.admin.residency_rules.py`'s PUT
+    handler reads the CURRENT row (`get_org_residency_rule(session)`, for
+    its audit-entry `old_value`) into this SAME session's identity map
+    BEFORE calling this function. SQLAlchemy 2.0's ORM-enabled `INSERT
+    ... RETURNING` then matches the returned row's primary key against
+    that already-identity-mapped (stale, pre-update) object and - by
+    documented default - returns THAT stale object unchanged rather than
+    the fresh post-update values, unless `populate_existing` is set.
+    Without this fix, `cache.set_org_rule(_snapshot_from_row(row))` below
+    would silently re-arm the in-process `ResidencyRuleCache` with the
+    OLD, pre-tightening rule on every UPDATE (not the first-ever INSERT,
+    which has no pre-existing identity-mapped object to collide with) -
+    meaning a tightened residency rule would correctly invalidate the
+    Redis response cache (so no stale cached RESPONSE is ever served) but
+    the very next live request's `check_residency()` call would still
+    silently enforce the OLD, more permissive rule, for the rest of this
+    process's lifetime (until the next full cache warm). A real
+    enforcement-correctness bug, not just a cache-staleness one - caught
+    only because this hardening pass's new test drives a real SECOND write
+    through the real HTTP endpoint (not just a bare service-function unit
+    test with no pre-existing identity-mapped row).
     """
     regions = _validate_regions(allowed_regions)
     insert_stmt = postgresql.insert(ResidencyRule).values(
@@ -358,7 +383,9 @@ async def set_org_residency_rule(
             "updated_at": text("now()"),
         },
     ).returning(ResidencyRule)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache is not None:
         cache.set_org_rule(_snapshot_from_row(row))
@@ -390,6 +417,13 @@ async def set_team_residency_rule(
     docstring for the full rationale; a TEAM rule change only needs to
     invalidate that team's own cached entries (`cache_invalidator.
     clear_team(team_id)`), not every team's.
+
+    Hardening pass item 1: `execution_options={"populate_existing": True}`
+    on the upsert below is REQUIRED for the same reason as `set_org_
+    residency_rule`'s identical fix (see that function's docstring) -
+    `api/v1/teams.py`'s PUT handler for this route also pre-reads the
+    current row (`get_team_residency_rule`) into this session's identity
+    map before calling this function.
     """
     regions = _validate_regions(allowed_regions)
     org_row = await get_org_residency_rule(session)
@@ -413,7 +447,9 @@ async def set_team_residency_rule(
             "updated_at": text("now()"),
         },
     ).returning(ResidencyRule)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache is not None:
         cache.set_team_rule(team_id, _snapshot_from_row(row))

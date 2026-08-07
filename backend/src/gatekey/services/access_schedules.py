@@ -499,7 +499,30 @@ async def set_org_access_schedule(
 ) -> AccessSchedule:
     """Validate then atomically full-replace-upsert the org-wide schedule.
     The org row is the root of the precedence chain - nothing to narrow
-    against."""
+    against.
+
+    Hardening pass item 2 (QA audit of every `on_conflict_do_update(...).
+    returning(...)` call site for the same defect fixed in `services.
+    residency.set_org_residency_rule`/`services.dlp.set_dlp_policy` - see
+    that function's docstring for the full mechanism): `execution_options=
+    {"populate_existing": True}` on the upsert below is REQUIRED, not
+    decorative, and IS live-triggered here. `api/v1/admin/access_schedule.
+    py`'s `put_org_access_schedule_endpoint` pre-reads the CURRENT row
+    (`get_org_access_schedule(session)`, for its own audit-entry
+    `old_value`) into this SAME session's identity map BEFORE calling this
+    function. Without `populate_existing`, SQLAlchemy 2.0's ORM-enabled
+    `INSERT ... RETURNING` matches the returned row's primary key against
+    that already-identity-mapped (stale, pre-update) object and returns it
+    unchanged instead of the fresh post-update values on every UPDATE (not
+    the first-ever INSERT, which has no pre-existing identity-mapped object
+    to collide with). That means `cache.set_org(...)` below would silently
+    re-arm `AccessScheduleCache` with the OLD, pre-tightening window -
+    `resolve_access_schedule_decision()` (read on every single gateway
+    request from a service-account credential) would keep enforcing the
+    OLD, more permissive window for the rest of this process's lifetime, a
+    real enforcement-correctness bug (e.g. a narrowed allowed-hours window,
+    or re-enabling enforcement after it was relaxed, could silently never
+    take effect)."""
     days = _validate_window(allowed_days, allowed_hours_start, allowed_hours_end)
     insert_stmt = postgresql.insert(AccessSchedule).values(
         org_id=DEFAULT_ORG_ID,
@@ -522,7 +545,9 @@ async def set_org_access_schedule(
             "updated_at": text("now()"),
         },
     ).returning(AccessSchedule)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache is not None:
         cache.set_org(_snapshot_from_row(row))
@@ -541,7 +566,18 @@ async def set_team_access_schedule(
 ) -> AccessSchedule:
     """Validate (including AC9.2 narrowing-only defense-in-depth against the
     CURRENT org schedule, re-read directly from the DB) then atomically
-    full-replace-upsert one team's schedule."""
+    full-replace-upsert one team's schedule.
+
+    Hardening pass item 2: `execution_options={"populate_existing": True}`
+    on the upsert below is REQUIRED for the same reason as `set_org_
+    access_schedule`'s identical fix (see that function's docstring for the
+    full mechanism) - `api/v1/teams.py`'s `put_team_access_schedule_
+    endpoint` also pre-reads the current row (`get_team_access_schedule`)
+    into this session's identity map before calling this function, and IS
+    live-triggered: without this fix, `cache.set_team(...)` below would
+    silently re-arm `AccessScheduleCache` with the OLD, pre-tightening
+    team window, which `resolve_access_schedule_decision()` would keep
+    enforcing on every gateway request from that team's service accounts."""
     days = _validate_window(allowed_days, allowed_hours_start, allowed_hours_end)
     parent = await _resolve_org_parent(session)
     validate_schedule_narrows_parent(
@@ -571,7 +607,9 @@ async def set_team_access_schedule(
             "updated_at": text("now()"),
         },
     ).returning(AccessSchedule)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache is not None:
         cache.set_team(team_id, _snapshot_from_row(row))
@@ -593,7 +631,19 @@ async def set_service_account_access_schedule(
     re-read directly from the DB) then atomically full-replace-upsert one
     key's schedule. `team_id` is the key's OWN team attribution (the
     caller looks this up from the `ServiceAccountKey` row) - used only to
-    resolve the correct parent, never persisted on this row."""
+    resolve the correct parent, never persisted on this row.
+
+    Hardening pass item 2: `execution_options={"populate_existing": True}`
+    on the upsert below is REQUIRED for the same reason as `set_org_
+    access_schedule`'s identical fix (see that function's docstring for the
+    full mechanism) - `api/v1/keys.py`'s `put_key_access_schedule_endpoint`
+    also pre-reads the current row (`get_service_account_access_schedule`)
+    into this session's identity map before calling this function, and IS
+    live-triggered: without this fix, `cache.set_service_account(...)`
+    below would silently re-arm `AccessScheduleCache` with the OLD,
+    pre-tightening key-level window, which `resolve_access_schedule_
+    decision()` would keep enforcing on every gateway request from this
+    service-account key."""
     days = _validate_window(allowed_days, allowed_hours_start, allowed_hours_end)
     parent = await _resolve_service_account_parent(session, team_id=team_id)
     validate_schedule_narrows_parent(
@@ -623,7 +673,9 @@ async def set_service_account_access_schedule(
             "updated_at": text("now()"),
         },
     ).returning(AccessSchedule)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache is not None:
         cache.set_service_account(service_account_id, _snapshot_from_row(row))

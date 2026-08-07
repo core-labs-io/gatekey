@@ -31,6 +31,7 @@ from gatekey.api.deps import (
     TeamRoleContext,
     get_access_schedule_cache,
     get_cache_invalidator,
+    get_custom_model_route_cache,
     get_key_provider,
     get_residency_rule_cache,
     get_self_hosted_model_route_cache,
@@ -111,6 +112,7 @@ from gatekey.services.residency import (
     get_team_residency_rule,
     set_team_residency_rule,
 )
+from gatekey.services.custom_models import CustomModelRouteCache
 from gatekey.services.self_hosted_providers import SelfHostedModelRouteCache
 from gatekey.services.service_accounts import get_service_account
 from gatekey.services.sessions import SessionContext
@@ -217,12 +219,19 @@ async def create_team_endpoint(
     session: AsyncSession = Depends(get_db_session),
 ) -> TeamResponse:
     team = await create_team(session, name=payload.name)
-    if payload.budget_ceiling_usd is not None:
-        # Reuses the ADR-5 locked org-ceiling check rather than reimplementing
-        # it for the create path.
-        team = await set_team_budget_ceiling(
-            session, team_id=team.id, budget_ceiling_usd=payload.budget_ceiling_usd
-        )
+    # Lock-ordering fix (CMR-14 security review): write the audit entry
+    # BEFORE `set_team_budget_ceiling`, which takes `SELECT ... FOR UPDATE`
+    # on `org_settings` (then `teams`). `write_audit_entry`, when the org's
+    # hash chain is enabled, takes its own `SELECT ... FOR UPDATE` on
+    # `compliance_settings` - `api/v1/admin/custom_models.py`'s/
+    # `self_hosted_providers.py`'s POST/PUT handlers already acquire
+    # compliance_settings before org_settings, so acquiring them in the
+    # opposite order here (org_settings first) was a real, reproducible
+    # cross-endpoint deadlock. `new_value`'s `budget_ceiling_usd` is taken
+    # from the request payload rather than the (not-yet-locked) `team` row -
+    # identical to what `set_team_budget_ceiling` below will actually
+    # persist on success; a rejection there (422) rolls back the whole
+    # transaction, discarding this queued-but-uncommitted audit entry too.
     await write_audit_entry(
         session,
         actor=ctx,
@@ -230,8 +239,14 @@ async def create_team_endpoint(
         target_type="team",
         target_id=str(team.id),
         old_value=None,
-        new_value={"name": team.name, "budget_ceiling_usd": team.budget_ceiling_usd},
+        new_value={"name": team.name, "budget_ceiling_usd": payload.budget_ceiling_usd},
     )
+    if payload.budget_ceiling_usd is not None:
+        # Reuses the ADR-5 locked org-ceiling check rather than reimplementing
+        # it for the create path.
+        team = await set_team_budget_ceiling(
+            session, team_id=team.id, budget_ceiling_usd=payload.budget_ceiling_usd
+        )
     await session.commit()
     await session.refresh(team)  # populate server defaults (period/spend/timestamps)
     return _team_response(team)
@@ -289,6 +304,31 @@ async def update_team_endpoint(
 ) -> TeamResponse:
     team = await _get_team_or_404(session, team_id)
     old_value = {"name": team.name, "budget_ceiling_usd": team.budget_ceiling_usd}
+    new_budget_ceiling_usd = (
+        payload.budget_ceiling_usd
+        if "budget_ceiling_usd" in payload.model_fields_set
+        else team.budget_ceiling_usd
+    )
+    new_name = payload.name if payload.name is not None else team.name
+    # Lock-ordering fix (CMR-14 security review): write the audit entry
+    # BEFORE `set_team_budget_ceiling` (locks `org_settings` then `teams`) -
+    # same rationale as `create_team_endpoint` above and `api/v1/admin/
+    # org_settings.py::put_org_settings_endpoint`. `new_value` is built from
+    # the request payload/current row rather than the post-write state,
+    # since the org_settings/team locks haven't been taken yet - identical
+    # to the final persisted state on success; any failure below (422 from
+    # the ceiling check, or the 409 IntegrityError handled explicitly) rolls
+    # back the whole transaction, discarding this queued-but-uncommitted
+    # audit entry with it.
+    await write_audit_entry(
+        session,
+        actor=ctx,
+        action="team.update",
+        target_type="team",
+        target_id=str(team_id),
+        old_value=old_value,
+        new_value={"name": new_name, "budget_ceiling_usd": new_budget_ceiling_usd},
+    )
     if "budget_ceiling_usd" in payload.model_fields_set:
         # ADR-5 locked check (422 budget_ceiling_exceeded /
         # budget_ceiling_below_current_allocation pass through).
@@ -306,15 +346,6 @@ async def update_team_endpoint(
                 code="team_already_exists",
                 status_code=status.HTTP_409_CONFLICT,
             ) from None
-    await write_audit_entry(
-        session,
-        actor=ctx,
-        action="team.update",
-        target_type="team",
-        target_id=str(team_id),
-        old_value=old_value,
-        new_value={"name": team.name, "budget_ceiling_usd": team.budget_ceiling_usd},
-    )
     await session.commit()
     return _team_response(team)
 
@@ -395,27 +426,19 @@ async def add_member_endpoint(
     user = await get_user(session, payload.user_id)
     if user is None:
         raise NotFoundError(f"No user found with id '{payload.user_id}'.")
-    try:
-        membership = await create_team_membership(
-            session,
-            team_id=team_id,
-            user_id=payload.user_id,
-            role=TeamRole(payload.role),
-            budget_usd=payload.budget_usd,
-        )
-    except IntegrityError:
-        await session.rollback()
-        raise GatekeyError(
-            "User is already a member of this team.",
-            code="member_already_exists",
-            status_code=status.HTTP_409_CONFLICT,
-        ) from None
+    membership_id = uuid.uuid4()
+    # Lock-ordering fix (CMR-14 security review, broader systemic audit):
+    # write the audit entry BEFORE `create_team_membership`, which takes
+    # `SELECT ... FOR UPDATE` on `teams` - see `create_team_endpoint`'s
+    # comment above / `services/team_budget.py`'s module docstring
+    # addendum. The id is generated here (mirroring `custom_models.py`'s
+    # `custom_model_id` pattern) so `target_id` is known before the lock.
     await write_audit_entry(
         session,
         actor=team_ctx.session,
         action="team.member.add",
         target_type="team_membership",
-        target_id=str(membership.id),
+        target_id=str(membership_id),
         old_value=None,
         new_value={
             "team_id": team_id,
@@ -424,6 +447,22 @@ async def add_member_endpoint(
             "budget_usd": payload.budget_usd,
         },
     )
+    try:
+        membership = await create_team_membership(
+            session,
+            team_id=team_id,
+            user_id=payload.user_id,
+            role=TeamRole(payload.role),
+            budget_usd=payload.budget_usd,
+            membership_id=membership_id,
+        )
+    except IntegrityError:
+        await session.rollback()
+        raise GatekeyError(
+            "User is already a member of this team.",
+            code="member_already_exists",
+            status_code=status.HTTP_409_CONFLICT,
+        ) from None
     await session.commit()
     await session.refresh(membership)  # server defaults (spend/timestamps)
     return _member_response(membership, user.name)
@@ -441,6 +480,29 @@ async def update_member_endpoint(
     if membership is None:
         raise NotFoundError("Team membership not found.")
     old_value = {"role": membership.role, "budget_usd": membership.budget_usd}
+    new_budget_usd = (
+        payload.budget_usd
+        if "budget_usd" in payload.model_fields_set
+        else membership.budget_usd
+    )
+    new_role = TeamRole(payload.role) if payload.role is not None else membership.role
+    # Lock-ordering fix (CMR-14 security review, broader systemic audit):
+    # write the audit entry BEFORE `update_team_membership_budget`, which
+    # takes `SELECT ... FOR UPDATE` on `teams` - see `create_team_endpoint`'s
+    # comment above. `new_value` is built from the payload/current row
+    # rather than the post-write state, since the lock hasn't been taken
+    # yet - identical to the final persisted state on success; a 422 from
+    # the ceiling check rolls back the whole transaction, discarding this
+    # queued-but-uncommitted audit entry with it.
+    await write_audit_entry(
+        session,
+        actor=team_ctx.session,
+        action="team.member.update",
+        target_type="team_membership",
+        target_id=str(membership.id),
+        old_value=old_value,
+        new_value={"role": new_role, "budget_usd": new_budget_usd},
+    )
     if "budget_usd" in payload.model_fields_set:
         # ADR-5 locked ceiling check (422 budget_ceiling_exceeded passes
         # through).
@@ -450,15 +512,6 @@ async def update_member_endpoint(
     if payload.role is not None:
         membership.role = TeamRole(payload.role)
         await session.flush()
-    await write_audit_entry(
-        session,
-        actor=team_ctx.session,
-        action="team.member.update",
-        target_type="team_membership",
-        target_id=str(membership.id),
-        old_value=old_value,
-        new_value={"role": membership.role, "budget_usd": membership.budget_usd},
-    )
     await session.commit()
     user = await get_user(session, user_id)
     return _member_response(membership, user.name if user is not None else "")
@@ -497,13 +550,23 @@ async def reassign_budget_endpoint(
     team_ctx: TeamRoleContext = Depends(require_team_role("team_lead")),
     session: AsyncSession = Depends(get_db_session),
 ) -> ReassignBudgetResponse:
-    result = await reassign_budget(
-        session,
-        team_id=team_id,
-        from_user_id=payload.from_user_id,
-        to_user_id=payload.to_user_id,
-        amount_usd=payload.amount_usd,
-    )
+    # Lock-ordering fix (CMR-14 security review, broader systemic audit):
+    # write the audit entry BEFORE `reassign_budget`, which takes
+    # `SELECT ... FOR UPDATE` on `teams` - see `create_team_endpoint`'s
+    # comment above. Old/expected-new amounts are read here via a plain
+    # (non-locking) membership lookup; `reassign_budget` below re-validates
+    # and re-applies the SAME delta under its own lock, so on success these
+    # values match exactly what gets persisted - any validation failure
+    # there (404/422) rolls back the whole transaction, discarding this
+    # queued-but-uncommitted audit entry with it.
+    from_membership = await get_membership(session, team_id=team_id, user_id=payload.from_user_id)
+    to_membership = await get_membership(session, team_id=team_id, user_id=payload.to_user_id)
+    if from_membership is None or to_membership is None:
+        raise NotFoundError("Team membership not found.")
+    from_old = from_membership.budget_usd
+    to_old = to_membership.budget_usd
+    from_new = from_old - payload.amount_usd if from_old is not None else None
+    to_new = to_old + payload.amount_usd if to_old is not None else None
     # AC2.4: exactly ONE audit entry recording both sides' old -> new.
     await write_audit_entry(
         session,
@@ -512,14 +575,21 @@ async def reassign_budget_endpoint(
         target_type="team",
         target_id=str(team_id),
         old_value={
-            "from": {"user_id": result.from_user_id, "budget_usd": result.from_old_budget_usd},
-            "to": {"user_id": result.to_user_id, "budget_usd": result.to_old_budget_usd},
+            "from": {"user_id": payload.from_user_id, "budget_usd": from_old},
+            "to": {"user_id": payload.to_user_id, "budget_usd": to_old},
         },
         new_value={
-            "amount_usd": result.amount_usd,
-            "from": {"user_id": result.from_user_id, "budget_usd": result.from_new_budget_usd},
-            "to": {"user_id": result.to_user_id, "budget_usd": result.to_new_budget_usd},
+            "amount_usd": payload.amount_usd,
+            "from": {"user_id": payload.from_user_id, "budget_usd": from_new},
+            "to": {"user_id": payload.to_user_id, "budget_usd": to_new},
         },
+    )
+    result = await reassign_budget(
+        session,
+        team_id=team_id,
+        from_user_id=payload.from_user_id,
+        to_user_id=payload.to_user_id,
+        amount_usd=payload.amount_usd,
     )
     await session.commit()
     return ReassignBudgetResponse(
@@ -557,6 +627,7 @@ async def put_model_restrictions_endpoint(
     session: AsyncSession = Depends(get_db_session),
     cache: TeamModelPolicyCache = Depends(get_team_model_policy_cache),
     self_hosted_cache: SelfHostedModelRouteCache = Depends(get_self_hosted_model_route_cache),
+    custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
 ) -> TeamModelRestrictionsResponse:
     """422 `team_model_restricts_org_denied_model` passes straight through
     from `set_team_model_policy` (AC3.2 defense-in-depth). The audit entry
@@ -578,7 +649,12 @@ async def put_model_restrictions_endpoint(
         new_value={"models": sorted(set(payload.models))},
     )
     committed = await set_team_model_policy(
-        session, team_id, payload.models, cache=cache, self_hosted_cache=self_hosted_cache
+        session,
+        team_id,
+        payload.models,
+        cache=cache,
+        self_hosted_cache=self_hosted_cache,
+        custom_model_cache=custom_model_cache,
     )
     org_snapshot = await get_policy(session)
     return TeamModelRestrictionsResponse(
@@ -852,14 +928,11 @@ async def approve_join_request_endpoint(
     )
     if join_request is None:
         raise NotFoundError("Join request not found.")
-    membership = await approve_join_request(
-        session,
-        request_id=request_id,
-        team_id=team_id,
-        requester_user_id=join_request.requester_user_id,
-        budget_usd=payload.budget_usd,
-        approved_by_user_id=team_ctx.session.user_id,
-    )
+    # Lock-ordering fix (CMR-14 security review, broader systemic audit):
+    # write the audit entry BEFORE `approve_join_request`, which takes
+    # `SELECT ... FOR UPDATE` on `teams` - see `create_team_endpoint`'s
+    # comment above. Every field below is already fully determined by the
+    # request/path (no DB read dependency), so no precompute-staleness risk.
     await write_audit_entry(
         session,
         actor=team_ctx.session,
@@ -873,6 +946,14 @@ async def approve_join_request_endpoint(
             "user_id": join_request.requester_user_id,
             "budget_usd": payload.budget_usd,
         },
+    )
+    membership = await approve_join_request(
+        session,
+        request_id=request_id,
+        team_id=team_id,
+        requester_user_id=join_request.requester_user_id,
+        budget_usd=payload.budget_usd,
+        approved_by_user_id=team_ctx.session.user_id,
     )
     await session.commit()
     await session.refresh(membership)  # server defaults (spend/timestamps)

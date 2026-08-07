@@ -34,6 +34,7 @@ from gatekey.api.deps import (
     get_access_schedule_cache,
     get_caching_settings_cache,
     get_content_aware_rule_cache,
+    get_custom_model_route_cache,
     get_db_session,
     get_dlp_analyzer_engine,
     get_key_provider,
@@ -79,6 +80,7 @@ from gatekey.providers.pricing import PricingEntryMissingError
 from gatekey.providers.vertex_ai import VertexAITokenCache
 from gatekey.schemas.chat import EmbeddingsRequest, EmbeddingsResponse
 from gatekey.services.access_schedules import AccessScheduleCache
+from gatekey.services.custom_models import CustomModelRouteCache, compute_custom_model_cost
 from gatekey.services.encryption import KeyProvider
 from gatekey.services.model_policy import ContentAwareRuleCache, ModelPolicyCache, TeamModelPolicyCache
 from gatekey.services.provider_key_health import TeamFailoverOverrideCache
@@ -115,6 +117,7 @@ async def create_embeddings(
     team_override_cache: TeamFailoverOverrideCache = Depends(get_team_failover_override_cache),
     rate_limit_cache: RateLimitCache = Depends(get_rate_limit_cache),
     caching_settings_cache: CachingSettingsCache = Depends(get_caching_settings_cache),
+    custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     sensitivity_label: str | None = Header(default=None, alias="X-Gatekey-Sensitivity-Label"),
 ) -> EmbeddingsResponse:
@@ -147,8 +150,20 @@ async def create_embeddings(
         )
         response_headers.update(build_rate_limit_headers(rate_limit_decision))
 
-        route = resolve_route(body.model)
+        # CMR-4 (Custom Model Registry): `embeddings.py` never passes
+        # `self_hosted_cache` (self-hosted is chat-only, AC5.5.4 untouched)
+        # but DOES pass `custom_model_cache` - a custom model's capability
+        # is per-row (chat OR embeddings), unlike self-hosted. Keyword
+        # argument, deliberately - see `resolve_route()`'s docstring for the
+        # positional-argument hazard this avoids.
+        route = resolve_route(body.model, custom_model_cache=custom_model_cache)
         provider_for_log = route.provider
+        # CMR-4: captured ONCE here - the sole discriminator is `route.
+        # custom_model_id is not None` (never `route.provider`, per the
+        # technical design doc section 2.2/8.1 flag 4).
+        custom_model_route_entry = (
+            custom_model_cache.get(body.model) if route.custom_model_id is not None else None
+        )
         check_model_policy(body.model, cache, team_cache, ctx.team_id)
         if route.capability != ModelCapability.EMBEDDINGS:
             raise HttpUnsupportedRequestError(
@@ -289,6 +304,17 @@ async def create_embeddings(
         response_headers.update(build_failover_headers(failover))
 
         cost_usd: Decimal | None = None
+        precomputed_cost_usd: Decimal | None = None
+        if route.custom_model_id is not None and custom_model_route_entry is not None:
+            # CMR-4 (Custom Model Registry): real per-token pricing from the
+            # admin-entered rates - `completion_tokens=None` selects the
+            # embeddings formula (no output-token term), mirroring `record_
+            # usage_charge()`'s own `completion_tokens=None` convention.
+            precomputed_cost_usd = compute_custom_model_cost(
+                custom_model_route_entry,
+                prompt_tokens=response_obj.usage.prompt_tokens,
+                completion_tokens=None,
+            )
         try:
             charge = await record_usage_charge(
                 session,
@@ -297,8 +323,12 @@ async def create_embeddings(
                 model=body.model,
                 prompt_tokens=response_obj.usage.prompt_tokens,
                 completion_tokens=None,
+                precomputed_cost_usd=precomputed_cost_usd,
                 background_tasks=background_tasks,
                 app=request.app,
+                org_id=ctx.org_id,
+                rate_limit_store=shared_state_store,
+                rate_limit_cache=rate_limit_cache,
             )
             cost_usd = charge.cost
         except PricingEntryMissingError:

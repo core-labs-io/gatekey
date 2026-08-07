@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     # deferred/TYPE_CHECKING-only mirrors `services.residency`'s own
     # `CacheInvalidator` import discipline for a sibling cross-service type
     # used only as a parameter annotation).
+    from gatekey.services.custom_models import CustomModelRouteCache
     from gatekey.services.self_hosted_providers import SelfHostedModelRouteCache
 
 PolicyMode = Literal["unconfigured", "allowlist", "denylist"]
@@ -217,12 +218,14 @@ async def set_policy(
     models: list[str],
     *,
     self_hosted_cache: "SelfHostedModelRouteCache | None" = None,
+    custom_model_cache: "CustomModelRouteCache | None" = None,
 ) -> ModelPolicySnapshot:
     """Validate then atomically full-replace-upsert the org's model policy.
 
     Raises `UnknownModelInPolicyError` if any entry in `models` isn't a
-    known `MODEL_REGISTRY` id AND isn't a currently-routable self-hosted
-    model id either; no database write happens in that case (AC-7).
+    known `MODEL_REGISTRY` id, isn't a currently-routable self-hosted model
+    id, and isn't a currently-routable (verified) custom model name either;
+    no database write happens in that case (AC-7).
 
     Phase 5 (5.5, AC5.5.6/design doc section 2.3(d)): `self_hosted_cache`
     widens the "known model" universe to `MODEL_REGISTRY.keys() |
@@ -233,14 +236,44 @@ async def set_policy(
     static-registry path) preserves the byte-for-byte pre-Phase-5 behavior
     of validating against `MODEL_REGISTRY` alone.
 
+    Custom Model Registry (CMR-5, technical design doc section 5 row 13):
+    `custom_model_cache` widens the union a third way, identical mechanism,
+    no special-casing - `MODEL_REGISTRY.keys() | self_hosted_cache.
+    known_model_ids() | custom_model_cache.known_model_ids()`, each term
+    conditional on its cache being non-`None`. `CustomModelRouteCache.
+    known_model_ids()` only ever contains `verified=true` rows (see that
+    class's docstring), so an unverified custom model's name is still
+    rejected here exactly like any other unknown model id.
+
     The upsert itself is a single `INSERT ... ON CONFLICT (org_id) DO
     UPDATE` statement (not a read-then-write), mirroring
     `services.provider_keys.add_or_replace_key` - so two concurrent `PUT`s
     cannot interleave into a mixed `mode`/`models` pair, and there is no
     window where a partially-applied policy is visible (AC-8).
+
+    Hardening pass item 2 (QA audit of every `on_conflict_do_update(...).
+    returning(...)` call site for the same defect fixed in `services.
+    residency.set_org_residency_rule`/`services.dlp.set_dlp_policy`, see
+    those functions' docstrings for the full mechanism): `execution_options=
+    {"populate_existing": True}` on the upsert's own `execute()` call below
+    is added defensively, not because a live bug is currently reachable
+    through it. `api.v1.admin.model_policy.put_model_policy` (the only
+    caller today) does NOT pre-read the current row into this session's
+    identity map before calling this function, so SQLAlchemy's ORM-enabled
+    `RETURNING` has nothing stale to collide with right now. But that is an
+    accident of this one caller's current shape, not a guarantee - a future
+    caller that adds a pre-read (for an audit-entry `old_value`, exactly
+    like every sibling policy-write route in this codebase already does)
+    would silently reintroduce the identical enforcement-breaking bug with
+    no test ever catching it until it broke in production, same as
+    happened here. Cheap, harmless when unneeded, and closes that latent
+    trap for good - same posture this hardening pass applied everywhere
+    else this shape appears.
     """
-    known_models = MODEL_REGISTRY.keys() | (
-        self_hosted_cache.known_model_ids() if self_hosted_cache is not None else frozenset()
+    known_models = (
+        MODEL_REGISTRY.keys()
+        | (self_hosted_cache.known_model_ids() if self_hosted_cache is not None else frozenset())
+        | (custom_model_cache.known_model_ids() if custom_model_cache is not None else frozenset())
     )
     unknown = set(models) - known_models
     if unknown:
@@ -258,7 +291,9 @@ async def set_policy(
             "updated_at": func.now(),
         },
     ).returning(ModelPolicy)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     return ModelPolicySnapshot(mode=row.mode.value, models=frozenset(row.models))
 
@@ -392,6 +427,7 @@ async def set_team_model_policy(
     *,
     cache: TeamModelPolicyCache | None = None,
     self_hosted_cache: "SelfHostedModelRouteCache | None" = None,
+    custom_model_cache: "CustomModelRouteCache | None" = None,
 ) -> frozenset[str]:
     """Validate then atomically full-replace-upsert one team's restriction.
 
@@ -408,9 +444,40 @@ async def set_team_model_policy(
     like `set_policy`'s own parameter of the same name, widens "known
     model" to also accept a currently-routable self-hosted model id -
     `self_hosted_cache=None` preserves byte-for-byte pre-Phase-5 behavior.
+
+    Custom Model Registry (CMR-5, technical design doc section 5 row 13):
+    `custom_model_cache`, like `set_policy`'s own parameter of the same
+    name, widens "known model" a third way to also accept a currently-
+    routable (verified) custom model name - `custom_model_cache=None`
+    preserves byte-for-byte pre-feature behavior.
+
+    Hardening pass item 2 (QA audit finding the same defect already fixed in
+    `services.residency.set_team_residency_rule`/`services.dlp.
+    set_team_dlp_override` - see `services.residency.
+    set_org_residency_rule`'s docstring for the full mechanism):
+    `execution_options={"populate_existing": True}` on the upsert below is
+    REQUIRED, not decorative, and IS live-triggered here.
+    `api/v1/teams.py`'s `put_model_restrictions_endpoint` pre-reads the
+    CURRENT restriction row (`get_team_model_policy(session, team_id)`, for
+    its own audit-entry `old_value`) into this SAME session's identity map
+    BEFORE calling this function. Without `populate_existing`, SQLAlchemy
+    2.0's ORM-enabled `INSERT ... RETURNING` matches the returned row's
+    primary key against that already-identity-mapped (stale, pre-update)
+    object and returns it unchanged instead of the fresh post-update values
+    on every UPDATE (not the first-ever INSERT for a team, which has no
+    pre-existing identity-mapped object to collide with). That means
+    `cache.set_team(team_id, committed)` below would silently re-arm
+    `TeamModelPolicyCache` with the OLD, pre-tightening restriction on every
+    subsequent write to an already-restricted team - `resolve_model_access()`
+    (read on every single gateway request) would keep enforcing the OLD,
+    more permissive restriction for the rest of this process's lifetime, a
+    real enforcement-correctness bug (e.g. a model removed from a team's
+    allowlist would silently remain reachable through that team).
     """
-    known_models = MODEL_REGISTRY.keys() | (
-        self_hosted_cache.known_model_ids() if self_hosted_cache is not None else frozenset()
+    known_models = (
+        MODEL_REGISTRY.keys()
+        | (self_hosted_cache.known_model_ids() if self_hosted_cache is not None else frozenset())
+        | (custom_model_cache.known_model_ids() if custom_model_cache is not None else frozenset())
     )
     org_snapshot = await load_policy_snapshot(session)
     offending = sorted(
@@ -427,7 +494,9 @@ async def set_team_model_policy(
         index_elements=[TeamModelPolicy.team_id],
         set_={"models": insert_stmt.excluded.models, "updated_at": func.now()},
     ).returning(TeamModelPolicy)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     committed = frozenset(row.models)
     if cache is not None:
@@ -627,7 +696,30 @@ async def set_content_aware_rule(
     know about here is harmless (it just never matches any real route) and
     future-proofs a rule authored before a model is registered - no
     narrowing/subset invariant applies to this table (AC4.2: org-wide only,
-    nothing to narrow against)."""
+    nothing to narrow against).
+
+    Hardening pass item 2 (QA audit finding the same defect already fixed in
+    `services.residency.set_org_residency_rule`/`services.dlp.
+    set_dlp_policy` - see that function's docstring for the full mechanism):
+    `execution_options={"populate_existing": True}` on the upsert below is
+    REQUIRED, not decorative, and IS live-triggered here.
+    `api/v1/admin/content_aware_rules.py`'s `put_content_aware_rules_
+    endpoint` pre-reads every CURRENT rule row (`get_content_aware_rules
+    (session)`, for its own per-category audit-entry `old_value`) into this
+    SAME session's identity map BEFORE calling this function, once per
+    category in the payload. Without `populate_existing`, SQLAlchemy 2.0's
+    ORM-enabled `INSERT ... RETURNING` matches the returned row's primary
+    key against that already-identity-mapped (stale, pre-update) object and
+    returns it unchanged instead of the fresh post-update values on every
+    UPDATE to a category that already had a row (not the first-ever INSERT
+    for that category). That means `cache.set_category(...)` below would
+    silently re-arm `ContentAwareRuleCache` with the OLD, pre-tightening
+    rule - `resolve_content_classification()` (read on every single gateway
+    request) would keep enforcing the OLD, more permissive allowed-models
+    set for the rest of this process's lifetime, a real
+    enforcement-correctness bug (e.g. a model removed from a category's
+    allowlist would silently remain reachable for content matching that
+    category)."""
     dedup_models = sorted(set(allowed_models))
     insert_stmt = postgresql.insert(ContentAwareRule).values(
         org_id=DEFAULT_ORG_ID, category=category, enabled=enabled, allowed_models=dedup_models
@@ -640,7 +732,9 @@ async def set_content_aware_rule(
             "updated_at": func.now(),
         },
     ).returning(ContentAwareRule)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache is not None:
         cache.set_category(

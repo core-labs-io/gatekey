@@ -790,7 +790,21 @@ async def set_dlp_policy(
             "updated_at": text("now()"),
         },
     ).returning(DlpPolicy)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    # Hardening pass item 1: `populate_existing=True` is REQUIRED, not
+    # decorative - see `services.residency.set_org_residency_rule`'s
+    # docstring for the full SQLAlchemy-identity-map mechanics (`api/v1/
+    # admin/dlp_policy.py`'s PUT handler pre-reads the current row into
+    # this same session's identity map, for its audit-entry `old_value`,
+    # before calling this function). This module has no in-process policy
+    # cache for `set_dlp_policy` to silently re-arm stale (DLP policy is
+    # read fresh from the DB on every request - see `load_dlp_policy`'s
+    # docstring), so unlike the residency-rule case this is not an
+    # enforcement-correctness bug - only the PUT response body itself
+    # (`row`, echoed back to the caller as confirmation of the write) would
+    # otherwise show the OLD, pre-update values on a second-and-later write.
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache_invalidator is not None:
         await cache_invalidator.clear_all()
@@ -921,13 +935,20 @@ async def set_team_dlp_override(
     the full rationale; a team override change only needs to invalidate
     that team's own cached entries (`cache_invalidator.clear_team(team_id)`),
     not every team's.
+
+    Hardening pass item 1: `populate_existing=True` below - see `set_dlp_
+    policy`'s identical note (`api/v1/teams.py`'s PUT handler for this
+    route pre-reads the current override into this same session's identity
+    map first).
     """
     insert_stmt = postgresql.insert(TeamDlpActionOverride).values(team_id=team_id, action=action)
     upsert_stmt = insert_stmt.on_conflict_do_update(
         index_elements=[TeamDlpActionOverride.team_id],
         set_={"action": insert_stmt.excluded.action},
     ).returning(TeamDlpActionOverride)
-    row = (await session.execute(upsert_stmt)).scalar_one()
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
     await session.commit()
     if cache_invalidator is not None:
         await cache_invalidator.clear_team(team_id)
