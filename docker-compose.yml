@@ -1,0 +1,151 @@
+# Gatekey - local self-hosted deployment (Phase 1.7, extended for Phase 4).
+#
+# `docker-compose up` starts Postgres + backend + frontend and gets a fully
+# working local instance - see ../README.md for the full under-60-minutes
+# walkthrough (git clone -> first proxied request).
+#
+# Config is via environment variables / this one file, per the Phase 1
+# deployment requirement ("no external dependencies beyond a database and
+# the container runtime"). Copy .env.example to .env and fill in the two
+# required secrets (GATEKEY_ADMIN_TOKEN, GATEKEY_MASTER_KEY) before running.
+#
+# Phase 4 (Reliability & Cost Efficiency) adds Redis-backed features:
+# - Rate limiting with sliding window counters
+# - Exact-match response caching with TTL
+# - Shared state store for distributed deployments
+#
+# Redis is optional and disabled by default. Enable with: docker-compose --profile cache up
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gatekey
+      POSTGRES_PASSWORD: gatekey
+      POSTGRES_DB: gatekey
+    ports:
+      - "5432:5432"
+    volumes:
+      - gatekey_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatekey -d gatekey"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    profiles: ["cache"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - gatekey_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+        required: false  # Redis is optional
+    environment:
+      DATABASE_URL: postgresql+asyncpg://gatekey:gatekey@postgres:5432/gatekey
+      GATEKEY_ADMIN_TOKEN: ${GATEKEY_ADMIN_TOKEN:?Set GATEKEY_ADMIN_TOKEN in .env - see .env.example}
+      GATEKEY_MASTER_KEY: ${GATEKEY_MASTER_KEY:?Set GATEKEY_MASTER_KEY in .env - see .env.example}
+      GATEKEY_PROVIDER_VALIDATION_TIMEOUT_SECONDS: ${GATEKEY_PROVIDER_VALIDATION_TIMEOUT_SECONDS:-8}
+      # Phase 4: Redis connection (optional, for rate limiting, caching, shared state)
+      GATEKEY_REDIS_URL: ${GATEKEY_REDIS_URL:-}
+      # Phase 2 optional vars, pass-through style (bare key, no `${...:-}`
+      # default): an unset var stays UNSET inside the container. This matters
+      # for the OIDC/SMTP groups - `${VAR:-}` would inject empty strings,
+      # which the backend's "unset means disabled" checks treat as configured.
+      GATEKEY_FRONTEND_ORIGIN:
+      GATEKEY_SESSION_COOKIE_SECURE:
+      GATEKEY_SESSION_TTL_HOURS:
+      # SSO (all-or-none; see .env.example "Optional: SSO"). NOTE: inside
+      # compose the backend must reach Keycloak via the service name -
+      # GATEKEY_OIDC_ISSUER_URL=http://keycloak:8080/realms/gatekey-dev -
+      # while browser redirects and the token issuer stay on
+      # http://localhost:8080 (Keycloak's KC_HOSTNAME +
+      # KC_HOSTNAME_BACKCHANNEL_DYNAMIC below make both work at once).
+      GATEKEY_OIDC_ISSUER_URL:
+      GATEKEY_OIDC_CLIENT_ID:
+      GATEKEY_OIDC_CLIENT_SECRET:
+      GATEKEY_OIDC_REDIRECT_URI:
+      # SMTP threshold-alert email (optional; unset = notifier is a no-op).
+      GATEKEY_SMTP_HOST:
+      GATEKEY_SMTP_PORT:
+      GATEKEY_SMTP_USERNAME:
+      GATEKEY_SMTP_PASSWORD:
+      GATEKEY_SMTP_FROM_ADDRESS:
+      GATEKEY_SMTP_USE_TLS:
+      # Phase 3 (audit source-IP capture, AC1.1/AC1.2): off by default. Only
+      # enable this if the backend sits behind a reverse proxy that
+      # overwrites/strips X-Forwarded-For/X-Real-IP on the way in - see
+      # api/deps.py's get_source_ip. Unset/false = the TCP peer address is
+      # used directly, which is correct for a self-hosted instance exposed
+      # straight to the internet with no trusted proxy in front.
+      GATEKEY_TRUST_PROXY_HEADERS:
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Browser-facing base URL for the backend - must be reachable from
+        # the *host machine's browser*, not just container-to-container, so
+        # this deliberately points at the published host port (localhost:8000)
+        # rather than the internal service name ("backend") which only
+        # resolves inside the compose network.
+        NEXT_PUBLIC_API_BASE_URL: ${GATEKEY_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+  # Dev-only Keycloak IdP for SSO development/testing (Phase 2). Gated behind
+  # `--profile sso` - plain `docker-compose up` NEVER starts it (AC1.3).
+  # Start with: docker compose --profile sso up
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0   # pin an exact tag, not `latest`
+    profiles: ["sso"]                        # NEVER starts on plain `docker-compose up`
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin          # dev-only; document as such in README, not a real secret
+      # Split-hostname setup so ONE issuer works for both the host browser
+      # and the backend container: KC_HOSTNAME pins the issuer claim and the
+      # browser-facing authorization endpoint to http://localhost:8080, and
+      # KC_HOSTNAME_BACKCHANNEL_DYNAMIC lets server-to-server calls (token
+      # exchange, JWKS) resolve to http://keycloak:8080 when the backend
+      # fetches discovery from inside the compose network. The backend
+      # validates the token issuer against the discovery document's issuer
+      # (services/oidc.py), so no backend-side override var is needed.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    volumes:
+      - ./devops/keycloak/gatekey-realm.json:/opt/keycloak/data/import/gatekey-realm.json:ro
+    ports:
+      - "8080:8080"
+
+volumes:
+  gatekey_postgres_data:
+  gatekey_redis_data:
