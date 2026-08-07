@@ -140,6 +140,82 @@ async def test_ingest_batch_persists_only_matched_hostname_rows(
     assert rows[0]["user_identifier"] == "alice@example.com"
 
 
+# ---------------------------------------------------------------------------
+# Hardening pass item 7: `raw_metadata` size cap (AC5.1.9's "connection
+# metadata only" claim, now enforced at the schema level, not just documented
+# convention - see `docs/policy/shadow-ai-data-handling.md` §2).
+# ---------------------------------------------------------------------------
+
+
+async def test_ingest_rejects_oversized_raw_metadata_with_structured_422(
+    client: httpx.AsyncClient, auth_headers: dict[str, str], migrated_database_url: str
+) -> None:
+    await _add_known_hostname(client, auth_headers, "chat.openai.com")
+    token = await _rotate_ingest_token(client, auth_headers)
+
+    # Comfortably over the 4096-byte serialized cap.
+    oversized_metadata = {"padding": "x" * 5000}
+    response = await client.post(
+        "/v1/admin/shadow-ai/ingest",
+        json={
+            "events": [
+                {
+                    "user_identifier": "alice@example.com",
+                    "destination_host": "chat.openai.com",
+                    "occurred_at": "2026-08-01T12:00:00Z",
+                    "source": "sase_log",
+                    "raw_metadata": oversized_metadata,
+                }
+            ]
+        },
+        headers=_ingest_headers(token),
+    )
+    assert response.status_code == 422, response.text
+
+    # A clean rejection, not a silent truncation or a partial persist - the
+    # whole batch (Pydantic validates the full request body before the
+    # handler ever runs) is refused, nothing is written.
+    conn = await asyncpg.connect(to_asyncpg_dsn(migrated_database_url))
+    try:
+        rows = await conn.fetch("SELECT id FROM shadow_ai_ingest_events")
+    finally:
+        await conn.close()
+    assert rows == []
+
+
+async def test_ingest_accepts_raw_metadata_within_the_size_cap(
+    client: httpx.AsyncClient, auth_headers: dict[str, str], migrated_database_url: str
+) -> None:
+    await _add_known_hostname(client, auth_headers, "chat.openai.com")
+    token = await _rotate_ingest_token(client, auth_headers)
+
+    small_metadata = {"connection_type": "vpn", "client_version": "1.2.3"}
+    response = await client.post(
+        "/v1/admin/shadow-ai/ingest",
+        json={
+            "events": [
+                {
+                    "user_identifier": "alice@example.com",
+                    "destination_host": "chat.openai.com",
+                    "occurred_at": "2026-08-01T12:00:00Z",
+                    "source": "sase_log",
+                    "raw_metadata": small_metadata,
+                }
+            ]
+        },
+        headers=_ingest_headers(token),
+    )
+    assert response.status_code == 202, response.text
+    assert response.json() == {"received": 1, "persisted": 1, "dropped": 0}
+
+    conn = await asyncpg.connect(to_asyncpg_dsn(migrated_database_url))
+    try:
+        rows = await conn.fetch("SELECT raw_metadata FROM shadow_ai_ingest_events")
+    finally:
+        await conn.close()
+    assert len(rows) == 1
+
+
 async def test_ingestion_rejected_before_setup_no_token_generated(client: httpx.AsyncClient) -> None:
     """AC5.1.4 fail-closed: with no `shadow_ai_ingest_config` row at all
     (nothing rotated yet in this test), the ingest endpoint rejects every

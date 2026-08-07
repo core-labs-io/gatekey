@@ -1,7 +1,0 @@
-total=43
-['GET', 'HEAD'] /openapi.json
-['GET', 'HEAD'] /docs
-['GET', 'HEAD'] /docs/oauth2-redirect
-['GET', 'HEAD'] /redoc
-['GET'] /healthz
-DONE
