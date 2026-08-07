@@ -216,6 +216,52 @@ async def test_ingest_accepts_raw_metadata_within_the_size_cap(
     assert len(rows) == 1
 
 
+async def test_ingest_boundary_precise_payload_just_under_the_cap_succeeds_via_the_real_endpoint(
+    client: httpx.AsyncClient, auth_headers: dict[str, str], migrated_database_url: str
+) -> None:
+    """QA follow-up (item 7): `test_schemas_shadow_ai.py` already pins the
+    exact-4096-byte boundary at the Pydantic-model level in isolation - this
+    is the same boundary-precise construction driven through the REAL
+    ingestion endpoint end-to-end (POST -> 202 -> a row genuinely persisted
+    with the full payload intact), not merely a model-validation unit test."""
+    import json
+
+    await _add_known_hostname(client, auth_headers, "chat.openai.com")
+    token = await _rotate_ingest_token(client, auth_headers)
+
+    overhead = len(json.dumps({"padding": ""}, separators=(",", ":")).encode("utf-8"))
+    filler_len = 4096 - overhead - 1  # one byte under the 4096 cap
+    just_under_metadata = {"padding": "x" * filler_len}
+    serialized_len = len(json.dumps(just_under_metadata, separators=(",", ":")).encode("utf-8"))
+    assert serialized_len == 4095  # sanity-check the arithmetic above
+
+    response = await client.post(
+        "/v1/admin/shadow-ai/ingest",
+        json={
+            "events": [
+                {
+                    "user_identifier": "alice@example.com",
+                    "destination_host": "chat.openai.com",
+                    "occurred_at": "2026-08-01T12:00:00Z",
+                    "source": "sase_log",
+                    "raw_metadata": just_under_metadata,
+                }
+            ]
+        },
+        headers=_ingest_headers(token),
+    )
+    assert response.status_code == 202, response.text
+    assert response.json() == {"received": 1, "persisted": 1, "dropped": 0}
+
+    conn = await asyncpg.connect(to_asyncpg_dsn(migrated_database_url))
+    try:
+        rows = await conn.fetch("SELECT raw_metadata FROM shadow_ai_ingest_events")
+    finally:
+        await conn.close()
+    assert len(rows) == 1
+    assert json.loads(rows[0]["raw_metadata"]) == just_under_metadata
+
+
 async def test_ingestion_rejected_before_setup_no_token_generated(client: httpx.AsyncClient) -> None:
     """AC5.1.4 fail-closed: with no `shadow_ai_ingest_config` row at all
     (nothing rotated yet in this test), the ingest endpoint rejects every

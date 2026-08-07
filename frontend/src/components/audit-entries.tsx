@@ -12,6 +12,14 @@
  * and an Export (CSV/JSON) action that automatically includes chain columns
  * once chaining is enabled - both org-admin and auditor sessions can call
  * these (same `require_admin_or_auditor` gate as the underlying reads).
+ *
+ * Hardening pass item 5: `ChainBadge` below discloses (via the badge's
+ * native tooltip - same convention as `budget-bar`'s title attr in
+ * `components/ui.tsx`) that `GET /v1/admin/audit/verify` can only detect
+ * tampering with or reordering of EXISTING entries, never a deleted tail -
+ * an accepted, documented v1 limitation (no external anchoring in this
+ * release), not a bug, but worth surfacing next to the badge rather than
+ * leaving an admin to assume "intact" means "nothing was ever removed."
  */
 
 import { Fragment, useEffect, useState } from "react";
@@ -79,7 +87,10 @@ function ChainBadge() {
   const tone: BadgeTone = result.status === "intact" ? "green" : "red";
   return (
     <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <Badge tone={tone}>
+      <Badge
+        tone={tone}
+        title="Verification detects tampering with or reordering of existing entries. It cannot detect if the most recent entries were deleted entirely (requires external anchoring, not included in this release)."
+      >
         {result.status === "intact"
           ? `Verified - chain intact (${result.entries_verified ?? 0} entries)`
           : `Chain broken at entry ${result.broken_at_entry_id}`}

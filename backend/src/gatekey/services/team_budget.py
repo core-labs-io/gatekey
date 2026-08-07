@@ -23,6 +23,23 @@ Lock ordering (deadlock avoidance): `org_settings` before `teams` before
 `team_memberships` - the same parent-then-child order used by
 `services.team_periods.ensure_current_period` and
 `services.budget.record_team_membership_usage_charge`.
+
+CMR-14 security review addendum: `write_audit_entry` (`services/audit.py`)
+takes its own `SELECT ... FOR UPDATE` on `compliance_settings` when the
+org's hash chain is enabled - a lock ABOVE `org_settings` in this ordering,
+acquired first. Every call site in this codebase that both writes an audit
+entry and calls one of the `_lock_team`-based functions here (or
+`set_org_budget_ceiling`) must call `write_audit_entry` BEFORE the locking
+function, never after - see `api/v1/teams.py`'s `create_team_endpoint`/
+`update_team_endpoint`/`add_member_endpoint`/`update_member_endpoint`/
+`approve_join_request_endpoint`/`reassign_budget_endpoint`,
+`api/v1/admin/org_settings.py::put_org_settings_endpoint`, and
+`services/scim.py::add_scim_group_members` for the established pattern
+(mirroring `api/v1/admin/custom_models.py`'s/`self_hosted_providers.py`'s
+audit-then-`org_settings`-lock convention for the `custom_models`/
+`self_hosted_providers` collision guards). Getting this backwards
+reproduces a real, previously-shipped Postgres deadlock between opposite
+lock-acquisition orderings.
 """
 
 from __future__ import annotations
@@ -92,14 +109,28 @@ async def create_team_membership(
     user_id: uuid.UUID,
     role: TeamRole = TeamRole.MEMBER,
     budget_usd: Decimal | None,
+    membership_id: uuid.UUID | None = None,
 ) -> TeamMembership:
     """Add a member with a budget, ceiling-checked under the team lock
     (AC2.2's assignment-time enforcement). Flushes, does not commit - see
-    module docstring."""
+    module docstring.
+
+    `membership_id` may be supplied by the caller (a router-generated
+    `uuid.uuid4()`, same shape as `custom_models.py`'s `custom_model_id`
+    parameter) so a lock-ordering-sensitive audit entry can reference the
+    row's id BEFORE this function's own `SELECT ... FOR UPDATE` on `teams`
+    runs (CMR-14 security review's broader systemic-lock-ordering finding -
+    callers write `write_audit_entry` before calling this function so the
+    `compliance_settings` lock, when the org's hash chain is enabled, is
+    always acquired before the `teams` lock here, matching the convention
+    `custom_models.py`/`self_hosted_providers.py`/`org_settings.py` use for
+    the `org_settings` lock). Defaults to a freshly generated id when
+    omitted, for callers that don't need the id ahead of time."""
     team = await _lock_team(session, team_id)
     allocated = await _allocated_member_budget(session, team_id)
     _check_headroom(ceiling=team.budget_ceiling_usd, allocated=allocated, requested=budget_usd)
     membership = TeamMembership(
+        id=membership_id if membership_id is not None else uuid.uuid4(),
         team_id=team_id, user_id=user_id, role=role, budget_usd=budget_usd
     )
     session.add(membership)

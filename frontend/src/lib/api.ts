@@ -2017,7 +2017,15 @@ export function listFailoverEvents(params?: {
  * id/label/health fields the Providers screen's key list and "Check now"
  * button need. Optional `?provider=` filter. Never returns ciphertext/
  * nonce/auth_tag/plaintext - same redaction discipline as every other
- * provider-key surface. */
+ * provider-key surface.
+ *
+ * Hardening pass item 3: `failover_enabled`/`failover_target_id` are now
+ * included here too, closing the gap noted on `ProviderKeyFailoverConfigResponse`
+ * below (this endpoint used to be the ONLY way to learn a key's failover
+ * state was the PUT's own response, so the Providers screen could only ever
+ * show it session-scoped, immediately after a save, and lost it on reload -
+ * see that screen's now-updated module doc comment). This is the
+ * authoritative, always-fresh source for both fields on page load. */
 export interface ProviderKeyListItem {
   id: string;
   provider: ProviderName;
@@ -2028,6 +2036,8 @@ export interface ProviderKeyListItem {
   last_health_check: string | null;
   last_error: string | null;
   availability_24h: number | null;
+  failover_enabled: boolean;
+  failover_target_id: string | null;
 }
 
 export function listProviderKeys(provider?: ProviderName): Promise<ProviderKeyListItem[]> {
@@ -2063,12 +2073,14 @@ export function checkProviderKeyHealth(keyId: string): Promise<ProviderKeyHealth
  * already the specific backend reason, safe to render verbatim rather than
  * folding into a generic failure message.
  *
- * Note: `listProviderKeys()` above does NOT include `failover_enabled`/
- * `failover_target_id` - there is no GET that returns per-key failover
- * config, only this PUT. This response is therefore the only way this
- * console ever learns a key's current failover state; callers should cache
- * it client-side (session-scoped) once returned rather than assuming it's
- * knowable up front. */
+ * Historical note (superseded, hardening pass item 3): `listProviderKeys()`
+ * used to NOT include `failover_enabled`/`failover_target_id`, making this
+ * PUT's response the only way the console ever learned a key's failover
+ * state (session-scoped cache only, lost on reload). `listProviderKeys()`
+ * now returns both fields directly (see that interface's doc comment), so
+ * that's the authoritative source on page load; this response is still
+ * used as an immediate optimistic update right after a save, ahead of the
+ * next full list refresh landing. */
 export interface ProviderKeyFailoverConfigResponse {
   id: string;
   provider: ProviderName;
@@ -2280,6 +2292,158 @@ export function removeSelfHostedProvider(providerId: string): Promise<void> {
  * background health-check job this phase. */
 export function reverifySelfHostedProvider(providerId: string): Promise<SelfHostedProviderResponse> {
   return request<SelfHostedProviderResponse>(`/v1/admin/self-hosted-providers/${providerId}/verify`, {
+    method: "POST",
+    session: adminAuth(),
+  });
+}
+
+/** Hardening pass item 6: the per-endpoint requests/estimated-cost/avg-
+ * latency breakdown the Phase 5 technical design's API-contract table named
+ * but was never built - only the org-wide `GET /v1/admin/usage/summary?
+ * provider=self_hosted` aggregate existed (see the Self-Hosted Governance
+ * screen's now-updated module doc comment for the prior gap). Org Admin +
+ * Auditor read (`require_admin_or_auditor`, same as `listSelfHostedProviders`
+ * above). `range`/`start`/`end` follow the exact same convention as
+ * `getUsageSummary()` (reuses `UsageRange`) - `range` selects a rolling
+ * window ending now, or `range: "custom"` with explicit `start`/`end` (ISO
+ * 8601) for an arbitrary window. `total_estimated_cost_usd` is a `Decimal`
+ * on the backend, serialized as a string here - same convention as every
+ * other `_usd` field in this file (see `UsageSummaryResponse`). 404 if
+ * `providerId` doesn't reference a registered self-hosted provider. */
+export interface SelfHostedProviderUsageResponse {
+  self_hosted_provider_id: string;
+  range_start: string;
+  range_end: string;
+  total_requests: number;
+  total_estimated_cost_usd: string;
+  avg_latency_ms: number;
+}
+
+export function getSelfHostedProviderUsage(
+  providerId: string,
+  range: UsageRange,
+  filters: { start?: string; end?: string } = {}
+): Promise<SelfHostedProviderUsageResponse> {
+  const qs = new URLSearchParams({ range });
+  if (range === "custom") {
+    if (filters.start) qs.set("start", filters.start);
+    if (filters.end) qs.set("end", filters.end);
+  }
+  return request<SelfHostedProviderUsageResponse>(
+    `/v1/admin/self-hosted-providers/${providerId}/usage?${qs.toString()}`,
+    { session: adminAuth() }
+  );
+}
+
+// --- Custom Model Registry (Admin-Managed BYOK Models) ------------------------
+//
+// RBAC: Org Admin registers/edits/removes/verifies (`require_role
+// ("org_admin")`); Org Admin + Auditor list/read (`require_admin_or_auditor`)
+// - identical posture to 5.5 Self-Hosted Governance above, this feature's
+// direct structural precedent. API-client-layer only (CMR-9) - no UI here;
+// see `gatekey/custom-model-registry-technical-design.md` section 3.3 for
+// the authoritative field list this mirrors (verified directly against
+// `backend/src/gatekey/schemas/custom_model.py`, which matches the design
+// doc's section 3.3 exactly, no drift found). Decimal fields
+// (`input_price_per_million_usd`/`output_price_per_million_usd`) are
+// serialized as strings on the wire - same convention as
+// `SelfHostedProviderResponse.cost_basis_per_gpu_hour` above.
+
+export type CustomModelProvider = "openai" | "anthropic" | "vertex_ai" | "openrouter";
+export type CustomModelCapability = "chat" | "embeddings";
+
+export interface CustomModelResponse {
+  id: string;
+  name: string;
+  provider: string;
+  native_model_id: string;
+  capability: string;
+  input_price_per_million_usd: string;
+  output_price_per_million_usd: string | null;
+  pricing_source: string | null;
+  pricing_as_of: string;
+  verified: boolean;
+  shadowed_by_registry: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `schemas.custom_model.CustomModelCreateRequest` exactly.
+ * `output_price_per_million_usd` must be omitted (never sent) for
+ * `capability: "embeddings"` - the backend's write-time guard #4/DB CHECK
+ * rejects a mismatch either way. */
+export interface CustomModelCreateRequest {
+  name: string;
+  provider: CustomModelProvider;
+  native_model_id: string;
+  capability: CustomModelCapability;
+  input_price_per_million_usd: string;
+  output_price_per_million_usd?: string | null;
+  pricing_source?: string | null;
+}
+
+/** Mirrors `schemas.custom_model.CustomModelUpdateRequest` - every field
+ * optional, omitted means "leave unchanged" (identical discipline to
+ * `editSelfHostedProvider`'s body above). Pass
+ * `output_price_per_million_usd: null` explicitly (not omitted) to clear a
+ * previously-required price when editing `capability` from `"chat"` to
+ * `"embeddings"` - the backend distinguishes "omitted" from "explicit
+ * null" via `model_fields_set`. */
+export interface CustomModelUpdateRequest {
+  name?: string;
+  provider?: CustomModelProvider;
+  native_model_id?: string;
+  capability?: CustomModelCapability;
+  input_price_per_million_usd?: string;
+  output_price_per_million_usd?: string | null;
+  pricing_source?: string | null;
+}
+
+export function listCustomModels(): Promise<CustomModelResponse[]> {
+  return request<CustomModelResponse[]>("/v1/admin/custom-models", {
+    session: adminAuth(),
+  });
+}
+
+export function getCustomModel(customModelId: string): Promise<CustomModelResponse> {
+  return request<CustomModelResponse>(`/v1/admin/custom-models/${customModelId}`, {
+    session: adminAuth(),
+  });
+}
+
+export function registerCustomModel(body: CustomModelCreateRequest): Promise<CustomModelResponse> {
+  return request<CustomModelResponse>("/v1/admin/custom-models", {
+    method: "POST",
+    body,
+    session: adminAuth(),
+  });
+}
+
+export function editCustomModel(
+  customModelId: string,
+  body: CustomModelUpdateRequest
+): Promise<CustomModelResponse> {
+  return request<CustomModelResponse>(`/v1/admin/custom-models/${customModelId}`, {
+    method: "PUT",
+    body,
+    session: adminAuth(),
+  });
+}
+
+export function removeCustomModel(customModelId: string): Promise<void> {
+  return request<void>(`/v1/admin/custom-models/${customModelId}`, {
+    method: "DELETE",
+    session: adminAuth(),
+  });
+}
+
+/** One live, minimal test call against the provider using the org's
+ * existing BYOK credential (technical design doc section 2.3). 30s
+ * per-row cooldown enforced backend-side (429 via `ApiError` on repeat
+ * calls); a real provider failure surfaces verbatim via `ApiError.message`
+ * (502-shaped), never swallowed. */
+export function verifyCustomModel(customModelId: string): Promise<CustomModelResponse> {
+  return request<CustomModelResponse>(`/v1/admin/custom-models/${customModelId}/verify`, {
     method: "POST",
     session: adminAuth(),
   });

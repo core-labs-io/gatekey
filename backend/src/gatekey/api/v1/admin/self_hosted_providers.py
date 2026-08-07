@@ -21,8 +21,9 @@ commit (design doc wiring checklist "5.3 (Self-Hosted Governance, 5.5)" row
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.api.deps import (
@@ -33,12 +34,14 @@ from gatekey.api.deps import (
     require_admin_or_auditor,
     require_role,
 )
+from gatekey.api.v1.admin.usage import TimeRange, _resolve_window  # shared range convention
 from gatekey.db.models.self_hosted_provider import SelfHostedProvider
 from gatekey.db.session import get_db_session
 from gatekey.schemas.self_hosted_provider import (
     SelfHostedProviderCreateRequest,
     SelfHostedProviderResponse,
     SelfHostedProviderUpdateRequest,
+    SelfHostedProviderUsageResponse,
 )
 from gatekey.services.audit import write_audit_entry
 from gatekey.services.encryption import KeyProvider
@@ -54,6 +57,7 @@ from gatekey.services.self_hosted_providers import (
     reverify_self_hosted_provider,
 )
 from gatekey.services.sessions import SessionContext
+from gatekey.services.usage_logs import get_self_hosted_provider_usage
 
 router = APIRouter(prefix="/v1/admin/self-hosted-providers", tags=["admin", "self-hosted-providers"])
 
@@ -240,3 +244,46 @@ async def reverify_self_hosted_provider_endpoint(
     await session.commit()
     await _refresh_cache(session, cache)
     return _to_response(row)
+
+
+@router.get("/{provider_id}/usage", response_model=SelfHostedProviderUsageResponse)
+async def get_self_hosted_provider_usage_endpoint(
+    provider_id: uuid.UUID,
+    range: TimeRange = Query(default="7d"),
+    start: datetime | None = Query(default=None),
+    end: datetime | None = Query(default=None),
+    ctx: AdminContext = Depends(require_admin_or_auditor),
+    session: AsyncSession = Depends(get_db_session),
+) -> SelfHostedProviderUsageResponse:
+    """Hardening pass item 6: the per-self-hosted-endpoint requests/
+    estimated-cost/avg-latency breakdown named in the Phase 5 technical
+    design's API-contract table but never built - only the org-wide `GET
+    /v1/admin/usage/summary?provider=self_hosted` aggregate existed. Org
+    Admin + Auditor read (`require_admin_or_auditor`), matching every other
+    Phase 5 read-endpoint's RBAC in this router.
+
+    `range`/`start`/`end` follow the exact same convention `GET /v1/admin/
+    usage/summary` already uses (`_resolve_window`, imported from that
+    module) - `range` selects a rolling window ending now (`24h`/`7d`/`30d`/
+    `90d`), or `range=custom` with explicit `start`/`end` (ISO 8601) for an
+    arbitrary window.
+
+    404 if `provider_id` doesn't reference a registered self-hosted
+    provider - checked here (not left to the aggregate query, which would
+    otherwise return an indistinguishable all-zero result for BOTH "no
+    usage yet" and "no such provider").
+    """
+    existing = await get_self_hosted_provider_by_id(session, provider_id)
+    if existing is None:
+        raise SelfHostedProviderNotFoundError(provider_id)
+
+    since, until = _resolve_window(range, start, end)
+    usage = await get_self_hosted_provider_usage(session, provider_id, since=since, until=until)
+    return SelfHostedProviderUsageResponse(
+        self_hosted_provider_id=usage.self_hosted_provider_id,
+        range_start=since,
+        range_end=until,
+        total_requests=usage.total_requests,
+        total_estimated_cost_usd=usage.total_estimated_cost_usd,
+        avg_latency_ms=usage.avg_latency_ms,
+    )

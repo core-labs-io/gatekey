@@ -60,6 +60,22 @@ class ModelRoute:
     # BYOK-provider route (the overwhelming majority) - see
     # `api.v1.gateway.common.resolve_route`'s self-hosted fallback.
     self_hosted_provider_id: uuid.UUID | None = None
+    # Custom Model Registry (Admin-Managed BYOK Models): populated ONLY when
+    # this route was produced by `CustomModelRouteCache`'s fallback in
+    # `resolve_route()` - the owning `CustomModel.id`. Unlike self-hosted,
+    # a custom model's `provider` carries the REAL BYOK provider value
+    # (`"openai"`/etc.), not a synthetic sentinel - `route.provider` alone
+    # therefore cannot distinguish "a static route to this provider" from
+    # "a custom-model route to this provider" (see `services.custom_models`
+    # module docstring / the Custom Model Registry technical design doc
+    # section 2.2). `custom_model_id` is the ONE field every downstream
+    # cost/audit branch must test for that distinction - never
+    # `route.provider`. `None` for every static route and every self-hosted
+    # route. A route can never have both `self_hosted_provider_id` and
+    # `custom_model_id` set (the two caches' key sets are disjoint by
+    # construction, via the bidirectional collision guards in
+    # `services.custom_models`/`services.self_hosted_providers`).
+    custom_model_id: uuid.UUID | None = None
 
 
 class UnknownModelError(ValueError):

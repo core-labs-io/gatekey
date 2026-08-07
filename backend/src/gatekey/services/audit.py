@@ -153,6 +153,21 @@ second, redundant copy of `shadow_ai_ingest_events` - the report endpoint
 (`GET /v1/admin/shadow-ai/report`) is the intended way to review this
 data, not the audit log.
 
+Custom Model Registry (Admin-Managed BYOK Models) additions - see
+`gatekey/custom-model-registry-technical-design.md` sections 3.1/5/6 and
+`api/v1/admin/custom_models.py`:
+
+    custom_model.register, custom_model.update, custom_model.remove,
+    custom_model.test_call
+
+Every one of these is written by `api/v1/admin/custom_models.py` (Org
+Admin only for every mutation this router exposes) -
+`target_type="custom_model"`, `target_id=str(custom_model_id)` for all
+four. `custom_model.test_call` is written for a genuinely attempted
+verification call only (success or a real `ProviderUpstreamError`), never
+for the pre-call 404/429/provider-not-configured short-circuits - see that
+router's verify endpoint docstring.
+
 Phase 5 (Differentiators, 5.2 Hash-Chained Audit Ledger) - hash-chain
 computation
 ------------------------------------------------------------------------

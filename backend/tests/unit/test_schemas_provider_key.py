@@ -267,6 +267,8 @@ class _FakeProviderKeyListRow:
         self.last_health_check = datetime(2026, 7, 11, 12, 0, 0, tzinfo=timezone.utc)
         self.last_error = None
         self.availability_24h = 0.995
+        self.failover_enabled = True
+        self.failover_target_id = uuid.uuid4()
         # Never-should-leak fields, present on the real ORM row.
         self.ciphertext = b"totally-secret-ciphertext"
         self.nonce = b"nonce-bytes"
@@ -276,12 +278,15 @@ class _FakeProviderKeyListRow:
 
 
 def test_list_item_response_maps_fields_correctly():
-    response = ProviderKeyListItemResponse.model_validate(_FakeProviderKeyListRow())
+    row = _FakeProviderKeyListRow()
+    response = ProviderKeyListItemResponse.model_validate(row)
     assert response.provider == "openai"
     assert response.label == "backup-key-1"
     assert response.is_primary is False
     assert response.health_status == "healthy"
     assert response.availability_24h == 0.995
+    assert response.failover_enabled is True
+    assert response.failover_target_id == row.failover_target_id
 
 
 def test_list_item_response_has_no_secret_fields_defined_at_all():
@@ -295,6 +300,10 @@ def test_list_item_response_has_no_secret_fields_defined_at_all():
         "last_health_check",
         "last_error",
         "availability_24h",
+        # Hardening pass item 3 - plain, non-secret failover routing/config
+        # fields, not ciphertext/nonce/auth_tag/plaintext.
+        "failover_enabled",
+        "failover_target_id",
     }
 
 

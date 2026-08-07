@@ -12,12 +12,22 @@ import uuid
 import pytest
 
 from gatekey.db.models.rate_limit_rule import RateLimitOnLimit, RateLimitRule, RateLimitScopeType
-from gatekey.services.rate_limit import check_and_consume_rate_limit, get_rule_current_status
+from gatekey.services.rate_limit import (
+    RateLimitCache,
+    check_and_consume_rate_limit,
+    get_rule_current_status,
+    record_token_usage,
+    snapshot_from_rule,
+)
 from gatekey.services.shared_state import InProcessSharedStateStore
 
 
 def _rule(
-    *, requests_per_min: int | None, scope_type: RateLimitScopeType, on_limit=RateLimitOnLimit.REJECT
+    *,
+    requests_per_min: int | None,
+    scope_type: RateLimitScopeType,
+    on_limit=RateLimitOnLimit.REJECT,
+    tokens_per_min: int | None = None,
 ) -> RateLimitRule:
     return RateLimitRule(
         id=uuid.uuid4(),
@@ -26,7 +36,7 @@ def _rule(
         scope_team_id=None,
         scope_user_id=None,
         requests_per_min=requests_per_min,
-        tokens_per_min=None,
+        tokens_per_min=tokens_per_min,
         on_limit=on_limit,
         max_queue_wait_seconds=5,
     )
@@ -163,6 +173,138 @@ async def test_rejected_decision_carries_on_limit_and_queue_wait_from_tripped_ru
     assert decision.on_limit == RateLimitOnLimit.QUEUE_RETRY
     assert decision.max_queue_wait_seconds == 5
     assert decision.rule is rule
+
+
+# ============================================================================
+# Hardening pass item 4: `tokens_per_min` enforcement (AC4.2.1/AC4.2.4) -
+# previously validated/stored but never checked on the live path. AC2.4's
+# "never estimate/pre-charge" contract: `check_and_consume_rate_limit()`
+# ONLY ever READS the tokens counter (never increments it); `record_token_
+# usage()` is the ONLY place it is ever incremented, and only after a real
+# provider response.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_tokens_per_min_never_trips_on_its_own_first_request_no_matter_how_large() -> None:
+    """The literal AC2.4 guarantee: a tokens/min gate can only ever block
+    based on ALREADY-consumed tokens from PRIOR requests - it never
+    estimates or pre-charges the current request's own (not-yet-known)
+    usage, so even a request whose eventual usage will vastly exceed the
+    limit is never blocked by that fact alone."""
+    store = InProcessSharedStateStore()
+    rule = _rule(
+        requests_per_min=None, tokens_per_min=5, scope_type=RateLimitScopeType.ORG_DEFAULT_PER_USER
+    )
+    decision = await check_and_consume_rate_limit(
+        store, org_rule=rule, team_rule=None, user_rule=None, team_id=uuid.uuid4(), user_id=uuid.uuid4()
+    )
+    assert decision.allowed is True
+    assert decision.limit == 5
+    assert decision.remaining == 5  # nothing consumed yet - a pure, unmodified read
+
+
+@pytest.mark.asyncio
+async def test_tokens_per_min_check_never_increments_the_counter() -> None:
+    """`check_and_consume_rate_limit()` must be a pure READ on the tokens
+    axis - calling it repeatedly must never itself move the counter (unlike
+    the requests axis, where `try_consume` increments on every passing
+    call)."""
+    store = InProcessSharedStateStore()
+    rule = _rule(
+        requests_per_min=None, tokens_per_min=100, scope_type=RateLimitScopeType.ORG_DEFAULT_PER_USER
+    )
+    team_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    for _ in range(5):
+        decision = await check_and_consume_rate_limit(
+            store, org_rule=rule, team_rule=None, user_rule=None, team_id=team_id, user_id=user_id
+        )
+        assert decision.allowed is True
+        assert decision.remaining == 100  # unchanged across every call - never incremented here
+
+
+@pytest.mark.asyncio
+async def test_record_token_usage_then_gate_trips_once_prior_usage_reaches_the_limit() -> None:
+    """The real, intended lifecycle: `record_token_usage()` (called from
+    `api.v1.gateway.common.record_usage_charge()` after a real provider
+    response) accumulates tokens from prior requests; a LATER `check_and_
+    consume_rate_limit()` call then sees that already-consumed total and
+    blocks once it is at/over the limit."""
+    store = InProcessSharedStateStore()
+    cache = RateLimitCache()
+    org_id = uuid.uuid4()
+    team_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    rule = _rule(
+        requests_per_min=None, tokens_per_min=10, scope_type=RateLimitScopeType.ORG_DEFAULT_PER_USER
+    )
+    cache.set_org_rule(org_id, snapshot_from_rule(rule))
+
+    # Before any usage: full headroom.
+    first = await check_and_consume_rate_limit(
+        store, org_rule=rule, team_rule=None, user_rule=None, team_id=team_id, user_id=user_id
+    )
+    assert first.allowed is True
+    assert first.remaining == 10
+
+    # A real provider response reported 10 tokens - accumulate it.
+    await record_token_usage(store, cache, org_id=org_id, team_id=None, user_id=user_id, total_tokens=10)
+
+    # Now already at the limit - the NEXT request's gate check trips.
+    second = await check_and_consume_rate_limit(
+        store, org_rule=rule, team_rule=None, user_rule=None, team_id=team_id, user_id=user_id
+    )
+    assert second.allowed is False
+    assert second.limit == 10
+    assert second.remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_record_token_usage_is_a_no_op_when_rule_has_no_tokens_per_min_configured() -> None:
+    """A rule with `tokens_per_min=None` (only `requests_per_min` set)
+    contributes nothing to accumulate against - `record_token_usage` must
+    not fabricate a counter for an axis that was never configured."""
+    store = InProcessSharedStateStore()
+    cache = RateLimitCache()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    rule = _rule(requests_per_min=10, scope_type=RateLimitScopeType.ORG_DEFAULT_PER_USER)
+    cache.set_org_rule(org_id, snapshot_from_rule(rule))
+
+    await record_token_usage(store, cache, org_id=org_id, team_id=None, user_id=user_id, total_tokens=99999)
+
+    # The requests-axis counter (the only one this rule configures) must be
+    # completely unaffected - still full headroom.
+    decision = await check_and_consume_rate_limit(
+        store, org_rule=rule, team_rule=None, user_rule=None, team_id=uuid.uuid4(), user_id=user_id
+    )
+    assert decision.allowed is True
+    assert decision.remaining == 9  # only THIS check's own try_consume() moved it
+
+
+@pytest.mark.asyncio
+async def test_requests_and_tokens_axes_are_independent_either_can_trip() -> None:
+    """A rule configuring BOTH axes: exceeding either one trips the
+    request, exactly like the existing pool-vs-personal additive semantics
+    (AC4.2.2/AC4.2.9), just applied within a single rule's two axes."""
+    store = InProcessSharedStateStore()
+    cache = RateLimitCache()
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    rule = _rule(
+        requests_per_min=100, tokens_per_min=10, scope_type=RateLimitScopeType.ORG_DEFAULT_PER_USER
+    )
+    cache.set_org_rule(org_id, snapshot_from_rule(rule))
+
+    # Plenty of request headroom, but tokens already exhausted by a prior
+    # request's real usage.
+    await record_token_usage(store, cache, org_id=org_id, team_id=None, user_id=user_id, total_tokens=10)
+    decision = await check_and_consume_rate_limit(
+        store, org_rule=rule, team_rule=None, user_rule=None, team_id=uuid.uuid4(), user_id=user_id
+    )
+    assert decision.allowed is False
+    assert decision.limit == 10  # the TOKEN limit tripped, not the (still-healthy) request limit
 
 
 # ============================================================================

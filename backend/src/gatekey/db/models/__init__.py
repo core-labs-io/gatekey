@@ -27,6 +27,7 @@ from gatekey.db.models.canary_run import CanaryRun
 from gatekey.db.models.cli_refresh_credential import CliRefreshCredential
 from gatekey.db.models.compliance_settings import ComplianceSettings
 from gatekey.db.models.content_aware_rule import ContentAwareRule
+from gatekey.db.models.custom_model import CustomModel
 from gatekey.db.models.degradation_event import DegradationEvent
 from gatekey.db.models.degradation_policy import DegradationPolicy, DegradationScopeType
 from gatekey.db.models.dlp_custom_pattern import DlpCustomPattern
@@ -82,6 +83,7 @@ __all__ = [
     "CliRefreshCredential",
     "ComplianceSettings",
     "ContentAwareRule",
+    "CustomModel",
     "DegradationEvent",
     "DegradationPolicy",
     "DegradationScopeType",

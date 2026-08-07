@@ -24,6 +24,7 @@ from gatekey.api.v1.admin.caching_settings import router as admin_caching_settin
 from gatekey.api.v1.admin.caching_settings import team_router as admin_caching_settings_team_router
 from gatekey.api.v1.admin.compliance_settings import router as admin_compliance_settings_router
 from gatekey.api.v1.admin.content_aware_rules import router as admin_content_aware_rules_router
+from gatekey.api.v1.admin.custom_models import router as admin_custom_models_router
 from gatekey.api.v1.admin.degradation_events import router as admin_degradation_events_router
 from gatekey.api.v1.admin.degradation_policy import router as admin_degradation_policy_router
 from gatekey.api.v1.admin.degradation_policy import team_router as admin_degradation_policy_team_router
@@ -66,8 +67,10 @@ from gatekey.api.v1.scim import users_router as scim_users_router
 from gatekey.api.v1.shadow_ai_ingest import router as shadow_ai_ingest_router
 from gatekey.api.v1.teams import router as teams_router
 from gatekey.config import Settings, get_settings
+from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.session import create_engine, create_session_factory
 from gatekey.errors import register_exception_handlers
+from gatekey.providers.model_registry import MODEL_REGISTRY
 from gatekey.providers.vertex_ai import VertexAITokenCache
 from gatekey.services.dlp import build_analyzer_engine
 from gatekey.services.model_policy import (
@@ -95,6 +98,7 @@ from gatekey.services.rate_limit import RateLimitCache, load_rate_limit_cache_sn
 from gatekey.services.residency import ResidencyRuleCache, load_residency_rule_snapshot
 from gatekey.services.response_cache import CachingSettingsCache, load_caching_settings_snapshot
 from gatekey.services.scheduler import run_scheduler_loop
+from gatekey.services.custom_models import CustomModelRouteCache, load_custom_model_route_snapshot
 from gatekey.services.self_hosted_providers import (
     SelfHostedModelRouteCache,
     load_self_hosted_model_route_snapshot,
@@ -292,6 +296,81 @@ async def _warm_self_hosted_model_route_cache(app: FastAPI) -> None:
         logger.warning("self_hosted_model_route_cache_bootstrap_failed", exc_info=True)
 
 
+async def _warm_custom_model_route_cache(app: FastAPI) -> None:
+    """Bounded, fail-open warm of `CustomModelRouteCache` (Custom Model
+    Registry / Admin-Managed BYOK Models, CMR-6, technical design doc
+    section 5 row 3) - identical ADR-3-style contract to `_warm_self_hosted_
+    model_route_cache` above: any failure is caught and logged, and the
+    cache stays at its empty default (= no custom model is routable
+    anywhere until the next admin write or process restart - the safe/
+    permissive-in-the-"deny" direction default, since an empty cache means
+    `resolve_route()`'s custom-model fallback finds nothing and every
+    custom-model name 404s exactly like any other unknown model). Never
+    raises.
+
+    Replaces CMR-4's deliberate empty-construction stopgap (see
+    `_lifespan`'s comment at the `app.state.custom_model_route_cache =
+    CustomModelRouteCache()` line) with the real DB-backed warm -
+    `load_custom_model_route_snapshot()` already exists (CMR-2) and already
+    filters to `verified = true` rows only, so this function's shape is a
+    direct, line-for-line mirror of `_warm_self_hosted_model_route_cache`
+    above, just against the new table/cache pair."""
+    try:
+        async with asyncio.timeout(_MODEL_POLICY_BOOTSTRAP_TIMEOUT_SECONDS):
+            async with app.state.db_session_factory() as session:
+                snapshot = await load_custom_model_route_snapshot(session)
+        app.state.custom_model_route_cache.set_all(snapshot)
+    except Exception:
+        logger.warning("custom_model_route_cache_bootstrap_failed", exc_info=True)
+
+
+def _log_custom_model_shadowing(app: FastAPI) -> None:
+    """Startup-only shadowing cross-reference (technical design doc section
+    2.4a/5 row 4/6.3) - called immediately after `_warm_custom_model_route_
+    cache` succeeds (or fails-open to empty; either way the cache is in its
+    final startup state by the time this runs).
+
+    Cross-references `CustomModelRouteCache`'s now-warmed key set against
+    the static `MODEL_REGISTRY`'s keys via a plain, zero-I/O `frozenset`
+    intersection - a collision means an already-registered, already-
+    verified custom model's name has been shadowed by a NEW static registry
+    entry shipped in *this* release. This is deliberately the only
+    detection point for that specific ordering: the write-time collision
+    guard (`services.custom_models._validate_custom_model_write`, guard #1)
+    only runs at registration time, before the colliding static key
+    existed, so it cannot catch this inverse-order case - see design doc
+    section 6.3's explicit "startup shadowing log is a one-time, per-process
+    check" rationale.
+
+    Logs one `ERROR`-level line per colliding name, naming both the org
+    (single-org deployment - `load_custom_model_route_snapshot()` only ever
+    loads `DEFAULT_ORG_ID`'s rows, so this is unambiguous) and the shadowed
+    custom model's id, exactly per design doc section 2.4a's pseudocode.
+    Never a `RuntimeError`, never raises for any reason - a code upgrade
+    that introduces a shadowing collision must be a loud warning, never a
+    reason the gateway fails to start (design doc section 2.4a). Purely
+    synchronous / zero I/O by design - it only reads the already-warmed
+    in-memory cache and the already-imported `MODEL_REGISTRY` dict, no
+    `await` needed."""
+    try:
+        cache: CustomModelRouteCache = app.state.custom_model_route_cache
+        colliding = cache.known_model_ids() & MODEL_REGISTRY.keys()
+        for name in sorted(colliding):
+            entry = cache.get(name)
+            if entry is None:  # pragma: no cover - defensive; nothing mutates the cache concurrently here.
+                continue
+            logger.error(
+                "custom_model_shadowed_by_static_registry",
+                extra={
+                    "org_id": str(DEFAULT_ORG_ID),
+                    "model": name,
+                    "custom_model_id": str(entry.id),
+                },
+            )
+    except Exception:
+        logger.warning("custom_model_shadowing_check_failed", exc_info=True)
+
+
 async def _model_policy_self_heal(app: FastAPI) -> None:
     """Bounded, in-process retry loop for a failed model-policy bootstrap.
 
@@ -474,6 +553,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # bound. See `_warm_self_hosted_model_route_cache`'s docstring.
         app.state.self_hosted_model_route_cache = SelfHostedModelRouteCache()
         await _warm_self_hosted_model_route_cache(app)
+
+        # Custom Model Registry (Admin-Managed BYOK Models): the cache
+        # instance is constructed here empty FIRST (same fail-open "no
+        # custom model routable yet" default the self-hosted cache above
+        # starts from) so `api.deps.get_custom_model_route_cache` (and
+        # therefore `chat.py`/`embeddings.py`'s `resolve_route()` calls)
+        # never hit an `AttributeError` on `app.state`, in every
+        # environment, even if the warm below fails-open. CMR-6: the
+        # bounded-timeout DB warm (`_warm_custom_model_route_cache`,
+        # mirroring `_warm_self_hosted_model_route_cache` above) and the
+        # shadowing startup log (technical design doc section 2.4a/5 row
+        # 3-4) now run immediately after construction, same block/ordering
+        # convention as the self-hosted cache immediately above.
+        app.state.custom_model_route_cache = CustomModelRouteCache()
+        await _warm_custom_model_route_cache(app)
+        _log_custom_model_shadowing(app)
 
         # Phase 3 (BD-1, design doc section 10 fork #2): the Presidio
         # AnalyzerEngine singleton - loading `en_core_web_sm` takes on the
@@ -687,6 +782,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Phase 5 (Differentiators, 5.5 Unified Self-Hosted Governance) - design
     # doc wiring checklist "5.3 (Self-Hosted Governance, 5.5)" row 12.
     app.include_router(admin_self_hosted_providers_router)
+    # Custom Model Registry (Admin-Managed BYOK Models) - technical design
+    # doc section 5 row 20.
+    app.include_router(admin_custom_models_router)
     # Phase 5 (Differentiators, 5.1 Shadow AI Discovery) - design doc wiring
     # checklist "5.5 (Shadow AI, 5.1)" rows 3/4. TWO deliberately SEPARATE
     # routers (see `api/v1/shadow_ai_ingest.py`'s module docstring): the

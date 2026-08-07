@@ -472,6 +472,137 @@ async def test_e2e_chat_completion_self_hosted_model_full_pipeline(
     assert Decimal(user_spend) == Decimal(usage_row["cost_usd"])
 
 
+# ---------------------------------------------------------------------------
+# Hardening pass item 6: `GET /v1/admin/self-hosted-providers/{id}/usage` -
+# the per-endpoint requests/estimated-cost/avg-latency breakdown named in the
+# Phase 5 technical design's API-contract table but never built.
+# ---------------------------------------------------------------------------
+
+
+async def test_usage_endpoint_unknown_provider_404(
+    client: httpx.AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    response = await client.get(
+        f"{_URL}/00000000-0000-0000-0000-000000000099/usage", headers=auth_headers
+    )
+    assert response.status_code == 404
+
+
+async def test_usage_endpoint_requires_admin_or_auditor(client: httpx.AsyncClient) -> None:
+    response = await client.get(f"{_URL}/00000000-0000-0000-0000-000000000099/usage")
+    assert response.status_code in (401, 403)
+
+
+async def test_usage_endpoint_zero_when_no_requests_yet(
+    client: httpx.AsyncClient, auth_headers: dict[str, str]
+) -> None:
+    register_response = await client.post(_URL, json=_register_payload(), headers=auth_headers)
+    provider_id = register_response.json()["id"]
+
+    response = await client.get(f"{_URL}/{provider_id}/usage", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["self_hosted_provider_id"] == provider_id
+    assert body["total_requests"] == 0
+    assert Decimal(body["total_estimated_cost_usd"]) == Decimal("0")
+    assert body["avg_latency_ms"] == 0
+
+
+async def test_usage_endpoint_reflects_a_real_request_through_the_full_pipeline(
+    app: FastAPI,
+    auth_headers: dict[str, str],
+    migrated_database_url: str,
+) -> None:
+    """Registers a real endpoint, drives one real (mocked-HTTP) chat
+    completion through it (same mechanic as `test_e2e_chat_completion_self_
+    hosted_model_full_pipeline` above), then confirms `GET .../usage`
+    reflects exactly that one request - proving the endpoint is a real
+    `GROUP BY self_hosted_provider_id`-style aggregate over `usage_logs`,
+    not a stub. Also proves a DIFFERENT, never-called self-hosted provider
+    stays at zero (the aggregate is correctly scoped to one endpoint, never
+    org-wide)."""
+    secret, _user_id = await _make_service_account_secret(migrated_database_url)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_canned_openai_shaped_response(
+                "usage-endpoint-llama3", "hello from the usage-endpoint test"
+            ),
+        )
+
+    app.dependency_overrides[get_provider_http_client] = lambda: _mock_client_for(handler)
+    try:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as admin_client:
+                register_response = await admin_client.post(
+                    _URL,
+                    json={
+                        "name": "usage-endpoint-provider",
+                        "base_url": "http://usage-endpoint-stub.internal:8000",
+                        "bearer_token": "usage-endpoint-bearer-token",
+                        "cost_basis_per_gpu_hour": "3.6000",
+                        "models": ["usage-endpoint-llama3"],
+                    },
+                    headers=auth_headers,
+                )
+                assert register_response.status_code == 201, register_response.text
+                provider_id = register_response.json()["id"]
+                verify_response = await admin_client.post(
+                    f"{_URL}/{provider_id}/verify", headers=auth_headers
+                )
+                assert verify_response.status_code == 200, verify_response.text
+
+                # A second, never-called provider - must stay at zero below.
+                other_register_response = await admin_client.post(
+                    _URL,
+                    json=_register_payload(name="usage-endpoint-unused-provider"),
+                    headers=auth_headers,
+                )
+                assert other_register_response.status_code == 201, other_register_response.text
+                other_provider_id = other_register_response.json()["id"]
+
+                chat_response = await admin_client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "usage-endpoint-llama3",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                    headers={"Authorization": f"Bearer {secret}"},
+                )
+                assert chat_response.status_code == 200, chat_response.text
+
+                usage_response = await admin_client.get(
+                    f"{_URL}/{provider_id}/usage", headers=auth_headers
+                )
+                other_usage_response = await admin_client.get(
+                    f"{_URL}/{other_provider_id}/usage", headers=auth_headers
+                )
+    finally:
+        app.dependency_overrides.pop(get_provider_http_client, None)
+
+    usage_row = await _fetch_usage_log(migrated_database_url, "usage-endpoint-llama3")
+    assert usage_row is not None
+
+    assert usage_response.status_code == 200, usage_response.text
+    body = usage_response.json()
+    assert body["self_hosted_provider_id"] == provider_id
+    assert body["total_requests"] == 1
+    assert Decimal(body["total_estimated_cost_usd"]) == Decimal(usage_row["cost_usd"])
+    assert Decimal(body["total_estimated_cost_usd"]) >= Decimal("0")
+    # Real wall-clock latency was recorded (never a fabricated/zero figure
+    # for an actual served request).
+    assert body["avg_latency_ms"] > 0
+
+    assert other_usage_response.status_code == 200, other_usage_response.text
+    other_body = other_usage_response.json()
+    assert other_body["total_requests"] == 0
+    assert Decimal(other_body["total_estimated_cost_usd"]) == Decimal("0")
+
+
 async def test_e2e_self_hosted_model_rejected_on_completions_endpoint(
     app: FastAPI,
     auth_headers: dict[str, str],

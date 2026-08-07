@@ -33,6 +33,7 @@ from gatekey.services.personal_keys import (
     get_active_personal_key_by_hash,
 )
 from gatekey.services.access_schedules import AccessScheduleCache
+from gatekey.services.custom_models import CustomModelRouteCache
 from gatekey.services.degradation import DegradationPolicyCache
 from gatekey.services.provider_key_health import TeamFailoverOverrideCache
 from gatekey.services.rate_limit import RateLimitCache
@@ -220,6 +221,24 @@ def get_self_hosted_model_route_cache(request: Request) -> SelfHostedModelRouteC
     `completions.py`/`embeddings.py` never depend on this, which is what
     structurally enforces AC5.5.4's "chat completions only" constraint."""
     return request.app.state.self_hosted_model_route_cache
+
+
+def get_custom_model_route_cache(request: Request) -> CustomModelRouteCache:
+    """Fetch the shared, in-process `CustomModelRouteCache` stashed on
+    `app.state` (Custom Model Registry / Admin-Managed BYOK Models, CMR-4) -
+    same single-instance contract as `get_self_hosted_model_route_cache`
+    above. Built once per process in `main.create_app`'s lifespan, warmed
+    via `_warm_custom_model_route_cache` (technical design doc section 5
+    row 3 - a separate task, CMR-6, wires the actual construction/warming;
+    this dependency is correct to add now regardless, since it only reads
+    `request.app.state` at request time, same as every other `*Cache`
+    dependency in this module). Threaded into BOTH `api/v1/gateway/chat.py`
+    and `api/v1/gateway/embeddings.py` (unlike self-hosted, which is
+    chat-only) - `completions.py` never depends on this, which is what
+    structurally enforces the product spec's "custom models are never
+    routable at `/v1/completions`" non-goal (technical design doc section
+    2.2/section 5 row 9)."""
+    return request.app.state.custom_model_route_cache
 
 
 def get_dlp_analyzer_engine(request: Request) -> AnalyzerEngine:

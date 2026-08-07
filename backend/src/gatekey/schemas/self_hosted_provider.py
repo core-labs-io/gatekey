@@ -63,3 +63,29 @@ class SelfHostedProviderResponse(BaseModel):
     models: list[str]
     created_at: datetime
     updated_at: datetime
+
+
+class SelfHostedProviderUsageResponse(BaseModel):
+    """Hardening pass item 6: backs `GET /v1/admin/self-hosted-providers/
+    {id}/usage` - the per-endpoint requests/estimated-cost/avg-latency
+    breakdown the Phase 5 technical design's API-contract table named but
+    was never built (only the org-wide `GET /v1/admin/usage/summary?
+    provider=self_hosted` aggregate existed). Mirrors `UsageSummaryResponse`'s
+    field naming (`api/v1/admin/usage.py`) where the concepts overlap
+    (`total_estimated_cost_usd`/`avg_latency_ms`), so the frontend doesn't
+    need to learn a second vocabulary for the same figures.
+
+    `total_estimated_cost_usd` is explicitly named "estimated" (not
+    `total_spend_usd`, unlike the org-wide summary) - matching AC5.5.7's
+    "estimated" labeling requirement for every self-hosted cost figure this
+    codebase surfaces (see `services.usage_logs.get_self_hosted_provider_
+    usage`'s docstring for exactly how the underlying `usage_logs.cost_usd`
+    values were computed).
+    """
+
+    self_hosted_provider_id: uuid.UUID
+    range_start: datetime
+    range_end: datetime
+    total_requests: int
+    total_estimated_cost_usd: Decimal
+    avg_latency_ms: float

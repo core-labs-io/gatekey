@@ -13,8 +13,23 @@ import { createContext, useCallback, useContext, useState, type ReactNode } from
 
 export type BadgeTone = "green" | "gray" | "amber" | "red";
 
-export function Badge({ tone, children }: { tone: BadgeTone; children: ReactNode }) {
-  return <span className={`badge badge-${tone}`}>{children}</span>;
+export function Badge({
+  tone,
+  children,
+  title,
+}: {
+  tone: BadgeTone;
+  children: ReactNode;
+  /** Native tooltip on hover - used sparingly, e.g. to disclose a known
+   * limitation alongside a status badge (see `audit-entries.tsx`'s hash-
+   * chain integrity badge) without adding a second UI element. */
+  title?: string;
+}) {
+  return (
+    <span className={`badge badge-${tone}`} title={title}>
+      {children}
+    </span>
+  );
 }
 
 // --- Stat tile -------------------------------------------------------------

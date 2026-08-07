@@ -54,7 +54,7 @@ routing eligibility" note).
 
 Model-id collision guard
 ---------------------------
-Two independent guards apply when an admin registers/edits a self-hosted
+Three independent guards apply when an admin registers/edits a self-hosted
 provider's `models` list (`_validate_model_ids` below):
 
 1. No entry may collide with a static `MODEL_REGISTRY` key - the static
@@ -72,6 +72,31 @@ provider's `models` list (`_validate_model_ids` below):
    explicitly by the phase spec, but a straightforward correctness
    requirement of the cache's own data shape, not a speculative future
    feature.
+3. No entry may collide with a name already claimed by a `custom_models`
+   row in this org (Custom Model Registry feature - see `gatekey/
+   custom-model-registry-technical-design.md` section 4.1 guard #2 /
+   section 5 row 15). This is this module's half of that feature's
+   bidirectional collision guard: `services/custom_models.py`'s own
+   write-time validation runs the mirror-image check against
+   `SelfHostedProvider.models`, so a name collision between the two tables
+   is rejected on whichever side is written second, regardless of write
+   order. Queries the `CustomModel` ORM class DIRECTLY (never `services.
+   custom_models`, the service module) - importing that module here would
+   create a circular import, since it needs the mirror-image check against
+   `SelfHostedProvider` (also queried via the ORM class directly, not this
+   module's own service functions).
+
+   CONCURRENCY (CMR-12/CMR-14 QA fix): guard #3 and its mirror image in
+   `services/custom_models.py::_validate_custom_model_write` are a
+   cross-table invariant with no single row of their own to lock across
+   both tables. Both sides therefore take `SELECT ... FOR UPDATE` on the
+   SAME per-org `org_settings` row
+   (`_lock_org_settings_for_model_name_guard` below) before running their
+   collision SELECT, mirroring `services/team_budget.py`'s ADR-5-style
+   lock-then-check-then-write pattern - see that function's own docstring.
+   This closes the race where a concurrent `register_self_hosted_provider
+   (models=[X])` and `register_custom_model(name=X)` could both pass their
+   collision SELECT before either committed and both succeed.
 """
 
 from __future__ import annotations
@@ -82,10 +107,13 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.constants import DEFAULT_ORG_ID
+from gatekey.db.models.custom_model import CustomModel
+from gatekey.db.models.org_settings import OrgSettings
 from gatekey.db.models.self_hosted_provider import SelfHostedProvider
 from gatekey.errors import GatekeyError, NotFoundError
 from gatekey.providers.base import ValidationStatus
@@ -153,6 +181,27 @@ class SelfHostedModelAlreadyClaimedError(GatekeyError):
             + "."
         )
         self.claimed_models = claimed_models
+
+
+class SelfHostedModelCustomModelCollisionError(GatekeyError):
+    """One or more `models` entries collide with a `custom_models` row's
+    `name` in this org - see module docstring "Model-id collision guard"
+    #3 (this module's half of the Custom Model Registry feature's
+    bidirectional collision guard). 422, no DB write happens in that
+    case."""
+
+    status_code = 422
+    code = "self_hosted_model_custom_model_collision"
+
+    def __init__(self, colliding_models: list[str]) -> None:
+        super().__init__(
+            "The following model id(s) are already registered as a custom "
+            "model's name in this organization and cannot also be "
+            "registered as a self-hosted model: "
+            + ", ".join(sorted(colliding_models))
+            + "."
+        )
+        self.colliding_models = colliding_models
 
 
 class SelfHostedCredentialNotConfiguredError(Exception):
@@ -293,16 +342,49 @@ async def get_self_hosted_provider_by_id(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def _lock_org_settings_for_model_name_guard(session: AsyncSession) -> None:
+    """`SELECT ... FOR UPDATE` the org's `org_settings` row (upserting it
+    first if absent, so there is always a row to lock - identical
+    bootstrap to `services.team_budget.set_org_budget_ceiling`) to
+    serialize this module's half of the bidirectional self-hosted-model /
+    custom-model name-collision guard against
+    `services.custom_models`'s mirror-image lock call - see module
+    docstring "Model-id collision guard" #3 for the full rationale. Held
+    only until the caller's own `session.commit()`/rollback (this
+    module's register/edit functions commit directly on the same session,
+    unlike `team_budget.py`'s flush-only convention) - never across an
+    outbound HTTP call."""
+    await session.execute(
+        postgresql.insert(OrgSettings)
+        .values(org_id=DEFAULT_ORG_ID)
+        .on_conflict_do_nothing(index_elements=[OrgSettings.org_id])
+    )
+    await session.execute(
+        select(OrgSettings.org_id).where(OrgSettings.org_id == DEFAULT_ORG_ID).with_for_update()
+    )
+
+
 async def _validate_model_ids(
     session: AsyncSession, *, models: list[str], exclude_provider_id: uuid.UUID | None
 ) -> None:
     """See module docstring "Model-id collision guard". Raises
-    `SelfHostedModelRegistryCollisionError`/`SelfHostedModelAlreadyClaimedError`
-    - no DB write happens in either case (called BEFORE any write)."""
+    `SelfHostedModelRegistryCollisionError`/`SelfHostedModelAlreadyClaimedError`/
+    `SelfHostedModelCustomModelCollisionError` - no DB write happens in any
+    case (called BEFORE any write)."""
     requested = set(models)
     registry_collisions = requested & MODEL_REGISTRY.keys()
     if registry_collisions:
         raise SelfHostedModelRegistryCollisionError(sorted(registry_collisions))
+
+    # Serialize against services.custom_models's mirror-image guard for the
+    # remainder of this transaction (through the caller's own insert/update
+    # + commit) - see module docstring "Model-id collision guard" #3 /
+    # `_lock_org_settings_for_model_name_guard`'s own docstring for the full
+    # CMR-12/CMR-14 race-condition rationale. Taken before EITHER
+    # cross-cutting check below (both #2, same-table-different-row, and #3,
+    # cross-table) so a concurrent same-table edit/register is also
+    # serialized here, not just the cross-table case.
+    await _lock_org_settings_for_model_name_guard(session)
 
     stmt = select(SelfHostedProvider).where(SelfHostedProvider.org_id == DEFAULT_ORG_ID)
     if exclude_provider_id is not None:
@@ -314,6 +396,13 @@ async def _validate_model_ids(
     already_claimed = requested & claimed
     if already_claimed:
         raise SelfHostedModelAlreadyClaimedError(sorted(already_claimed))
+
+    custom_model_stmt = select(CustomModel).where(CustomModel.org_id == DEFAULT_ORG_ID)
+    custom_model_rows = (await session.execute(custom_model_stmt)).scalars().all()
+    custom_model_names = {row.name for row in custom_model_rows}
+    custom_model_collisions = requested & custom_model_names
+    if custom_model_collisions:
+        raise SelfHostedModelCustomModelCollisionError(sorted(custom_model_collisions))
 
 
 def _encrypt_bearer_token(
