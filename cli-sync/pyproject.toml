@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gatekey-sync"
+version = "0.1.0"
+description = "Local credential-sync helper for Gatekey personal keys (Phase 3, spec section 3.7a) - a thin device-code-authorized CLI wrapper that keeps a rotated personal key on disk/in-env for your AI CLI, without a persistent background process."
+requires-python = ">=3.11"
+# Kept deliberately minimal (ladder rung 5/3): `keyring` is the one
+# non-negotiable dependency (cross-platform OS credential-store
+# abstraction - no hand-rolled per-OS integration, per the design's own
+# resolved decision). `httpx` is used for the handful of JSON HTTP calls
+# this tool makes (device-code start/poll, current-key fetch) - stdlib
+# `urllib.request` could do this, but httpx's `.json()`/timeout/exception
+# ergonomics are enough of a win for a handful of call sites to justify
+# one small, well-known dependency; `requests` was the other option this
+# codebase's architect named - `httpx` was chosen only because the sibling
+# `backend/` package already standardizes on it, not for a functional
+# reason. The CLI surface itself is stdlib `argparse` - no `click` - a
+# handful of subcommands doesn't need a third-party CLI framework.
+dependencies = [
+    "keyring>=24",
+    "httpx>=0.25",
+]
+
+[project.scripts]
+gatekey-sync = "gatekey_sync.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
