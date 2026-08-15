@@ -1,20 +1,19 @@
-# Gatekey - local self-hosted deployment (Phase 1.7, extended for Phase 4).
+# Gatekey - local self-hosted deployment.
 #
-# `docker-compose up` starts Postgres + backend + frontend and gets a fully
-# working local instance - see ../README.md for the full under-60-minutes
-# walkthrough (git clone -> first proxied request).
+# `docker compose up` starts Postgres + backend + frontend and gets a fully
+# working local instance - see README.md for the walkthrough (git clone ->
+# first proxied request), or just run ./setup.sh / .\setup.ps1.
 #
-# Config is via environment variables / this one file, per the Phase 1
-# deployment requirement ("no external dependencies beyond a database and
-# the container runtime"). Copy .env.example to .env and fill in the two
-# required secrets (GATEKEY_ADMIN_TOKEN, GATEKEY_MASTER_KEY) before running.
+# Config is via environment variables / this one file ("no external
+# dependencies beyond a database and the container runtime"). Copy
+# .env.example to .env and fill in the two required secrets
+# (GATEKEY_ADMIN_TOKEN, GATEKEY_MASTER_KEY) before running.
 #
-# Phase 4 (Reliability & Cost Efficiency) adds Redis-backed features:
-# - Rate limiting with sliding window counters
-# - Exact-match response caching with TTL
-# - Shared state store for distributed deployments
-#
-# Redis is optional and disabled by default. Enable with: docker-compose --profile cache up
+# Redis is optional and disabled by default; it powers rate limiting,
+# exact-match response caching, and shared state for multi-replica
+# deployments. Enabling it takes BOTH steps:
+#   1. docker compose --profile cache up
+#   2. GATEKEY_REDIS_URL=redis://redis:6379/0 in .env
 
 services:
   postgres:
@@ -63,13 +62,14 @@ services:
       GATEKEY_ADMIN_TOKEN: ${GATEKEY_ADMIN_TOKEN:?Set GATEKEY_ADMIN_TOKEN in .env - see .env.example}
       GATEKEY_MASTER_KEY: ${GATEKEY_MASTER_KEY:?Set GATEKEY_MASTER_KEY in .env - see .env.example}
       GATEKEY_PROVIDER_VALIDATION_TIMEOUT_SECONDS: ${GATEKEY_PROVIDER_VALIDATION_TIMEOUT_SECONDS:-8}
-      # Phase 4: Redis connection (optional, for rate limiting, caching, shared state)
+      # Redis connection (optional - rate limiting, caching, shared state)
       GATEKEY_REDIS_URL: ${GATEKEY_REDIS_URL:-}
-      # Phase 2 optional vars, pass-through style (bare key, no `${...:-}`
+      # Optional vars, pass-through style (bare key, no `${...:-}`
       # default): an unset var stays UNSET inside the container. This matters
       # for the OIDC/SMTP groups - `${VAR:-}` would inject empty strings,
       # which the backend's "unset means disabled" checks treat as configured.
       GATEKEY_FRONTEND_ORIGIN:
+      GATEKEY_CORS_ALLOWED_ORIGINS:
       GATEKEY_SESSION_COOKIE_SECURE:
       GATEKEY_SESSION_TTL_HOURS:
       # SSO (all-or-none; see .env.example "Optional: SSO"). NOTE: inside
@@ -89,7 +89,7 @@ services:
       GATEKEY_SMTP_PASSWORD:
       GATEKEY_SMTP_FROM_ADDRESS:
       GATEKEY_SMTP_USE_TLS:
-      # Phase 3 (audit source-IP capture, AC1.1/AC1.2): off by default. Only
+      # Audit source-IP capture: off by default. Only
       # enable this if the backend sits behind a reverse proxy that
       # overwrites/strips X-Forwarded-For/X-Real-IP on the way in - see
       # api/deps.py's get_source_ip. Unset/false = the TCP peer address is
@@ -121,8 +121,8 @@ services:
     ports:
       - "3000:3000"
 
-  # Dev-only Keycloak IdP for SSO development/testing (Phase 2). Gated behind
-  # `--profile sso` - plain `docker-compose up` NEVER starts it (AC1.3).
+  # Dev-only Keycloak IdP for SSO development/testing. Gated behind
+  # `--profile sso` - plain `docker compose up` NEVER starts it.
   # Start with: docker compose --profile sso up
   keycloak:
     image: quay.io/keycloak/keycloak:26.0   # pin an exact tag, not `latest`

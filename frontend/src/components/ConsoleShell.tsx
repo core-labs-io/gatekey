@@ -72,11 +72,11 @@ const ORG_ADMIN_NAV: NavGroup[] = [
       { href: "/failover-events", label: "Failover Events" },
     ],
   },
-  // Phase 5 (Differentiators) - Shadow AI/Drift Detector config = Org Admin
+  // AI oversight - Shadow AI/Drift Detector config = Org Admin
   // only; Self-Hosted Governance's actual CRUD lives on the Providers
   // screen, this is the read-only cost-normalization cross-link tab.
   {
-    label: "Differentiators",
+    label: "AI Oversight",
     items: [
       { href: "/differentiators/shadow-ai", label: "Shadow AI" },
       { href: "/differentiators/drift-detector", label: "Drift Detector" },
@@ -93,11 +93,11 @@ const AUDITOR_NAV: NavGroup[] = [
       { href: "/policy-viewer", label: "Policy Viewer" },
     ],
   },
-  // Phase 5 (Differentiators) - Auditor gets the identical read-only view
+  // AI oversight - Auditor gets the identical read-only view
   // of each screen (require_admin_or_auditor backend-side); the pages
   // themselves hide every write control for a non-org_admin session.
   {
-    label: "Differentiators",
+    label: "AI Oversight",
     items: [
       { href: "/differentiators/shadow-ai", label: "Shadow AI" },
       { href: "/differentiators/drift-detector", label: "Drift Detector" },
@@ -217,7 +217,7 @@ export function ConsoleShell({ children }: { children: ReactNode }) {
             </div>
           ))}
         </nav>
-        <div className="sidebar-footer">v0.4.0 (Phase 5)</div>
+        <div className="sidebar-footer">v0.1.0</div>
       </aside>
       <div className="content">
         <div className="topbar">

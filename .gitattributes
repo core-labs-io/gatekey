@@ -1,0 +1,8 @@
+# Shell scripts must always check out with LF line endings — the backend
+# container's entrypoint (backend/docker-entrypoint.sh) is executed inside a
+# Linux container, and a CRLF checkout (the default on Windows with
+# core.autocrlf=true) makes it fail with a cryptic `exec` error.
+*.sh text eol=lf
+
+# PowerShell is happy with either; keep the conventional CRLF on Windows.
+*.ps1 text eol=crlf
