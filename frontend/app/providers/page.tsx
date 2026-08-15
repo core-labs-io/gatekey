@@ -1129,7 +1129,7 @@ export default function ProvidersPage() {
         {error ? <div className="banner banner-error">{error}</div> : null}
 
         <div className="panel" style={{ marginBottom: 16 }}>
-          <div className="panel-title">Reliability (Phase 4)</div>
+          <div className="panel-title">Reliability</div>
           <p className="text-muted">
             A provider can hold more than one labeled key - health, availability, and backup-group
             membership for each are shown per key below. Multi-key failover groups and their
