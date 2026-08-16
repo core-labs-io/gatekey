@@ -28,6 +28,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { clearStoredToken, getMe, getStoredToken, logoutSession } from "@/lib/api";
+import { ThemeToggle } from "@/components/ui";
 
 interface NavGroup {
   label?: string;
@@ -144,6 +145,38 @@ export function ConsoleShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const [identity, setIdentity] = useState<ShellIdentity | null>(null);
+  // Off-canvas drawer state (only relevant under the 900px breakpoint -
+  // above it the sidebar is always visible and this class is inert).
+  const [navOpen, setNavOpen] = useState(false);
+  // Collapsed nav groups, persisted so an admin who tucks away rarely-used
+  // sections keeps that layout across visits.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("gatekey-nav-collapsed");
+      if (raw) setCollapsed(JSON.parse(raw));
+    } catch {
+      // Corrupt/unavailable storage - fall back to everything expanded.
+    }
+  }, []);
+
+  function toggleGroup(label: string) {
+    setCollapsed((prev) => {
+      const next = { ...prev, [label]: !prev[label] };
+      try {
+        localStorage.setItem("gatekey-nav-collapsed", JSON.stringify(next));
+      } catch {
+        // Non-fatal.
+      }
+      return next;
+    });
+  }
+
+  // Navigating always closes the drawer (mobile).
+  useEffect(() => {
+    setNavOpen(false);
+  }, [pathname]);
 
   useEffect(() => {
     let cancelled = false;
@@ -196,32 +229,69 @@ export function ConsoleShell({ children }: { children: ReactNode }) {
   if (!identity) return null;
 
   return (
-    <div className="shell">
+    <div className={`shell ${navOpen ? "sidebar-open" : ""}`}>
       <aside className="sidebar">
         <div className="sidebar-brand">
           <span aria-hidden>&#9860;</span> Gatekey
         </div>
-        <nav className="sidebar-nav">
-          {identity.nav.map((group, i) => (
-            <div key={group.label ?? i}>
-              {group.label ? <div className="sidebar-section">{group.label}</div> : null}
-              {group.items.map((item) => (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className={`sidebar-link ${pathname?.startsWith(item.href) ? "active" : ""}`}
-                >
-                  {item.label}
-                </Link>
-              ))}
-            </div>
-          ))}
+        <nav className="sidebar-nav" aria-label="Main navigation">
+          {identity.nav.map((group, i) => {
+            const isCollapsed = group.label ? Boolean(collapsed[group.label]) : false;
+            return (
+              <div key={group.label ?? i}>
+                {group.label ? (
+                  <button
+                    type="button"
+                    className="sidebar-section"
+                    aria-expanded={!isCollapsed}
+                    onClick={() => toggleGroup(group.label!)}
+                  >
+                    {group.label}
+                    <span className="chevron" aria-hidden>
+                      &#9662;
+                    </span>
+                  </button>
+                ) : null}
+                {isCollapsed
+                  ? null
+                  : group.items.map((item) => (
+                      <Link
+                        key={item.href}
+                        href={item.href}
+                        className={`sidebar-link ${pathname?.startsWith(item.href) ? "active" : ""}`}
+                        aria-current={pathname?.startsWith(item.href) ? "page" : undefined}
+                      >
+                        {item.label}
+                      </Link>
+                    ))}
+              </div>
+            );
+          })}
         </nav>
         <div className="sidebar-footer">v0.1.0</div>
       </aside>
+      {navOpen ? (
+        <button
+          type="button"
+          className="sidebar-backdrop"
+          aria-label="Close navigation"
+          onClick={() => setNavOpen(false)}
+        />
+      ) : null}
       <div className="content">
         <div className="topbar">
+          <button
+            type="button"
+            className="icon-btn nav-toggle"
+            aria-label={navOpen ? "Close navigation" : "Open navigation"}
+            aria-expanded={navOpen}
+            onClick={() => setNavOpen((v) => !v)}
+          >
+            <span aria-hidden>&#9776;</span>
+          </button>
+          <span style={{ flex: 1 }} className="nav-toggle-spacer" />
           <span className="topbar-identity">{identity.label}</span>
+          <ThemeToggle />
           <button className="btn btn-secondary" onClick={handleSignOut}>
             Sign out
           </button>

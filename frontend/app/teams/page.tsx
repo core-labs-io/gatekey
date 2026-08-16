@@ -312,10 +312,14 @@ export default function TeamsPage() {
           rows={teams}
           rowKey={(t) => t.id}
           emptyState="No teams yet. Add one to start delegating budgets."
+          searchText={(t) => t.name}
+          searchPlaceholder="Filter teams..."
+          initialSort={{ key: "name", dir: "asc" }}
           columns={[
             {
               key: "name",
               header: "Team",
+              sortValue: (t) => t.name,
               render: (t) => <Link href={`/teams/${t.id}`}>{t.name}</Link>,
             },
             {

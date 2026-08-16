@@ -44,6 +44,21 @@ npx tsc --noEmit
 npm run build
 ```
 
+Frontend conventions:
+
+- **Data fetching**: new screens use the `useApiQuery` hook
+  (`src/lib/useApiQuery.ts`) instead of hand-rolling
+  useEffect + loading/error state; convert existing pages opportunistically
+  when touching them.
+- **Tables**: use the shared `DataTable` and pass `sortValue` per column
+  plus `searchText` so sorting/filtering/pagination come for free.
+- **Charts**: use the primitives in `src/components/charts.tsx` (themed via
+  the `--chart-*` CSS tokens); every chart keeps a table-view twin so no
+  value is hover-gated.
+- **Colors**: never hardcode a hex in a component — add a token to
+  `app/globals.css` and define it in all three theme blocks (light, the
+  prefers-color-scheme dark block, and `[data-theme="dark"]`).
+
 ## SSO against a locally-running backend
 
 Start just the IdP with `docker compose --profile sso up keycloak` and use

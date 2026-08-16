@@ -153,8 +153,8 @@ export function ProviderKeyForm({
     <div>
       {editingLabel ? (
         <div className="field">
-          <label>Label</label>
-          <input type="text" value={editingLabel} disabled />
+          <label htmlFor="pkf-label-locked">Label</label>
+          <input id="pkf-label-locked" type="text" value={editingLabel} disabled />
           <div className="field-hint">
             Saving overwrites this specific key - to add a separate key instead, use "Add key"
             rather than editing this one.
@@ -162,8 +162,9 @@ export function ProviderKeyForm({
         </div>
       ) : showLabelField ? (
         <div className="field">
-          <label>Label</label>
+          <label htmlFor="pkf-label">Label</label>
           <input
+            id="pkf-label"
             type="text"
             value={keyLabel}
             onChange={(e) => setKeyLabel(e.target.value)}
@@ -178,8 +179,9 @@ export function ProviderKeyForm({
       {provider === "vertex_ai" ? (
         <>
           <div className="field">
-            <label>Service account JSON</label>
+            <label htmlFor="pkf-sa-json">Service account JSON</label>
             <textarea
+              id="pkf-sa-json"
               rows={5}
               value={serviceAccountJson}
               onChange={(e) => setServiceAccountJson(e.target.value)}
@@ -187,19 +189,20 @@ export function ProviderKeyForm({
             />
           </div>
           <div className="field">
-            <label>Project ID</label>
-            <input type="text" value={projectId} onChange={(e) => setProjectId(e.target.value)} />
+            <label htmlFor="pkf-project">Project ID</label>
+            <input id="pkf-project" type="text" value={projectId} onChange={(e) => setProjectId(e.target.value)} />
           </div>
           <div className="field">
-            <label>Location</label>
-            <input type="text" value={location} onChange={(e) => setLocation(e.target.value)} />
+            <label htmlFor="pkf-location">Location</label>
+            <input id="pkf-location" type="text" value={location} onChange={(e) => setLocation(e.target.value)} />
           </div>
         </>
       ) : provider === "ollama" ? (
         <>
           <div className="field">
-            <label>Base URL</label>
+            <label htmlFor="pkf-base-url">Base URL</label>
             <input
+              id="pkf-base-url"
               type="text"
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
@@ -207,8 +210,9 @@ export function ProviderKeyForm({
             />
           </div>
           <div className="field">
-            <label>Bearer token (optional)</label>
+            <label htmlFor="pkf-bearer">Bearer token (optional)</label>
             <input
+              id="pkf-bearer"
               type="password"
               value={bearerToken}
               onChange={(e) => setBearerToken(e.target.value)}
@@ -220,8 +224,9 @@ export function ProviderKeyForm({
         </>
       ) : (
         <div className="field">
-          <label>API key</label>
+          <label htmlFor="pkf-api-key">API key</label>
           <input
+            id="pkf-api-key"
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}

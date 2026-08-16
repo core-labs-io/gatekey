@@ -400,7 +400,13 @@ export default function TeamDetailPage() {
       <div className="page">
         <div className="page-header-row">
           <div>
-            <Link href="/teams">&larr; Teams</Link>
+            <nav className="breadcrumb" aria-label="Breadcrumb">
+              <Link href="/teams">Teams</Link>
+              <span className="breadcrumb-sep" aria-hidden>
+                /
+              </span>
+              <span aria-current="page">{detail.name}</span>
+            </nav>
             <div className="page-title">{detail.name}</div>
           </div>
           <span>

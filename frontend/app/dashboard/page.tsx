@@ -11,6 +11,8 @@
 
 import { useEffect, useState } from "react";
 import { ConsoleShell } from "@/components/ConsoleShell";
+import { SpendOverTimePanel } from "@/components/charts";
+import { OnboardingChecklist } from "@/components/OnboardingChecklist";
 import { StatTile, StatTileSkeleton, DataTable, BudgetBar, Badge, useToast } from "@/components/ui";
 import {
   ApiError,
@@ -137,7 +139,6 @@ export default function DashboardPage() {
   }
 
   const isEmpty = !loading && !error && summary && summary.request_count === 0;
-  const maxDaySpend = summary ? Math.max(1e-9, ...summary.spend_by_day.map((d) => Number(d.spend_usd))) : 1;
   const maxModelSpend = summary
     ? Math.max(1e-9, ...summary.spend_by_model.map((m) => Number(m.spend_usd)))
     : 1;
@@ -213,6 +214,8 @@ export default function DashboardPage() {
           </div>
         ) : null}
 
+        <OnboardingChecklist requestCount={summary ? summary.request_count : null} />
+
         <div className="stat-grid">
           {loading ? (
             <>
@@ -239,21 +242,14 @@ export default function DashboardPage() {
             <div className="panel-title">Spend by day</div>
             {loading ? (
               <div className="skeleton skeleton-text" style={{ height: 120 }} />
-            ) : summary && summary.spend_by_day.length > 0 ? (
-              summary.spend_by_day.map((d) => (
-                <div className="bar-row" key={d.date}>
-                  <span className="bar-label">{d.date}</span>
-                  <span className="bar-track">
-                    <span
-                      className="bar-fill"
-                      style={{ width: `${(Number(d.spend_usd) / maxDaySpend) * 100}%` }}
-                    />
-                  </span>
-                  <span className="bar-value">${Number(d.spend_usd).toFixed(2)}</span>
-                </div>
-              ))
             ) : (
-              <p className="text-muted">No spend data for this range.</p>
+              <SpendOverTimePanel
+                label="Spend by day"
+                points={(summary?.spend_by_day ?? []).map((d) => ({
+                  date: d.date,
+                  value: Number(d.spend_usd),
+                }))}
+              />
             )}
           </div>
           <div className="panel">

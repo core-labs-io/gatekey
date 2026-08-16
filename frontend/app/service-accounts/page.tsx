@@ -521,10 +521,15 @@ export default function ServiceAccountsPage() {
           rows={sorted}
           rowKey={(r) => r.id}
           emptyState="No keys yet."
+          searchText={(r) =>
+            `${r.name} ${r.owner_name} ${r.key_type} ${teams?.find((t) => t.id === r.team_id)?.name ?? ""}`
+          }
+          searchPlaceholder="Filter keys..."
           columns={[
             {
               key: "name",
               header: "Name",
+              sortValue: (r) => r.name,
               render: (r) => (
                 <span style={!r.active ? { color: "var(--text-muted)" } : undefined}>{r.name}</span>
               ),
@@ -533,6 +538,7 @@ export default function ServiceAccountsPage() {
             {
               key: "owner",
               header: "Owner",
+              sortValue: (r) => `${r.key_type} ${r.owner_name}`,
               render: (r) => (
                 <>
                   <Badge tone="gray">{r.key_type === "app" ? "App" : "Personal"}</Badge>{" "}
@@ -543,6 +549,8 @@ export default function ServiceAccountsPage() {
             {
               key: "team",
               header: "Team",
+              sortValue: (r) =>
+                r.team_id === null ? null : (teams?.find((t) => t.id === r.team_id)?.name ?? r.team_id),
               // Legacy pre-Phase-2 keys have no team binding (team_id null).
               render: (r) =>
                 r.team_id === null ? (
@@ -554,11 +562,13 @@ export default function ServiceAccountsPage() {
             {
               key: "created",
               header: "Created",
+              sortValue: (r) => r.created_at,
               render: (r) => new Date(r.created_at).toLocaleDateString(),
             },
             {
               key: "expires",
               header: "Expires",
+              sortValue: (r) => r.expires_at ?? "9999",
               render: (r) => (r.expires_at ? new Date(r.expires_at).toLocaleDateString() : "Never"),
             },
             {
