@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Dark mode: full token-based dark palette (system-preference default plus
+  an explicit topbar toggle persisted per user, applied before first paint).
+- Real spend-over-time chart: SVG line/area chart with hover crosshair +
+  tooltip, keyboard navigation, and a "view as table" twin — replaces the
+  CSS bar rows on the Dashboard, My Usage, and Org Usage screens.
+- DataTable upgrades inherited by every list screen: horizontal scroll
+  container, client-side column sorting (aria-sort), text filter, and
+  pagination; wired up with sort keys on Users, Service Accounts, and Teams.
+- Responsive console: off-canvas sidebar drawer under 900px, fluid stat
+  grids, single-column panels, and no horizontal page scroll on mobile.
+- Accessibility pass on the shared primitives: modal focus trap +
+  Escape-to-close + dialog semantics + focus restore + scroll lock,
+  screen-reader-announced toasts with a dismiss button, visible
+  :focus-visible styles, associated labels on the provider key form, and
+  reduced-motion support.
+- Dismissible "Getting started" checklist on the Dashboard, derived from
+  live data (provider → user/team → service account → first request).
+- Collapsible sidebar nav groups (persisted) and a breadcrumb on the team
+  detail page.
+- `useApiQuery` hook — the shared load/error/refetch pattern for new
+  screens (see docs/development.md).
 - GitHub Actions CI: ruff (blocking), mypy (advisory), backend unit +
   integration tests against service Postgres/Redis, frontend
   typecheck+build, cli-sync tests+package build, and a full compose smoke

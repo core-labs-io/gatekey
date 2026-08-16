@@ -234,11 +234,15 @@ export default function UsersPage() {
           rows={rows}
           rowKey={(r) => r.id}
           emptyState="No users yet. Add one to start tracking budget/spend."
+          searchText={(r) => `${r.name} ${r.org_role ?? ""}`}
+          searchPlaceholder="Filter users..."
+          initialSort={{ key: "name", dir: "asc" }}
           columns={[
-            { key: "name", header: "Name", render: (r) => r.name },
+            { key: "name", header: "Name", render: (r) => r.name, sortValue: (r) => r.name },
             {
               key: "org_role",
               header: "Org role",
+              sortValue: (r) => r.org_role,
               render: (r) =>
                 r.org_role ? (
                   <Badge tone={r.org_role === "org_admin" ? "amber" : "gray"}>
@@ -252,12 +256,14 @@ export default function UsersPage() {
               key: "budget",
               header: "Budget",
               align: "right",
+              sortValue: (r) => (r.budget_usd === null ? null : Number(r.budget_usd)),
               render: (r) => (r.budget_usd === null ? "Unmetered" : `$${Number(r.budget_usd).toFixed(2)}`),
             },
             {
               key: "spent",
               header: "Spent",
               align: "right",
+              sortValue: (r) => Number(r.current_spend_usd),
               render: (r) => `$${Number(r.current_spend_usd).toFixed(2)}`,
             },
             {
