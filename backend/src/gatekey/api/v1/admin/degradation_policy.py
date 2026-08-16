@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import uuid
 from decimal import Decimal
-from typing import Any
 
 from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel
@@ -112,7 +111,7 @@ async def update_degradation_policy(
     degradation_policy_cache: DegradationPolicyCache = Depends(get_degradation_policy_cache),
 ) -> DegradationPolicyResponse:
     """Create or update degradation policy for the default org."""
-    from sqlalchemy import select, insert, update
+    from sqlalchemy import select
 
     # Validate threshold
     if payload.threshold_pct_of_budget < 1.0 or payload.threshold_pct_of_budget > 99.0:
@@ -247,7 +246,7 @@ async def update_team_degradation_policy(
     degradation_policy_cache: DegradationPolicyCache = Depends(get_degradation_policy_cache),
 ) -> TeamDegradationPolicyResponse:
     """Create or update degradation policy for a specific team."""
-    from sqlalchemy import select, insert, update
+    from sqlalchemy import select
 
     # Validate threshold
     if payload.threshold_pct_of_budget < 1.0 or payload.threshold_pct_of_budget > 99.0:

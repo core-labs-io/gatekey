@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- GitHub Actions CI: ruff (blocking), mypy (advisory), backend unit +
+  integration tests against service Postgres/Redis, frontend
+  typecheck+build, cli-sync tests+package build, and a full compose smoke
+  test that bootstraps via `setup.sh` and exercises the admin API, gateway
+  auth, and console.
+- Release workflow: pushing a `vX.Y.Z` tag publishes semver-tagged backend
+  and frontend images to GHCR and attaches the `gatekey-sync` sdist/wheel
+  to a GitHub release (opt-in PyPI publish via trusted publishing).
+- `docker-compose.prod.yml` + Caddy: production deployment on one public
+  domain with automatic TLS, same-origin console/API/SCIM routing (no
+  CORS), parametrized DB password, no DB/Redis ports on the host, memory
+  limits, correct proxy-header settings, and `.env.prod.example`.
+- `docs/production.md`: TLS variations, backups + master-key escrow +
+  restore, upgrade/rollback, SSO walkthroughs (Okta, Microsoft Entra ID,
+  Google Workspace), SCIM setup, cli-sync fleet rollout, and a production
+  checklist.
+- `cli-sync`: README, `GATEKEY_SYNC_BASE_URL` env var for fleet/MDM
+  preconfiguration (flag > env > config > default resolution, with tests),
+  and complete package metadata — `python -m build` produces a
+  pipx-installable wheel.
+- Frontend container healthcheck (both compose files).
 - `LICENSE` (Apache-2.0), this changelog, and `CONTRIBUTING.md`.
 - `setup.sh` / `setup.ps1` one-command bootstrap: generates both required
   secrets (no host Python needed), writes `.env`, and starts docker-compose.
@@ -18,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now passes `GATEKEY_CORS_ALLOWED_ORIGINS` through to the backend.
 
 ### Changed
+- The console's browser-facing API base URL is now applied at container
+  START (`GATEKEY_PUBLIC_API_BASE_URL`), not baked at image build time —
+  one published frontend image works for any backend host. The Next.js
+  standalone server now binds 0.0.0.0 explicitly.
+- Backend source is now ruff-clean (unused imports removed, a missing
+  `TYPE_CHECKING` forward-reference import added, one dead assignment
+  removed).
 - README restructured around a reader evaluating the project (intro,
   architecture diagram, quick start, feature table); detailed references
   moved to `docs/` (configuration, SSO, console tour, known limitations,

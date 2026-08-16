@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-lint:
+    name: Backend lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff>=0.5,<1.0"
+      - run: ruff check src
+        working-directory: backend
+
+  backend-typecheck:
+    name: Backend typecheck (mypy, advisory)
+    runs-on: ubuntu-latest
+    # Advisory only: the codebase has known, pre-existing mypy findings
+    # that are tracked but not yet burned down. This job surfaces the
+    # count on every PR without blocking merges. Flip continue-on-error
+    # off once the count reaches zero.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - run: pip install -e ".[dev]"
+        working-directory: backend
+      - run: mypy src/gatekey --ignore-missing-imports
+        working-directory: backend
+
+  backend-tests:
+    name: Backend tests (unit + integration)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gatekey
+          POSTGRES_PASSWORD: gatekey
+          POSTGRES_DB: gatekey_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gatekey -d gatekey_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      # conftest.py skips its own throwaway-Postgres Docker logic when this
+      # is set and runs migrations against it directly.
+      GATEKEY_TEST_DATABASE_URL: postgresql+asyncpg://gatekey:gatekey@localhost:5432/gatekey_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - run: pip install -e ".[dev]"
+        working-directory: backend
+      - name: Unit tests
+        run: pytest tests/unit -q
+        working-directory: backend
+      - name: Integration tests
+        run: pytest tests/integration -q
+        working-directory: backend
+
+  frontend:
+    name: Frontend typecheck + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: frontend
+      - run: npx tsc --noEmit
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+
+  cli-sync:
+    name: cli-sync tests + package build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ./cli-sync pytest build
+      - run: pytest cli-sync/tests -q
+      - run: python -m build cli-sync
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gatekey-sync-dist
+          path: cli-sync/dist/*
+
+  compose-smoke:
+    name: Compose smoke test (clone -> healthy -> API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap with the setup script (generates secrets, starts stack)
+        run: ./setup.sh
+      - name: Admin API call succeeds with the generated token
+        run: |
+          TOKEN=$(grep '^GATEKEY_ADMIN_TOKEN=' .env | cut -d= -f2)
+          code=$(curl -s -o /tmp/admin.json -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" \
+            http://localhost:8000/v1/admin/provider-keys)
+          cat /tmp/admin.json
+          test "$code" = "200"
+      - name: Gateway rejects a bad key with 401
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://localhost:8000/v1/chat/completions \
+            -H "Authorization: Bearer gk_sk_invalid" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}')
+          test "$code" = "401"
+      - name: Console serves the login page
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login)
+          test "$code" = "200"
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

@@ -37,8 +37,6 @@ next gateway request, not just after the next process restart.
 from __future__ import annotations
 
 import uuid
-from decimal import Decimal
-from typing import Any
 
 from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel
@@ -112,7 +110,7 @@ async def update_caching_settings(
     caching_settings_cache: CachingSettingsCache = Depends(get_caching_settings_cache),
 ) -> CachingSettingsResponse:
     """Create or update caching settings for the default org."""
-    from sqlalchemy import select, insert, update
+    from sqlalchemy import select
 
     # Validate TTL
     if payload.ttl_seconds < 60 or payload.ttl_seconds > 86400:

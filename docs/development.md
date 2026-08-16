@@ -56,15 +56,15 @@ correct when the backend itself runs inside compose). Full SSO walkthrough:
 
 `cli-sync/` is a standalone helper that keeps a rotated personal API key
 synced to a local CLI tool via the OS keychain. It is installed and run
-separately, not part of docker-compose:
+separately, not part of docker-compose — see
+[../cli-sync/README.md](../cli-sync/README.md) for usage and fleet
+rollout. For development:
 
 ```bash
-pip install -e cli-sync/
-gatekey-sync --help
+pip install -e cli-sync/ pytest
+pytest cli-sync/tests
+python -m build cli-sync    # sdist + wheel (pip install build first)
 ```
-
-Its user-facing documentation currently lives in the command's own `--help`
-output and the docstrings in `cli-sync/src/gatekey_sync/cli.py`.
 
 ## Design and requirement documents
 

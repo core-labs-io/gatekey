@@ -19,6 +19,11 @@ Subcommands:
     cache hit - the NFR this whole design exists to satisfy), injects the
     key, runs the wrapped command, and forwards its exit code.
 
+The gateway URL resolves as: `--base-url` flag > `GATEKEY_SYNC_BASE_URL`
+environment variable > saved config > `http://localhost:8000`. The env var
+exists so an IT admin can preconfigure a whole fleet (MDM/login script)
+without each user ever typing the URL.
+
 Uses stdlib `argparse` (ladder rung 3 - a handful of subcommands doesn't
 need a third-party CLI framework). The `--` separator between this tool's
 own flags and the wrapped command is handled by hand (splitting `sys.argv`
@@ -42,6 +47,10 @@ from gatekey_sync.client import AuthRejectedError, CurrentKey, GatekeySyncClient
 CONFIG_FILE = cache.CACHE_DIR / "config.json"
 DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_FILE_TEMPLATE = "{secret}"
+# Fleet/MDM preconfiguration: an IT admin can set this machine-wide so
+# users never have to know the gateway URL. Resolution order everywhere:
+# --base-url flag > GATEKEY_SYNC_BASE_URL env var > saved config > default.
+BASE_URL_ENV_VAR = "GATEKEY_SYNC_BASE_URL"
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,9 @@ def _save_config(config: dict) -> None:
 def _resolve_base_url(args: argparse.Namespace) -> str:
     if args.base_url:
         return args.base_url
+    env_url = os.environ.get(BASE_URL_ENV_VAR)
+    if env_url:
+        return env_url
     return _load_config().get("base_url", DEFAULT_BASE_URL)
 
 
@@ -159,7 +171,7 @@ def _run_wrapped(command: list[str], env: dict | None) -> int:
 
 
 def _cmd_login(args: argparse.Namespace) -> None:
-    base_url = args.base_url or _load_config().get("base_url", DEFAULT_BASE_URL)
+    base_url = _resolve_base_url(args)
     auth.login(base_url)
     config = _load_config()
     config["base_url"] = base_url
