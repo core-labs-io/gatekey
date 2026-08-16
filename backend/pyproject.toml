@@ -47,6 +47,9 @@ dependencies = [
     # GATEKEY_REDIS_URL is set; redis-py ships native asyncio support
     # (`redis.asyncio`) since 4.2, no separate aioredis package needed.
     "redis>=5.0,<6.0",
+    # Tier 4 (ops polish): /metrics endpoint - the standard Prometheus
+    # client, counters/histograms recorded by the observability middleware.
+    "prometheus-client>=0.20,<1.0",
 ]
 
 [project.optional-dependencies]

@@ -92,6 +92,12 @@ class SharedStateStore(Protocol):
         shutdown."""
         ...
 
+    async def ping(self) -> None:
+        """Raise if the backing store is unreachable (used by `/readyz`).
+        The in-process store is always reachable; the Redis store does a
+        real round-trip PING."""
+        ...
+
 
 class InProcessSharedStateStore:
     """Default, zero-configuration `SharedStateStore` - see module docstring.
@@ -172,6 +178,9 @@ class InProcessSharedStateStore:
     async def aclose(self) -> None:  # pragma: no cover - trivial no-op
         return None
 
+    async def ping(self) -> None:  # pragma: no cover - trivial no-op
+        return None
+
 
 # Lua scripts - see module docstring. `KEYS[1]` is the counter key,
 # `ARGV[1]` is `window_seconds` (for `EXPIRE`), `ARGV[2]` is `limit`
@@ -248,3 +257,6 @@ class RedisSharedStateStore:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def ping(self) -> None:
+        await self._client.ping()

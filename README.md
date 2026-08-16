@@ -107,7 +107,7 @@ Okta/Entra ID/Google — use `docker-compose.prod.yml` and follow
 
 | Area | Capabilities |
 |---|---|
-| **Unified gateway** | OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`; streaming (SSE); drop-in for existing SDKs. |
+| **Unified gateway** | OpenAI-compatible `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and `/v1/models` (policy-filtered, so `client.models.list()` shows what *your* key can call); streaming (SSE) with a structured error frame on mid-stream failure; drop-in for existing SDKs. |
 | **Provider & key management** | BYOK for OpenAI/Anthropic/Vertex AI/OpenRouter plus self-hosted endpoints (vLLM/Ollama/any OpenAI-compatible), validated live on entry, encrypted at rest (AES-256-GCM), never displayed again. Register brand-new provider models yourself (with your own pricing) the day they ship — no Gatekey release needed. |
 | **Model policy** | Org-wide allow/denylist that teams can only narrow, never widen; per-request enforcement with plain-language "which layer blocked this" errors. |
 | **Budgets** | Org / team / member budget hierarchy with atomic spend accounting, hard cutoff, monthly/quarterly periods, and optional automatic model downgrade at spend thresholds (with `X-Gatekey-Degraded` response headers). |
@@ -115,6 +115,7 @@ Okta/Entra ID/Google — use `docker-compose.prod.yml` and follow
 | **Security & compliance** | DLP/PII scanning (Presidio, in-process — log/redact/block), content-classification-aware routing (PII, source code, financial, legal), data-residency rules, scheduled access windows, automatic key rotation, configurable retention. |
 | **Audit** | Append-only trail of every governance mutation, with an optional tamper-evident hash chain whose verify endpoint pinpoints the exact broken entry. |
 | **Reliability & cost** | Multi-key failover with active health checks, Redis-backed rate limiting (requests + tokens/min), exact-match response caching, cost/reliability dashboard with CSV/JSON export. |
+| **Operability** | `X-Request-ID` on every response (and in every error body) for log correlation, structured text/JSON logging, Prometheus `/metrics`, a real dependency-checking `/readyz`, and a one-call `POST /v1/admin/bootstrap` that creates user + team + membership + first key atomically. |
 | **AI oversight** | Provider drift detection (daily canary suite against a rolling baseline), shadow-AI discovery from your SASE/proxy logs (allowlist-only storage, dedicated data-handling policy). |
 
 ## Documentation
@@ -129,6 +130,7 @@ Okta/Entra ID/Google — use `docker-compose.prod.yml` and follow
 | [docs/development.md](docs/development.md) | Running backend/frontend locally, tests, cli-sync |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Dev setup, test requirements, ground rules for changes |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
+| API reference | Interactive docs at `http://localhost:8000/docs` on any running instance; the OpenAPI document is committed at [`backend/docs/api/openapi.json`](backend/docs/api/openapi.json) |
 | [`backend/docs/compliance/`](backend/docs/compliance/) | Data-flow diagram + data-handling policy, written for customer security reviews |
 
 ## Repository layout

@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `GET /v1/models` (and `/v1/models/{model}`): OpenAI-compatible model
+  discovery for gateway keys, filtered by the caller's effective org+team
+  policy — `client.models.list()` now works and shows exactly what that
+  key can call.
+- `X-Request-ID` on every response (caller-supplied ids honored when
+  well-formed), embedded as `error.request_id` in every error body and
+  shared with gateway usage-log rows and server log lines.
+- Real structured logging: `extra={...}` fields (previously silently
+  dropped — no formatter rendered them) now reach the output; `text`
+  (key=value) or `json` via `GATEKEY_LOG_FORMAT`.
+- Prometheus `/metrics` (HTTP request counters + duration histograms by
+  route template) and `/readyz` (real database/Redis checks, 503 when a
+  dependency is down); compose healthchecks now use `/readyz`.
+- `POST /v1/admin/bootstrap`: one atomic call creating user + team +
+  membership (+budget) + service-account key — the four-entity first-key
+  chain in one step, with audit entries.
+- Streaming failures are now distinguishable from completion: a mid-stream
+  provider error emits a structured SSE `{"error": ...}` frame and never
+  `data: [DONE]`.
+- Budget-exhausted errors carry `budget_usd`/`current_spend_usd` as
+  structured fields, not just prose.
+- OpenAPI hygiene: stale app description replaced, the error envelope is
+  declared on the gateway routes, and a generated `openapi.json` is
+  committed at `backend/docs/api/openapi.json` (CI fails on drift).
 - Dark mode: full token-based dark palette (system-preference default plus
   an explicit topbar toggle persisted per user, applied before first paint).
 - Real spend-over-time chart: SVG line/area chart with hover crosshair +

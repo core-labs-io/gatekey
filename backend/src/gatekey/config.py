@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     # horizontally-scaled deployment.
     GATEKEY_REDIS_URL: str | None = None
 
+    # --- Logging (Tier 4 ops polish) ---
+    # "text" (default): human-readable lines with `extra={...}` fields
+    # appended as key=value pairs. "json": one JSON object per line, for
+    # log pipelines. Either way, the structured extra fields this codebase
+    # attaches to log calls actually reach the output now - see
+    # `observability.configure_logging`.
+    GATEKEY_LOG_FORMAT: str = "text"
+    GATEKEY_LOG_LEVEL: str = "INFO"
+
     def cors_allowed_origins(self) -> list[str]:
         """Explicit CORS origin allowlist: the frontend origin plus any
         extra configured origins. Wildcard entries are dropped - credentialed

@@ -443,7 +443,12 @@ def test_chat_completion_denied_model_non_streaming_returns_403_and_never_dispat
     # wording, not just "some 403 happened". Phase 2 (BD-13) extended the
     # message to name the blocking layer ("org policy" here); `code` and
     # status are unchanged.
-    assert response.json() == {
+    body = response.json()
+    # Tier 4 adds a per-request correlation id to every error body - assert
+    # it separately, then keep the exact-wording lockdown on the rest.
+    request_id = body["error"].pop("request_id")
+    assert request_id == response.headers["X-Request-ID"]
+    assert body == {
         "error": {
             "code": "model_denied",
             "message": (
@@ -742,3 +747,62 @@ async def test_sse_event_stream_closes_upstream_generator_on_disconnect(monkeypa
     # already gone does not need it, and there is no guarantee the
     # connection can still accept bytes (see chat.py finally block).
     assert frames == []
+
+
+# --- Tier 4: mid-stream provider failure emits an SSE error frame, not [DONE] --
+
+
+def test_chat_completion_streaming_midstream_error_emits_error_frame_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider failure AFTER chunks have streamed must be distinguishable
+    from a complete response: one final `data: {"error": ...}` frame, and
+    never `data: [DONE]` (Tier 4 ops/DX polish)."""
+
+    async def _two_chunks_then_error(client, native_model_id, request, credential, *, timeout_seconds=60.0):  # noqa: ANN001, ARG001
+        yield ChatCompletionChunk(
+            id="chatcmpl-test",
+            created=1_700_000_000,
+            model=native_model_id,
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChatCompletionChunkDelta(role="assistant", content=""),
+                    finish_reason=None,
+                )
+            ],
+        )
+        yield ChatCompletionChunk(
+            id="chatcmpl-test",
+            created=1_700_000_000,
+            model=native_model_id,
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChatCompletionChunkDelta(content="partial answ"),
+                    finish_reason=None,
+                )
+            ],
+        )
+        raise ProviderCallError("OpenAI returned HTTP 500 during inference.", status_code=500)
+
+    monkeypatch.setattr(openai_mod, "stream_chat_completion", _two_chunks_then_error)
+
+    app = build_authenticated_app(monkeypatch)
+    with TestClient(app) as client:
+        with client.stream(
+            "POST",
+            _CHAT_URL,
+            json=_basic_body("gpt-4o", stream=True),
+            headers={"Authorization": "Bearer gk_sk_test"},
+        ) as response:
+            assert response.status_code == 200  # headers were already sent
+            raw_frames = [line for line in response.iter_lines() if line]
+
+    assert all(line != "data: [DONE]" for line in raw_frames)
+    last = json.loads(raw_frames[-1][len("data: "):])
+    assert last["error"]["code"] == "provider_upstream_error"
+    assert "request_id" in last["error"]
+    # The successfully-streamed chunks were still delivered before the frame.
+    first = json.loads(raw_frames[0][len("data: "):])
+    assert first["choices"][0]["delta"]["role"] == "assistant"

@@ -87,6 +87,11 @@ jobs:
       - name: Integration tests
         run: pytest tests/integration -q
         working-directory: backend
+      - name: OpenAPI document is current
+        run: |
+          python scripts/export_openapi.py
+          git diff --exit-code docs/api/openapi.json
+        working-directory: backend
 
   frontend:
     name: Frontend typecheck + build
