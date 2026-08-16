@@ -36,3 +36,7 @@ node_modules/
 dist/
 build/
 *.tsbuildinfo
+
+# --- Playwright ---
+test-results/
+playwright-report/
