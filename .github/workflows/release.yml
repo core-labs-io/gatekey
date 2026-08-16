@@ -1,0 +1,92 @@
+name: Release
+
+# Cut a release by pushing a semver tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# This publishes:
+#   - ghcr.io/<owner>/gatekey-backend:{X.Y.Z, X.Y, latest}
+#   - ghcr.io/<owner>/gatekey-frontend:{X.Y.Z, X.Y, latest}
+#   - a GitHub Release with the gatekey-sync sdist + wheel attached
+#   - (optional) gatekey-sync to PyPI, if the repository variable
+#     PUBLISH_TO_PYPI is set to "true" and PyPI trusted publishing is
+#     configured for this repository (see docs/production.md).
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  images:
+    name: Publish ${{ matrix.component }} image
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/gatekey-${{ matrix.component }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.component }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,scope=${{ matrix.component }},mode=max
+
+  cli-sync-dist:
+    name: Build gatekey-sync distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build cli-sync
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cli-sync/dist/*
+          generate_release_notes: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gatekey-sync-dist
+          path: cli-sync/dist/*
+
+  pypi:
+    name: Publish gatekey-sync to PyPI (opt-in)
+    # Requires: repository variable PUBLISH_TO_PYPI=true, plus a PyPI
+    # "trusted publisher" configured for this repo/workflow (no API token
+    # secret needed). Skipped entirely otherwise.
+    if: vars.PUBLISH_TO_PYPI == 'true'
+    needs: cli-sync-dist
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gatekey-sync-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

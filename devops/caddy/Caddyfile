@@ -1,0 +1,32 @@
+# Gatekey production reverse proxy (docker-compose.prod.yml).
+#
+# Serves the console and the API on ONE domain with automatic TLS:
+#   https://<domain>/v1/*      -> backend  (gateway + admin API + SSO callback)
+#   https://<domain>/scim/v2/* -> backend  (SCIM provisioning, if enabled)
+#   https://<domain>/healthz   -> backend  (monitoring)
+#   https://<domain>/*         -> frontend (console)
+#
+# Same-origin routing means no CORS configuration and no cross-origin
+# session-cookie pitfalls: browser, console, and API all share one origin.
+#
+# TLS is automatic (Let's Encrypt) for any public domain, provided DNS for
+# the domain points at this host and ports 80+443 are reachable from the
+# internet. With GATEKEY_DOMAIN=localhost, Caddy issues a locally-trusted
+# self-signed certificate instead - useful for a smoke test, not for users.
+
+{$GATEKEY_DOMAIN} {
+	encode gzip
+
+	handle /v1/* {
+		reverse_proxy backend:8000
+	}
+	handle /scim/v2/* {
+		reverse_proxy backend:8000
+	}
+	handle /healthz {
+		reverse_proxy backend:8000
+	}
+	handle {
+		reverse_proxy frontend:3000
+	}
+}

@@ -107,19 +107,27 @@ services:
   frontend:
     build:
       context: ./frontend
-      args:
-        # Browser-facing base URL for the backend - must be reachable from
-        # the *host machine's browser*, not just container-to-container, so
-        # this deliberately points at the published host port (localhost:8000)
-        # rather than the internal service name ("backend") which only
-        # resolves inside the compose network.
-        NEXT_PUBLIC_API_BASE_URL: ${GATEKEY_PUBLIC_API_BASE_URL:-http://localhost:8000}
     restart: unless-stopped
     depends_on:
       backend:
         condition: service_healthy
+    environment:
+      # Browser-facing base URL for the backend - must be reachable from
+      # the *host machine's browser*, not just container-to-container, so
+      # this deliberately points at the published host port (localhost:8000)
+      # rather than the internal service name ("backend") which only
+      # resolves inside the compose network. Applied at container START
+      # (the image is host-agnostic - see frontend/docker-entrypoint.sh),
+      # so the same image can be pointed at a different backend without a
+      # rebuild.
+      GATEKEY_PUBLIC_API_BASE_URL: ${GATEKEY_PUBLIC_API_BASE_URL:-http://localhost:8000}
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/login').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   # Dev-only Keycloak IdP for SSO development/testing. Gated behind
   # `--profile sso` - plain `docker compose up` NEVER starts it.

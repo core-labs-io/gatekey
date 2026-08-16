@@ -31,7 +31,6 @@ and loaded into a cache at startup (see `load_rate_limit_cache`).
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
 import uuid

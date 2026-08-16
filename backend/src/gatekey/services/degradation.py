@@ -28,18 +28,14 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
-from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.db.models.degradation_event import DegradationEvent
 from gatekey.db.models.degradation_policy import DegradationPolicy, DegradationScopeType
-from gatekey.db.models.org import Org
-from gatekey.db.models.team import Team
-from gatekey.db.models.usage_log import UsageLog
 # `services.team_budget` owns assignment-time *ceiling* enforcement
 # (create/update membership budgets) - it does not read current spend state
 # and has no `get_team_membership_budget_state`/`get_budget_state` functions.

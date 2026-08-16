@@ -94,6 +94,15 @@ Then:
 | **SSO** (OIDC, with a bundled dev-only Keycloak for local testing) | `./setup.sh --sso`, then follow [docs/sso.md](docs/sso.md). |
 | **Email alerts** (budget thresholds; webhooks work with no server config) | Set the `GATEKEY_SMTP_*` variables — see [docs/configuration.md](docs/configuration.md). |
 
+### Deploying for your organization
+
+The quick start above is a laptop evaluation. For a real deployment —
+one public domain with automatic TLS (Caddy + Let's Encrypt), a
+parametrized database password, no database/Redis ports exposed, correct
+proxy-header and cookie settings, backups, upgrades, and SSO against
+Okta/Entra ID/Google — use `docker-compose.prod.yml` and follow
+**[docs/production.md](docs/production.md)**.
+
 ## What you get
 
 | Area | Capabilities |
@@ -113,6 +122,7 @@ Then:
 | Document | What's in it |
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | Every environment variable, with defaults and gotchas |
+| [docs/production.md](docs/production.md) | Production deployment — TLS, backups, upgrades/rollback, SSO walkthroughs (Okta/Entra/Google), SCIM |
 | [docs/sso.md](docs/sso.md) | SSO setup — bundled dev Keycloak and production IdPs |
 | [docs/console.md](docs/console.md) | Tour of every admin and non-admin console screen |
 | [docs/known-limitations.md](docs/known-limitations.md) | Honest list of what's unverified, estimated, or deliberately deferred |
@@ -124,15 +134,18 @@ Then:
 ## Repository layout
 
 ```
-backend/            FastAPI gateway + admin API (Python)
-frontend/           Admin & user console (Next.js/React)
-cli-sync/           gatekey-sync CLI - keeps a rotated personal API key
-                    synced to local tools via the OS keychain
-devops/keycloak/    Dev-only Keycloak realm for SSO testing
-docs/               Operator documentation
-gatekey/            Product requirement documents (historical scope)
-setup.sh, setup.ps1 One-command bootstrap
-docker-compose.yml  Local self-hosted deployment
+backend/                 FastAPI gateway + admin API (Python)
+frontend/                Admin & user console (Next.js/React)
+cli-sync/                gatekey-sync CLI - keeps a rotated personal API key
+                         synced to local tools via the OS keychain
+devops/keycloak/         Dev-only Keycloak realm for SSO testing
+devops/caddy/            Caddyfile for the production reverse proxy
+docs/                    Operator documentation
+gatekey/                 Product requirement documents (historical scope)
+.github/workflows/       CI (lint, tests, compose smoke test) + release
+setup.sh, setup.ps1      One-command bootstrap
+docker-compose.yml       Local self-hosted deployment
+docker-compose.prod.yml  Production deployment (Caddy, TLS - see docs/production.md)
 ```
 
 ## Design principles

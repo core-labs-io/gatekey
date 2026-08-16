@@ -214,10 +214,24 @@ when the code was built. Items closed by later work are removed (see
 
 ## Project maturity
 
-- **No CI pipeline, published container images, or production deployment
-  guide yet** — these are the next planned tranche of work. Today's
-  deployment path is `git clone` + docker-compose, and upgrades are
-  `git pull && docker compose up --build`.
+- **Container images are not published until the repository lives on
+  GitHub and a release tag is pushed.** The release workflow
+  (`.github/workflows/release.yml`) publishes semver-tagged backend and
+  frontend images to GHCR on every `v*.*.*` tag; until the first tag,
+  `docker compose -f docker-compose.prod.yml up -d --build` builds from
+  the checkout instead (the compose files support both paths).
+- **CI has not yet run on GitHub's own runners.** Every command the
+  workflow executes (ruff, both pytest suites, frontend typecheck+build,
+  cli-sync tests+build, the compose smoke test) was run and verified
+  locally, but the workflow itself needs one real run on GitHub to be
+  called proven.
+- **mypy reports ~56 pre-existing findings** in the backend; the CI
+  typecheck job is advisory (non-blocking) until that count is burned
+  down. `ruff check src` is clean and blocking.
+- **`gatekey-sync` is not on public PyPI.** The release workflow attaches
+  the sdist/wheel to each GitHub release and has an opt-in PyPI publish
+  job (trusted publishing) behind the `PUBLISH_TO_PYPI` repository
+  variable; install via `pipx install <wheel>` until then.
 - **Feature prioritization has not yet been validated with real design
   partners** — the five differentiating features (hash-chained ledger,
   drift detector, self-hosted governance, content-aware routing, shadow AI

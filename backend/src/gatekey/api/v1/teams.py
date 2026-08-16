@@ -20,7 +20,6 @@ form - `webhook_configured` only (see `services/teams.py`).
 from __future__ import annotations
 
 import uuid
-from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Response, status
@@ -635,7 +634,7 @@ async def put_model_restrictions_endpoint(
     internally - its commit persists both in one transaction, and its
     validate-before-write means a 422 leaves the pending audit row
     uncommitted (rolled back with the session)."""
-    team = await _get_team_or_404(session, team_id)
+    await _get_team_or_404(session, team_id)  # existence gate only
     old_restriction = await get_team_model_policy(session, team_id)
     await write_audit_entry(
         session,
