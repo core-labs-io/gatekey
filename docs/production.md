@@ -254,10 +254,24 @@ for full usage. For a fleet:
 
 ## Monitoring
 
-- `https://<domain>/healthz` — liveness (the compose healthcheck uses it
-  in-container). Note it does not yet verify database connectivity; a
-  deeper `/readyz` and Prometheus `/metrics` are on the roadmap (see
-  [known-limitations.md](known-limitations.md)).
+- `https://<domain>/healthz` — liveness: the process is up.
+- `/readyz` — readiness: verifies the database (and Redis, when
+  configured) actually respond; returns 503 with per-check detail
+  otherwise. The compose healthchecks use it, so a backend with a dead
+  dependency never reports healthy.
+- `/metrics` — Prometheus exposition: `gatekey_http_requests_total` and
+  `gatekey_http_request_duration_seconds`, labeled by method, route
+  template, and status, plus standard process metrics.
+- **`/readyz` and `/metrics` are deliberately NOT routed by the bundled
+  Caddyfile** — they're for inside-the-network scrapers/orchestrators.
+  Point Prometheus at the backend container directly (`backend:8000`), or
+  add an access-controlled route in `devops/caddy/Caddyfile` if you need
+  them externally.
+- **Log correlation:** every response carries an `X-Request-ID` header
+  (honored from the caller when supplied), every error body embeds the
+  same id as `error.request_id`, and gateway usage-log rows/server log
+  lines share it. Set `GATEKEY_LOG_FORMAT=json` for pipeline-friendly
+  structured logs (see [configuration.md](configuration.md)).
 - `docker compose -f docker-compose.prod.yml logs -f backend` — request
   and scheduler logs, migration output on start.
 - The console dashboard tracks spend, error rate, latency, cache hit

@@ -99,7 +99,10 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      # /readyz (not /healthz): fails when the database - or Redis, when
+      # configured - is actually unreachable, so a container with a dead
+      # dependency never reports healthy.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
       interval: 5s
       timeout: 3s
       retries: 20

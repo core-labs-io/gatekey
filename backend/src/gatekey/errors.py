@@ -414,10 +414,17 @@ def _error_response(
     *,
     headers: dict[str, str] | None = None,
     extra: dict[str, Any] | None = None,
+    request_id: str | None = None,
 ) -> JSONResponse:
     body: dict[str, Any] = {"code": code, "message": message}
     if extra:
         body.update(extra)
+    # Tier 4 ops polish: every error body carries the request correlation id
+    # (also echoed as the X-Request-ID response header) so a caller's "my
+    # request failed" report can be matched to server logs/usage rows.
+    if request_id is not None:
+        body["request_id"] = request_id
+        headers = {**(headers or {}), "X-Request-ID": request_id}
     return JSONResponse(
         status_code=status_code,
         content={"error": body},
@@ -425,14 +432,29 @@ def _error_response(
     )
 
 
+def _request_id_of(request: Request) -> str | None:
+    """The id assigned by `observability.install_observability`'s middleware
+    (None only when an app was built without it, e.g. bare unit fixtures)."""
+    return getattr(request.state, "request_id", None)
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """Register structured-error handlers on the given FastAPI app."""
 
     @app.exception_handler(GatekeyError)
     async def _handle_gatekey_error(request: Request, exc: GatekeyError) -> JSONResponse:
-        logger.info("gatekey_error", extra={"code": exc.code, "path": request.url.path})
+        request_id = _request_id_of(request)
+        logger.info(
+            "gatekey_error",
+            extra={"code": exc.code, "path": request.url.path, "request_id": request_id},
+        )
         return _error_response(
-            exc.status_code, exc.code, exc.message, headers=exc.headers, extra=exc.extra
+            exc.status_code,
+            exc.code,
+            exc.message,
+            headers=exc.headers,
+            extra=exc.extra,
+            request_id=request_id,
         )
 
     @app.exception_handler(StarletteHTTPException)
@@ -440,7 +462,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
         detail = exc.detail if isinstance(exc.detail, str) else "HTTP error"
-        return _error_response(exc.status_code, "http_error", detail)
+        return _error_response(
+            exc.status_code, "http_error", detail, request_id=_request_id_of(request)
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(
@@ -452,11 +476,16 @@ def register_exception_handlers(app: FastAPI) -> None:
         # ever reaches a log line or the response. Belt-and-suspenders with
         # the `include_input=False` used at the raise site in providers.py.
         safe_errors = redact_json_safe(exc.errors())
-        logger.info("request_validation_error", extra={"path": request.url.path})
+        request_id = _request_id_of(request)
+        logger.info(
+            "request_validation_error",
+            extra={"path": request.url.path, "request_id": request_id},
+        )
         return _error_response(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "validation_error",
             f"Request validation failed: {safe_errors}",
+            request_id=request_id,
         )
 
     @app.exception_handler(Exception)
@@ -464,11 +493,15 @@ def register_exception_handlers(app: FastAPI) -> None:
         # Never include exception args/repr in the response - they may
         # contain secret material bubbled up from a lower layer. Full
         # (redacted-at-source) details go to the server log only.
-        logger.exception("unhandled_exception", extra={"path": request.url.path})
+        request_id = _request_id_of(request)
+        logger.exception(
+            "unhandled_exception", extra={"path": request.url.path, "request_id": request_id}
+        )
         return _error_response(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "internal_error",
             "An unexpected error occurred.",
+            request_id=request_id,
         )
 # ---------------------------------------------------------------------------
 # Phase 1.4 (Budget - Basic): raised by
@@ -493,8 +526,19 @@ class BudgetExhaustedError(GatekeyError):
         super().__init__(
             f"User '{name}' has exhausted its budget of ${budget_usd:,.2f} USD "
             f"(current spend: ${current_spend_usd:,.2f} USD). "
-            "Contact your administrator to increase the budget."
+            "Contact your administrator to increase the budget.",
+            # Tier 4 (OpenAPI/DX polish): the live figures as structured
+            # fields, not only prose - callers can render/alert on them
+            # without parsing the message. Strings (not floats) to preserve
+            # decimal precision, matching every other money field this API
+            # returns.
+            extra={
+                "budget_usd": str(budget_usd),
+                "current_spend_usd": str(current_spend_usd),
+            },
         )
+        self.budget_usd = budget_usd
+        self.current_spend_usd = current_spend_usd
 
 
 # ---------------------------------------------------------------------------
@@ -659,3 +703,43 @@ class ShadowAiWebhookUrlRequiredError(GatekeyError):
         super().__init__(
             "Cannot enable webhook enforcement without a webhook_url configured."
         )
+
+
+# ---------------------------------------------------------------------------
+# Tier 4 (OpenAPI hygiene): the error envelope as a declared schema, so SDK
+# consumers and codegen see the real error shape instead of FastAPI's
+# default `{"detail": ...}` (which this API never returns).
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel, Field  # noqa: E402  (deliberate tail section)
+
+
+class ErrorBody(BaseModel):
+    code: str = Field(description="Stable, machine-readable error code.")
+    message: str = Field(description="Human-readable explanation. Never contains secrets.")
+    request_id: str | None = Field(
+        default=None,
+        description="Correlation id, identical to the X-Request-ID response header.",
+    )
+
+
+class ErrorEnvelope(BaseModel):
+    """Every non-2xx response from this API uses this one shape. Some codes
+    add extra sibling fields next to `code`/`message` (e.g. rate limits add
+    `retry_after_seconds`/`hard_limit`; budget exhaustion adds
+    `budget_usd`/`current_spend_usd`)."""
+
+    error: ErrorBody
+
+
+# Router-level `responses=` declaration for the public gateway surface -
+# documents the envelope on every status the gateway actually returns.
+GATEWAY_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: {"model": ErrorEnvelope, "description": "Unsupported/malformed request."},
+    401: {"model": ErrorEnvelope, "description": "Missing or invalid gateway credential."},
+    402: {"model": ErrorEnvelope, "description": "Budget exhausted."},
+    403: {"model": ErrorEnvelope, "description": "Denied by policy (model/DLP/residency/schedule)."},
+    404: {"model": ErrorEnvelope, "description": "Unknown model or unconfigured provider."},
+    429: {"model": ErrorEnvelope, "description": "Rate limit exceeded (see Retry-After)."},
+    502: {"model": ErrorEnvelope, "description": "Upstream provider error or unreachable."},
+}

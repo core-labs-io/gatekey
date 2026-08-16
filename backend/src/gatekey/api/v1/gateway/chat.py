@@ -52,6 +52,7 @@ Summary for this route specifically:
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -113,7 +114,7 @@ from gatekey.api.v1.gateway.common import (
     validate_idempotency_key,
     write_response_cache,
 )
-from gatekey.errors import GatekeyError, ProviderUpstreamError
+from gatekey.errors import GATEWAY_ERROR_RESPONSES, GatekeyError, ProviderUpstreamError
 from gatekey.errors import UnsupportedRequestError as HttpUnsupportedRequestError
 from gatekey.providers import anthropic as anthropic_provider
 from gatekey.providers import ollama as ollama_provider
@@ -145,7 +146,7 @@ from gatekey.services.usage_logs import record_usage_log
 
 logger = logging.getLogger("gatekey")
 
-router = APIRouter(tags=["gateway"])
+router = APIRouter(tags=["gateway"], responses=GATEWAY_ERROR_RESPONSES)
 
 _ENDPOINT = "/v1/chat/completions"
 
@@ -270,6 +271,13 @@ async def _sse_event_stream(
     disconnected = False
     result_status = "ok"
     captured_usage = None
+    # Tier 4 (ops/DX polish): a mid-stream provider failure must be
+    # DISTINGUISHABLE from a complete response. Set to (code, message) on
+    # failure; the finally block then emits one SSE error frame and never
+    # `data: [DONE]` - so "[DONE] received" reliably means "complete", and
+    # an error frame (or plain truncation, e.g. a network drop before we
+    # could emit anything) means it wasn't.
+    stream_error: tuple[str, str] | None = None
 
     def _handle(chunk: ChatCompletionChunk) -> bytes | None:
         nonlocal captured_usage
@@ -293,9 +301,17 @@ async def _sse_event_stream(
                 yield frame
     except ProviderUnsupportedRequestError:
         result_status = "unsupported_request"
+        stream_error = (
+            "unsupported_request",
+            "The provider rejected part of this streaming request as unsupported; "
+            "the response above is incomplete.",
+        )
         logger.warning("gateway_stream_unsupported_request", extra={"request_id": request_id})
     except ProviderCallError as exc:
         result_status = "provider_error"
+        # `exc.message` is documented safe to return (never echoes a raw
+        # provider response body) - see providers/base.py.
+        stream_error = ("provider_upstream_error", exc.message)
         logger.warning(
             "gateway_stream_provider_error",
             extra={"request_id": request_id, "upstream_status_code": exc.status_code},
@@ -380,7 +396,18 @@ async def _sse_event_stream(
                         "gateway_stream_usage_unavailable",
                         extra={"request_id": request_id, "provider": provider, "model": model},
                     )
-            yield b"data: [DONE]\n\n"
+            if stream_error is not None:
+                error_code, error_message = stream_error
+                error_frame = {
+                    "error": {
+                        "code": error_code,
+                        "message": error_message,
+                        "request_id": request_id,
+                    }
+                }
+                yield f"data: {json.dumps(error_frame)}\n\n".encode()
+            else:
+                yield b"data: [DONE]\n\n"
         timer.mark("flush_complete")
         deltas = timer.deltas_ms()
         latency_ms = int(deltas.get("flush_complete", 0.0))
@@ -471,7 +498,10 @@ async def create_chat_completion(
     )
     personal_api_key_id = ctx.credential_id if ctx.credential_type == "personal" else None
     timer = LatencyTimer()
-    request_id = new_request_id()
+    # Prefer the middleware-assigned correlation id (also returned to the
+    # caller as the X-Request-ID header) so the header, usage_logs row, and
+    # every log line share ONE id; fall back for bare-app unit fixtures.
+    request_id = getattr(request.state, "request_id", None) or new_request_id()
     idempotency_key = validate_idempotency_key(idempotency_key)
     client_wants_usage = body.stream_options is not None and body.stream_options.include_usage
     response_cache = ResponseCache(shared_state_store)

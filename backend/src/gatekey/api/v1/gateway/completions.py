@@ -88,7 +88,7 @@ from gatekey.api.v1.gateway.common import (
     validate_idempotency_key,
     write_response_cache,
 )
-from gatekey.errors import GatekeyError, ProviderUpstreamError
+from gatekey.errors import GATEWAY_ERROR_RESPONSES, GatekeyError, ProviderUpstreamError
 from gatekey.errors import UnsupportedRequestError as HttpUnsupportedRequestError
 from gatekey.providers import openai as openai_provider
 from gatekey.providers.base import ProviderCallError
@@ -106,7 +106,7 @@ from gatekey.services.response_cache import CachingSettingsCache, ResponseCache
 from gatekey.services.shared_state import SharedStateStore
 from gatekey.services.usage_logs import record_usage_log
 
-router = APIRouter(tags=["gateway"])
+router = APIRouter(tags=["gateway"], responses=GATEWAY_ERROR_RESPONSES)
 
 _ENDPOINT = "/v1/completions"
 
@@ -141,7 +141,10 @@ async def create_completion(
     )
     personal_api_key_id = ctx.credential_id if ctx.credential_type == "personal" else None
     timer = LatencyTimer()
-    request_id = new_request_id()
+    # Prefer the middleware-assigned correlation id (also returned to the
+    # caller as the X-Request-ID header) so the header, usage_logs row, and
+    # every log line share ONE id; fall back for bare-app unit fixtures.
+    request_id = getattr(request.state, "request_id", None) or new_request_id()
     idempotency_key = validate_idempotency_key(idempotency_key)
     provider_for_log: str | None = None
     response_cache = ResponseCache(shared_state_store)

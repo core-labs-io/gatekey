@@ -51,6 +51,7 @@ from gatekey.api.v1.admin.sensitivity_label_mappings import (
 from gatekey.api.v1.admin.service_accounts import router as admin_service_accounts_router
 from gatekey.api.v1.admin.shadow_ai import router as admin_shadow_ai_router
 from gatekey.api.v1.admin.usage import router as admin_usage_router
+from gatekey.api.v1.admin.bootstrap import router as admin_bootstrap_router
 from gatekey.api.v1.admin.users import router as admin_users_router
 from gatekey.api.v1.auth import router as auth_router
 from gatekey.api.v1.auth_device import me_router as cli_sync_me_router
@@ -70,6 +71,7 @@ from gatekey.config import Settings, get_settings
 from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.session import create_engine, create_session_factory
 from gatekey.errors import register_exception_handlers
+from gatekey.observability import configure_logging, install_observability
 from gatekey.providers.model_registry import MODEL_REGISTRY
 from gatekey.providers.vertex_ai import VertexAITokenCache
 from gatekey.services.dlp import build_analyzer_engine
@@ -474,6 +476,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     or insecure configuration.
     """
     settings = settings or get_settings()
+    # Install the structured-logging formatter first, so lifespan startup
+    # (migrations, cache warms, scheduler) already logs with extra fields
+    # rendered - see `observability.configure_logging`.
+    configure_logging(settings.GATEKEY_LOG_FORMAT, settings.GATEKEY_LOG_LEVEL)
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -656,9 +662,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="Gatekey",
         description=(
-            "Open-source enterprise AI gateway - Phase 1.3 "
-            "(Model Access Governance - Basic, builds on 1.1's Provider & Key "
-            "Management and 1.2's Unified API / Gateway Core)"
+            "Self-hostable enterprise AI gateway: an OpenAI-compatible proxy "
+            "(`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, "
+            "`/v1/models`) over your own provider keys, plus the admin API "
+            "behind the management console.\n\n"
+            "Every error response uses one structured envelope: "
+            '`{"error": {"code", "message", "request_id", ...}}` - `code` is '
+            "machine-readable and stable, and `request_id` matches the "
+            "`X-Request-ID` response header for log correlation."
         ),
         version="0.1.0",
         lifespan=_lifespan,
@@ -727,6 +738,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         return await call_next(request)
 
+    # Added AFTER the CSRF guard above so it wraps it (last-added middleware
+    # runs outermost): every response - including CSRF 403s - gets an
+    # X-Request-ID header and lands in the /metrics counters.
+    install_observability(app)
+
     register_exception_handlers(app)
     # Phase 3 (BD-20..24, design doc section 6.1): registered ALONGSIDE
     # `register_exception_handlers` above, not instead of it - every
@@ -740,6 +756,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(admin_service_accounts_router)
     app.include_router(admin_model_policy_router)
     app.include_router(admin_users_router)
+    # Tier 4 (ops/DX polish): one-call user+team+membership+key onboarding.
+    app.include_router(admin_bootstrap_router)
     app.include_router(admin_usage_router)
     app.include_router(admin_join_requests_router)
     app.include_router(admin_org_settings_router)
