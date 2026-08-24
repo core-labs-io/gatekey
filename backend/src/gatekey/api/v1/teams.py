@@ -32,6 +32,7 @@ from gatekey.api.deps import (
     get_cache_invalidator,
     get_custom_model_route_cache,
     get_key_provider,
+    get_member_model_policy_cache,
     get_residency_rule_cache,
     get_self_hosted_model_route_cache,
     get_source_ip,
@@ -62,11 +63,14 @@ from gatekey.schemas.residency_rule import ResidencyRulePutRequest, ResidencyRul
 from gatekey.schemas.team import (
     ReassignBudgetRequest,
     ReassignBudgetResponse,
+    RemovedTeamMemberResponse,
     TeamAlertConfigPutRequest,
     TeamAlertConfigResponse,
     TeamCreateRequest,
     TeamDetailResponse,
     TeamMemberAddRequest,
+    TeamMemberModelRestrictionsPutRequest,
+    TeamMemberModelRestrictionsResponse,
     TeamMemberResponse,
     TeamMemberUpdateRequest,
     TeamMemberUsageResponse,
@@ -100,9 +104,12 @@ from gatekey.services.join_requests import (
 )
 from gatekey.services.response_cache import CacheInvalidator
 from gatekey.services.model_policy import (
+    MemberModelPolicyCache,
     TeamModelPolicyCache,
+    get_member_model_policy,
     get_policy,
     get_team_model_policy,
+    set_member_model_policy,
     set_team_model_policy,
 )
 from gatekey.services.residency import (
@@ -129,10 +136,12 @@ from gatekey.services.teams import (
     get_membership,
     get_team,
     get_team_usage_summary,
+    list_removed_team_members,
     list_team_members,
     list_teams,
     list_teams_for_user,
     remove_team_member,
+    restore_team_member,
     set_team_alert_config,
     webhook_configured,
 )
@@ -171,6 +180,19 @@ def _member_response(membership: TeamMembership, name: str) -> TeamMemberRespons
         budget_usd=membership.budget_usd,
         current_spend_usd=membership.current_spend_usd,
         created_at=membership.created_at,
+    )
+
+
+def _removed_member_response(membership: TeamMembership, name: str) -> RemovedTeamMemberResponse:
+    assert membership.removed_at is not None
+    return RemovedTeamMemberResponse(
+        user_id=membership.user_id,
+        name=name,
+        role=membership.role.value,
+        budget_usd=membership.budget_usd,
+        current_spend_usd=membership.current_spend_usd,
+        created_at=membership.created_at,
+        removed_at=membership.removed_at,
     )
 
 
@@ -263,7 +285,11 @@ async def list_teams_endpoint(
     if ctx.org_role in _ORG_WIDE_READ_ROLES:
         teams = await list_teams(session)
     else:
-        teams = await list_teams_for_user(session, ctx.user_id)
+        # The break-glass bearer always resolves with org_role="org_admin"
+        # (in _ORG_WIDE_READ_ROLES, caught by the `if` above) - this branch
+        # only ever runs for a real per-user session, so require_user_id()
+        # here is a correctness backstop, not a defensive guess.
+        teams = await list_teams_for_user(session, ctx.require_user_id())
     return [_team_response(t) for t in teams]
 
 
@@ -279,7 +305,9 @@ async def get_team_endpoint(
     The non-member rejection is the same generic 403 whether or not the team
     exists (anti-enumeration, matching `require_team_role`)."""
     if ctx.org_role not in _ORG_WIDE_READ_ROLES:
-        if await get_membership(session, team_id=team_id, user_id=ctx.user_id) is None:
+        # Same reasoning as list_teams_endpoint: break-glass never reaches
+        # here (it's always org_admin, caught above).
+        if await get_membership(session, team_id=team_id, user_id=ctx.require_user_id()) is None:
             raise ForbiddenError("You do not have the required role for this team.")
     team = await _get_team_or_404(session, team_id)
     await ensure_current_period(session, team)  # design doc 3.5's touch point
@@ -403,6 +431,20 @@ async def delete_team_endpoint(
 # --- Members (5.4) -----------------------------------------------------------
 
 
+@router.get("/{team_id}/members/removed", response_model=list[RemovedTeamMemberResponse])
+async def list_removed_members_endpoint(
+    team_id: uuid.UUID,
+    team_ctx: TeamRoleContext = Depends(require_team_role("team_lead")),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[RemovedTeamMemberResponse]:
+    """Restore-UI counterpart to `list_members_endpoint` (added by `0049`).
+    `team_lead`-only (not plain `member`) - same gate as removing/restoring
+    itself, not the read-only member-list gate."""
+    await _get_team_or_404(session, team_id)
+    removed = await list_removed_team_members(session, team_id)
+    return [_removed_member_response(m, u.name) for m, u in removed]
+
+
 @router.get("/{team_id}/members", response_model=list[TeamMemberResponse])
 async def list_members_endpoint(
     team_id: uuid.UUID,
@@ -523,6 +565,10 @@ async def remove_member_endpoint(
     team_ctx: TeamRoleContext = Depends(require_team_role("team_lead")),
     session: AsyncSession = Depends(get_db_session),
 ) -> Response:
+    """Soft delete (added by `0049`) - takes effect immediately (every
+    subsequent gateway request on this member's keys 403s), reversible via
+    `restore_member_endpoint` below. See `services.teams.remove_team_
+    member`'s docstring for why the old ADR-4 active-key guard is gone."""
     membership = await remove_team_member(session, team_id=team_id, user_id=user_id)
     await write_audit_entry(
         session,
@@ -540,6 +586,36 @@ async def remove_member_endpoint(
     )
     await session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{team_id}/members/{user_id}/restore", response_model=TeamMemberResponse)
+async def restore_member_endpoint(
+    team_id: uuid.UUID,
+    user_id: uuid.UUID,
+    team_ctx: TeamRoleContext = Depends(require_team_role("team_lead")),
+    session: AsyncSession = Depends(get_db_session),
+) -> TeamMemberResponse:
+    """Undo `remove_member_endpoint` (added by `0049`) - same role, budget,
+    and spend history the removal left in place; no key re-issuance
+    needed, the member's existing keys work again immediately."""
+    membership = await restore_team_member(session, team_id=team_id, user_id=user_id)
+    await write_audit_entry(
+        session,
+        actor=team_ctx.session,
+        action="team.member.restore",
+        target_type="team_membership",
+        target_id=str(membership.id),
+        old_value=None,
+        new_value={
+            "team_id": team_id,
+            "user_id": user_id,
+            "role": membership.role,
+            "budget_usd": membership.budget_usd,
+        },
+    )
+    await session.commit()
+    user = await get_user(session, user_id)
+    return _member_response(membership, user.name if user is not None else "")
 
 
 @router.post("/{team_id}/reassign-budget", response_model=ReassignBudgetResponse)
@@ -603,17 +679,36 @@ async def reassign_budget_endpoint(
 # --- Model restrictions (5.4) ------------------------------------------------
 
 
+def _known_models(
+    self_hosted_cache: SelfHostedModelRouteCache, custom_model_cache: CustomModelRouteCache
+) -> set[str]:
+    """The full universe of Gatekey-routable model names Model Policy can
+    govern - static registry plus every VERIFIED self-hosted/custom model
+    this org has registered. Matches `api.v1.model_access`'s own
+    `all_models` union exactly, so the org baseline a team lead sees here
+    is the same universe the gateway and the end-user self-service screen
+    actually enforce against - not just the static registry subset (a
+    previous, narrower version of this endpoint enumerated `MODEL_REGISTRY`
+    alone, which silently produced an EMPTY baseline - and an unusable
+    Team Model Restrictions checklist - for any org whose entire allowlist
+    happened to be a custom/self-hosted/OpenRouter-discovered model rather
+    than a static registry entry)."""
+    return set(MODEL_REGISTRY) | self_hosted_cache.known_model_ids() | custom_model_cache.known_model_ids()
+
+
 @router.get("/{team_id}/model-restrictions", response_model=TeamModelRestrictionsResponse)
 async def get_model_restrictions_endpoint(
     team_id: uuid.UUID,
     team_ctx: TeamRoleContext = Depends(require_team_role("team_lead", "member")),
     session: AsyncSession = Depends(get_db_session),
+    self_hosted_cache: SelfHostedModelRouteCache = Depends(get_self_hosted_model_route_cache),
+    custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
 ) -> TeamModelRestrictionsResponse:
     await _get_team_or_404(session, team_id)
     org_snapshot = await get_policy(session)
     restriction = await get_team_model_policy(session, team_id)
     return TeamModelRestrictionsResponse(
-        org_baseline=sorted(m for m in MODEL_REGISTRY if org_snapshot.is_allowed(m)),
+        org_baseline=sorted(m for m in _known_models(self_hosted_cache, custom_model_cache) if org_snapshot.is_allowed(m)),
         team_restriction=sorted(restriction) if restriction is not None else None,
     )
 
@@ -657,8 +752,114 @@ async def put_model_restrictions_endpoint(
     )
     org_snapshot = await get_policy(session)
     return TeamModelRestrictionsResponse(
-        org_baseline=sorted(m for m in MODEL_REGISTRY if org_snapshot.is_allowed(m)),
+        org_baseline=sorted(m for m in _known_models(self_hosted_cache, custom_model_cache) if org_snapshot.is_allowed(m)),
         team_restriction=sorted(committed),
+    )
+
+
+async def _team_baseline_models(
+    session: AsyncSession,
+    team_id: uuid.UUID,
+    self_hosted_cache: SelfHostedModelRouteCache,
+    custom_model_cache: CustomModelRouteCache,
+) -> list[str]:
+    """Every model this TEAM can currently use - org baseline (see
+    `_known_models`, the full static/self-hosted/custom universe, not just
+    the static registry) intersected with the team's own restriction, if
+    any."""
+    org_snapshot = await get_policy(session)
+    team_restriction = await get_team_model_policy(session, team_id)
+    return sorted(
+        m
+        for m in _known_models(self_hosted_cache, custom_model_cache)
+        if org_snapshot.is_allowed(m) and (team_restriction is None or m in team_restriction)
+    )
+
+
+@router.get(
+    "/{team_id}/members/{user_id}/model-restrictions",
+    response_model=TeamMemberModelRestrictionsResponse,
+)
+async def get_member_model_restrictions_endpoint(
+    team_id: uuid.UUID,
+    user_id: uuid.UUID,
+    team_ctx: TeamRoleContext = Depends(require_team_role("team_lead", "member")),
+    session: AsyncSession = Depends(get_db_session),
+    self_hosted_cache: SelfHostedModelRouteCache = Depends(get_self_hosted_model_route_cache),
+    custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
+) -> TeamMemberModelRestrictionsResponse:
+    """A plain `member` session may only fetch their OWN restriction (self-
+    view) - a `team_lead` (or the org_admin bypass, which resolves `role`
+    to `"org_admin"`) may fetch any member's. Mirrors the RBAC posture
+    `update_member_endpoint` already applies to per-member budget - see
+    that endpoint for the precedent."""
+    await _get_team_or_404(session, team_id)
+    if team_ctx.role == "member" and team_ctx.session.user_id != user_id:
+        raise ForbiddenError("You can only view your own model access.")
+    restriction = await get_member_model_policy(session, team_id, user_id)
+    return TeamMemberModelRestrictionsResponse(
+        team_baseline=await _team_baseline_models(session, team_id, self_hosted_cache, custom_model_cache),
+        member_restriction=sorted(restriction) if restriction is not None else None,
+    )
+
+
+@router.put(
+    "/{team_id}/members/{user_id}/model-restrictions",
+    response_model=TeamMemberModelRestrictionsResponse,
+)
+async def put_member_model_restrictions_endpoint(
+    team_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: TeamMemberModelRestrictionsPutRequest,
+    team_ctx: TeamRoleContext = Depends(require_team_role("team_lead")),
+    session: AsyncSession = Depends(get_db_session),
+    cache: MemberModelPolicyCache = Depends(get_member_model_policy_cache),
+    self_hosted_cache: SelfHostedModelRouteCache = Depends(get_self_hosted_model_route_cache),
+    custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
+) -> TeamMemberModelRestrictionsResponse:
+    """Team-lead-only (same as the team-level PUT above) - a member can view
+    their own restriction but never set it. 422
+    `member_model_restricts_team_denied_model` passes straight through from
+    `set_member_model_policy` (already carries its own status_code/code - no
+    manual mapping needed, same as every other error this router lets
+    propagate). Fetches the membership row FIRST (404 `NotFoundError` if
+    `user_id` doesn't currently hold an active membership on `team_id`) both
+    to give a clean 404 before any other work AND to get the membership's
+    own id for the audit entry's `target_id` - same convention
+    `update_member_endpoint`'s per-membership budget audit already
+    establishes (`target_type="team_membership"`, `target_id=str(membership.
+    id)`), not a composite string. `set_member_model_policy` re-checks
+    membership internally too (defense in depth - it's a cheap, already-
+    indexed lookup, and that function must also be safe to call from
+    contexts that haven't already fetched the row)."""
+    await _get_team_or_404(session, team_id)
+    membership = await get_membership(session, team_id=team_id, user_id=user_id)
+    if membership is None:
+        raise NotFoundError("Team membership not found.")
+    old_restriction = await get_member_model_policy(session, team_id, user_id)
+    await write_audit_entry(
+        session,
+        actor=team_ctx.session,
+        action="team.member_model_restrictions.update",
+        target_type="team_membership",
+        target_id=str(membership.id),
+        old_value={
+            "models": sorted(old_restriction) if old_restriction is not None else None
+        },
+        new_value={"models": sorted(set(payload.models))},
+    )
+    committed = await set_member_model_policy(
+        session,
+        team_id,
+        user_id,
+        payload.models,
+        cache=cache,
+        self_hosted_cache=self_hosted_cache,
+        custom_model_cache=custom_model_cache,
+    )
+    return TeamMemberModelRestrictionsResponse(
+        team_baseline=await _team_baseline_models(session, team_id, self_hosted_cache, custom_model_cache),
+        member_restriction=sorted(committed),
     )
 
 

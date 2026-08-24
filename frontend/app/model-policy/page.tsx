@@ -3,39 +3,63 @@
 /**
  * Model Policy screen (UI spec section 7.7). Real endpoints.
  *
- * Phase 5 (5.5 Unified Governance, AC5.5.9): the provider-grouped checklist
- * gains a "Self-Hosted" group sourced from registered self-hosted models -
- * only VERIFIED endpoints' models are selectable (an unverified endpoint's
- * models are never in `SelfHostedModelRouteCache`, so the backend would
- * reject them as unknown - AC5.5.6/design doc section 2.3(d)).
+ * Redesigned: the old checklist iterated a hand-typed `MODELS_BY_PROVIDER`
+ * constant for openai/anthropic/openrouter, which drifts from reality the
+ * moment a provider adds, renames, or retires a model. This version drives
+ * those three providers from `listAvailableModels()` - the same live
+ * "what does this provider actually have right now" lookup the post-key-save
+ * `ModelEnablePicker` flow already uses - fetched on demand only for the
+ * provider the admin picks from the dropdown below (not all three eagerly on
+ * load, since each is a real upstream network call). `vertex_ai` has no live
+ * listing (`custom_model_live_listing_unsupported`), so it's sourced from
+ * `listRegistryModels()` instead - still zero hand-typed data, just backend-
+ * derived rather than live-provider-derived.
  *
- * CMR-11 (Custom Model Registry technical design section 5, row 25): the
- * checklist also gains a "Custom" group sourced from `listCustomModels()` -
- * same only-verified-is-selectable rule as Self-Hosted, but rendered as a
- * flat list since custom models aren't grouped by endpoint. A
- * `shadowed_by_registry: true` model gets the same red "Shadowed" badge
- * used on the Providers screen's Custom Models card, for visual consistency.
+ * "Select entire provider" is a SNAPSHOT of what's live right now, not a
+ * standing "always allow whatever this provider has" rule - a model this
+ * provider adds next month needs one more visit here before it's usable.
+ * That's a deliberate choice (see conversation this shipped from): a
+ * live-tracking wildcard would need a new rule shape across the org/team/
+ * member policy layers and would auto-admit unreviewed models org-wide.
+ *
+ * Self-Hosted and Custom groups are unchanged from before this redesign -
+ * both were already sourced live from this org's own DB rows, never from a
+ * hand-typed list, so they never had the staleness problem being fixed here.
  */
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { ConsoleShell } from "@/components/ConsoleShell";
+import { CustomModelForm } from "@/components/custom-model-form";
 import { Badge, useToast } from "@/components/ui";
 import {
   ApiError,
   getModelPolicy,
+  listAvailableModels,
   listCustomModels,
+  listRegistryModelNames,
+  listRegistryModels,
   listSelfHostedProviders,
-  MODELS_BY_PROVIDER,
   PROVIDER_LABELS,
   putModelPolicy,
+  verifyCustomModel,
+  type AvailableModelEntry,
   type CustomModelResponse,
   type ModelPolicyMode,
-  type ProviderName,
+  type RegistryModelEntry,
   type SelfHostedProviderResponse,
 } from "@/lib/api";
 
-const PROVIDERS: ProviderName[] = ["openai", "anthropic", "vertex_ai", "ollama", "openrouter"];
+/** Providers offered in the dropdown below - the four BYOK-style providers
+ * Model Policy governs directly. `ollama` isn't here: it's purely
+ * self-hosted, with no provider-wide catalog of its own - its models come
+ * entirely from this org's registered Self-Hosted endpoints (own section
+ * below, unchanged). */
+type PolicyProvider = "openai" | "anthropic" | "openrouter" | "vertex_ai";
+const POLICY_PROVIDERS: PolicyProvider[] = ["openai", "anthropic", "openrouter", "vertex_ai"];
+/** The subset with a real live-listing endpoint - `vertex_ai` is excluded,
+ * see module docstring. */
+const LIVE_LISTING_PROVIDERS: PolicyProvider[] = ["openai", "anthropic", "openrouter"];
 
 export default function ModelPolicyPage() {
   const toast = useToast();
@@ -43,23 +67,120 @@ export default function ModelPolicyPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selfHostedProviders, setSelfHostedProviders] = useState<SelfHostedProviderResponse[]>([]);
   const [customModels, setCustomModels] = useState<CustomModelResponse[]>([]);
+  const [registryModels, setRegistryModels] = useState<RegistryModelEntry[]>([]);
+  const [registryNames, setRegistryNames] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
 
+  // --- Provider dropdown + live catalog -------------------------------------
+  const [activeProvider, setActiveProvider] = useState<PolicyProvider | "">("");
+  const [liveEntries, setLiveEntries] = useState<AvailableModelEntry[]>([]);
+  const [liveLoading, setLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState<{ notConfigured: boolean; message: string } | null>(null);
+  const [filterText, setFilterText] = useState("");
+  // native_model_id -> the name a just-completed inline registration
+  // resolved to, so that entry's checkbox reflects checked immediately
+  // without waiting on a full catalog refetch.
+  const [resolvedNames, setResolvedNames] = useState<Record<string, string>>({});
+  const [registering, setRegistering] = useState<AvailableModelEntry | null>(null);
+  const [verifying, setVerifying] = useState<{ entry: AvailableModelEntry; model: CustomModelResponse } | null>(
+    null
+  );
+
   useEffect(() => {
     setLoading(true);
-    Promise.all([getModelPolicy(), listSelfHostedProviders(), listCustomModels()])
-      .then(([res, providers, custom]) => {
+    Promise.all([
+      getModelPolicy(),
+      listSelfHostedProviders(),
+      listCustomModels(),
+      listRegistryModels(),
+      listRegistryModelNames(),
+    ])
+      .then(([res, providers, custom, registry, names]) => {
         setMode(res.mode);
         setSelected(new Set(res.models));
         setSelfHostedProviders(providers);
         setCustomModels(custom);
+        setRegistryModels(registry);
+        setRegistryNames(names);
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load model policy."))
       .finally(() => setLoading(false));
   }, []);
+
+  // Fetch the live catalog only for the provider currently chosen in the
+  // dropdown - never all three eagerly, each is a real upstream call.
+  useEffect(() => {
+    if (!activeProvider || !LIVE_LISTING_PROVIDERS.includes(activeProvider)) return;
+    let cancelled = false;
+    setLiveLoading(true);
+    setLiveError(null);
+    setLiveEntries([]);
+    listAvailableModels(activeProvider)
+      .then((entries) => {
+        if (cancelled) return;
+        setLiveEntries(entries);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.code === "provider_not_configured") {
+          setLiveError({ notConfigured: true, message: err.message });
+        } else {
+          setLiveError({
+            notConfigured: false,
+            message: err instanceof ApiError ? err.message : "Failed to load live models.",
+          });
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLiveLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProvider]);
+
+  // Auto-verify right after a successful inline registration - mirrors
+  // `ModelEnablePicker`'s identical step (same reason: only a VERIFIED
+  // custom model name is accepted by model policy).
+  useEffect(() => {
+    if (!verifying) return;
+    let cancelled = false;
+    verifyCustomModel(verifying.model.id)
+      .then((result) => {
+        if (cancelled) return;
+        if (result.verified) {
+          setResolvedNames((prev) => ({ ...prev, [verifying.entry.native_model_id]: result.name }));
+          setSelected((prev) => new Set(prev).add(result.name));
+          setDirty(true);
+          setCustomModels((prev) => [...prev.filter((m) => m.id !== result.id), result]);
+          toast.push("success", `"${result.name}" registered and verified.`);
+        } else {
+          toast.push(
+            "error",
+            `"${verifying.model.name}" was registered but could not be verified - check the native ` +
+              "model id from Model Catalog, then come back and enable it."
+          );
+        }
+        setVerifying(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        toast.push(
+          "error",
+          err instanceof ApiError
+            ? `"${verifying.model.name}" was registered but verification failed: ${err.message}`
+            : `"${verifying.model.name}" was registered but verification failed.`
+        );
+        setVerifying(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verifying]);
 
   function toggleModel(model: string) {
     setSelected((prev) => {
@@ -72,7 +193,7 @@ export default function ModelPolicyPage() {
   }
 
   function toggleGroup(models: string[]) {
-    const allSelected = models.every((model) => selected.has(model));
+    const allSelected = models.length > 0 && models.every((model) => selected.has(model));
     setSelected((prev) => {
       const next = new Set(prev);
       for (const model of models) {
@@ -82,6 +203,15 @@ export default function ModelPolicyPage() {
       return next;
     });
     setDirty(true);
+  }
+
+  function toggleLiveEntry(entry: AvailableModelEntry) {
+    const routableName = entry.routable_as ?? resolvedNames[entry.native_model_id] ?? null;
+    if (routableName === null) {
+      setRegistering(entry);
+      return;
+    }
+    toggleModel(routableName);
   }
 
   function setModeAndMarkDirty(next: ModelPolicyMode) {
@@ -115,6 +245,57 @@ export default function ModelPolicyPage() {
     if (mode === "denylist") return "checked = blocked from use";
     return null;
   }, [mode]);
+
+  // Fallback-chain candidates for the inline registration sub-flow - best
+  // effort only, mirrors `ModelEnablePicker`'s identical union.
+  const fallbackCandidates = useMemo(() => {
+    const verifiedCustomNames = customModels.filter((m) => m.verified).map((m) => m.name);
+    const verifiedSelfHostedIds = Array.from(
+      new Set(selfHostedProviders.filter((p) => p.verified).flatMap((p) => p.models))
+    );
+    return Array.from(new Set([...registryNames, ...verifiedCustomNames, ...verifiedSelfHostedIds]));
+  }, [registryNames, customModels, selfHostedProviders]);
+
+  const vertexModels = useMemo(
+    () => registryModels.filter((m) => m.provider === "vertex_ai").map((m) => m.name),
+    [registryModels]
+  );
+
+  const filteredLiveEntries = useMemo(() => {
+    const q = filterText.trim().toLowerCase();
+    if (!q) return liveEntries;
+    return liveEntries.filter(
+      (e) => e.native_model_id.toLowerCase().includes(q) || e.display_name.toLowerCase().includes(q)
+    );
+  }, [liveEntries, filterText]);
+
+  const sortedSelected = useMemo(() => Array.from(selected).sort((a, b) => a.localeCompare(b)), [selected]);
+
+  // --- Inline Custom Model registration (routable_as: null live entry) -----
+  if (registering) {
+    return (
+      <ConsoleShell>
+        <div className="page">
+          <CustomModelForm
+            initial={null}
+            prefill={{
+              provider: activeProvider as "openai" | "anthropic" | "openrouter",
+              native_model_id: registering.native_model_id,
+              name: registering.native_model_id,
+              input_price_per_million_usd: registering.input_price_per_million_usd,
+              output_price_per_million_usd: registering.output_price_per_million_usd,
+            }}
+            fallbackCandidates={fallbackCandidates}
+            onClose={() => setRegistering(null)}
+            onSaved={(saved) => {
+              setVerifying({ entry: registering, model: saved });
+              setRegistering(null);
+            }}
+          />
+        </div>
+      </ConsoleShell>
+    );
+  }
 
   return (
     <ConsoleShell>
@@ -169,39 +350,218 @@ export default function ModelPolicyPage() {
                 </span>
               </label>
             </div>
-            {helperCopy ? <p className="field-hint" style={{ marginTop: -8, marginBottom: 12 }}>{helperCopy}</p> : null}
+            {helperCopy ? <p className="field-hint" style={{ marginTop: -8, marginBottom: 4 }}>{helperCopy}</p> : null}
 
-            {PROVIDERS.map((provider) => (
-              <div className="model-group" key={provider}>
+            {/* Always-visible summary of the current set, regardless of which
+                provider tab is open below - this is "what's allowed" (or
+                "what's blocked", in denylist mode) at a glance, spanning
+                registry, self-hosted, AND custom/Model Catalog models. */}
+            {mode !== "unconfigured" ? (
+              <div className="model-group" style={{ marginTop: 8 }}>
                 <div className="model-group-title">
-                  {PROVIDER_LABELS[provider]}
-                  <label className="model-checkbox" style={{ display: "inline-flex", marginLeft: 12, fontWeight: "normal" }}>
+                  {mode === "allowlist" ? "Currently allowed" : "Currently blocked"} ({sortedSelected.length})
+                </div>
+                {sortedSelected.length === 0 ? (
+                  <div className="text-muted" style={{ fontSize: 13 }}>
+                    Nothing selected yet - pick models from a provider below.
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {sortedSelected.map((model) => (
+                      <button
+                        key={model}
+                        type="button"
+                        className="mono"
+                        onClick={() => toggleModel(model)}
+                        title="Click to remove"
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 6,
+                          border: "1px solid var(--border)",
+                          borderRadius: 999,
+                          padding: "3px 10px",
+                          fontSize: 12,
+                          background: "var(--surface)",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {model}
+                        <span aria-hidden="true" style={{ color: "var(--text-muted)" }}>
+                          ×
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : null}
+
+            {/* --- Provider picker: dropdown -> live (or registry) catalog --- */}
+            <div className="model-group">
+              <div className="model-group-title">Add models from a provider</div>
+              <select
+                value={activeProvider}
+                onChange={(e) => {
+                  setActiveProvider(e.target.value as PolicyProvider | "");
+                  setFilterText("");
+                }}
+                style={{ maxWidth: 320, marginBottom: 10 }}
+              >
+                <option value="">Choose a provider...</option>
+                {POLICY_PROVIDERS.map((p) => (
+                  <option key={p} value={p}>
+                    {PROVIDER_LABELS[p]}
+                  </option>
+                ))}
+              </select>
+
+              {activeProvider === "vertex_ai" ? (
+                <>
+                  <label className="model-checkbox" style={{ marginBottom: 6 }}>
                     <input
                       type="checkbox"
-                      checked={MODELS_BY_PROVIDER[provider].every((model) => selected.has(model))}
-                      onChange={() => toggleGroup(MODELS_BY_PROVIDER[provider])}
+                      checked={vertexModels.length > 0 && vertexModels.every((m) => selected.has(m))}
+                      onChange={() => toggleGroup(vertexModels)}
                       disabled={mode === "unconfigured"}
                       style={{ width: "auto" }}
                     />
-                    select all
+                    Select entire provider ({vertexModels.length} models)
                   </label>
+                  <div className="model-checkbox-grid">
+                    {vertexModels.map((model) => (
+                      <label className="model-checkbox" key={model}>
+                        <input
+                          type="checkbox"
+                          checked={selected.has(model)}
+                          onChange={() => toggleModel(model)}
+                          disabled={mode === "unconfigured"}
+                          style={{ width: "auto" }}
+                        />
+                        {model}
+                      </label>
+                    ))}
+                  </div>
+                </>
+              ) : null}
+
+              {activeProvider && LIVE_LISTING_PROVIDERS.includes(activeProvider) ? (
+                <>
+                  {liveLoading ? (
+                    <div className="skeleton skeleton-text" />
+                  ) : liveError ? (
+                    <div className="banner banner-error">
+                      {liveError.notConfigured ? (
+                        <>
+                          No {PROVIDER_LABELS[activeProvider]} key configured yet - add one on{" "}
+                          <Link href="/providers">Providers</Link> to see and manage its live models.
+                        </>
+                      ) : (
+                        liveError.message
+                      )}
+                    </div>
+                  ) : (
+                    <>
+                      {liveEntries.length > 5 ? (
+                        <input
+                          type="text"
+                          placeholder={`Filter ${PROVIDER_LABELS[activeProvider]} models...`}
+                          value={filterText}
+                          onChange={(e) => setFilterText(e.target.value)}
+                          style={{ maxWidth: 320, marginBottom: 10 }}
+                        />
+                      ) : null}
+                      <label className="model-checkbox" style={{ marginBottom: 6 }}>
+                        <input
+                          type="checkbox"
+                          checked={
+                            filteredLiveEntries.some((e) => e.routable_as !== null) &&
+                            filteredLiveEntries
+                              .filter((e) => e.routable_as !== null)
+                              .every((e) => selected.has(e.routable_as as string))
+                          }
+                          onChange={() =>
+                            toggleGroup(
+                              filteredLiveEntries
+                                .filter((e) => e.routable_as !== null)
+                                .map((e) => e.routable_as as string)
+                            )
+                          }
+                          disabled={mode === "unconfigured"}
+                          style={{ width: "auto" }}
+                        />
+                        Select entire provider ({filteredLiveEntries.filter((e) => e.routable_as !== null).length}
+                        {filteredLiveEntries.length !== liveEntries.length ? " matching" : ""} models)
+                      </label>
+                      {liveEntries.length === 0 ? (
+                        <div className="text-muted">
+                          No models are currently available from {PROVIDER_LABELS[activeProvider]}.
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 360, overflowY: "auto" }}>
+                          {filteredLiveEntries.map((entry) => {
+                            const routableName = entry.routable_as ?? resolvedNames[entry.native_model_id] ?? null;
+                            const checked = routableName !== null && selected.has(routableName);
+                            return (
+                              <label
+                                key={entry.native_model_id}
+                                style={{
+                                  display: "flex",
+                                  alignItems: "flex-start",
+                                  gap: 10,
+                                  border: "1px solid var(--border)",
+                                  borderRadius: 6,
+                                  padding: 8,
+                                  cursor: mode === "unconfigured" ? "default" : "pointer",
+                                }}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleLiveEntry(entry)}
+                                  disabled={mode === "unconfigured"}
+                                  style={{ marginTop: 3, width: "auto" }}
+                                />
+                                <span style={{ flex: 1 }}>
+                                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                    <span className="mono">{entry.native_model_id}</span>
+                                    <span className="text-muted">{entry.display_name}</span>
+                                    {routableName === null ? (
+                                      <Badge tone="amber">Needs registration &amp; pricing</Badge>
+                                    ) : null}
+                                  </div>
+                                  <div className="text-muted" style={{ fontSize: 12, marginTop: 2 }}>
+                                    {entry.input_price_per_million_usd ? (
+                                      <>
+                                        ${entry.input_price_per_million_usd} in
+                                        {entry.output_price_per_million_usd ? (
+                                          <> / ${entry.output_price_per_million_usd} out</>
+                                        ) : null}{" "}
+                                        per million tokens
+                                      </>
+                                    ) : (
+                                      "Pricing unknown"
+                                    )}
+                                  </div>
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </>
+              ) : null}
+
+              {!activeProvider ? (
+                <div className="text-muted" style={{ fontSize: 13 }}>
+                  Pick a provider above to see its models, live from {PROVIDER_LABELS.openai} /{" "}
+                  {PROVIDER_LABELS.anthropic} / {PROVIDER_LABELS.openrouter}, or {PROVIDER_LABELS.vertex_ai}
+                  &apos;s registry.
                 </div>
-                <div className="model-checkbox-grid">
-                  {MODELS_BY_PROVIDER[provider].map((model) => (
-                    <label className="model-checkbox" key={model}>
-                      <input
-                        type="checkbox"
-                        checked={selected.has(model)}
-                        onChange={() => toggleModel(model)}
-                        disabled={mode === "unconfigured"}
-                        style={{ width: "auto" }}
-                      />
-                      {model}
-                    </label>
-                  ))}
-                </div>
-              </div>
-            ))}
+              ) : null}
+            </div>
 
             {selfHostedProviders.length > 0 ? (
               <div className="model-group">
@@ -247,7 +607,7 @@ export default function ModelPolicyPage() {
               </div>
             ) : null}
 
-            {/* Phase CMR-11: flat "Custom" group sourced from listCustomModels() -
+            {/* CMR-11: flat "Custom" group sourced from listCustomModels() -
                 unlike Self-Hosted (grouped by endpoint), custom models are each
                 individually named/verified, so verification state is shown
                 per-checkbox rather than per-group. Only verified: true models

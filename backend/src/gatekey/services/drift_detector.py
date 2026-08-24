@@ -96,6 +96,7 @@ from gatekey.services.budget import compute_cost
 from gatekey.services.encryption import DecryptionError, EnvKeyProvider, KeyProvider
 from gatekey.services.proxy_keys import (
     CredentialDecodeError,
+    ProviderCredential,
     ProviderKeyNotConfiguredError,
     UnsupportedProviderCredentialError,
     get_decrypted_provider_credential,
@@ -574,6 +575,13 @@ async def run_canary_suite_for_org(session: "AsyncSession", app: "FastAPI") -> C
                 self_hosted_provider_id=self_hosted_entry.provider_id,
             )
 
+        # Annotated as the base type: `OllamaCredential` (self-hosted
+        # branch) is a `ProviderCredential` subclass (see
+        # `services/proxy_keys.py`), and `_dispatch_canary_call` below only
+        # needs the base interface either way - without this, mypy infers
+        # `credential`'s type from whichever branch runs first and then
+        # flags the other branch's wider return type as incompatible.
+        credential: ProviderCredential
         if route.provider == "self_hosted":
             assert self_hosted_entry is not None
             try:
@@ -635,7 +643,13 @@ async def run_canary_suite_for_org(session: "AsyncSession", app: "FastAPI") -> C
                 continue
             latency_ms = int((time.monotonic() - started_at) * 1000)
 
-            output_text = response.choices[0].message.content if response.choices else ""
+            # `.content` is nullable (post-ship fix, real reasoning-model
+            # responses can legitimately have no visible text - e.g. the
+            # whole response budget spent on hidden reasoning tokens) -
+            # `or ""` here is a deliberate, honest signal for THIS canary
+            # comparison (empty output vs. the baseline is itself a real,
+            # measurable drift/regression), not a silent swallow.
+            output_text = (response.choices[0].message.content or "") if response.choices else ""
             refusal_detected = detect_refusal(output_text)
             similarity_score = (
                 compute_similarity(output_text, baseline.baseline_output_text)

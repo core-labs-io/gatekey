@@ -19,17 +19,15 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.models.join_request import JoinRequest
-from gatekey.db.models.personal_api_key import PersonalApiKey
-from gatekey.db.models.service_account_key import ServiceAccountKey
 from gatekey.db.models.team import Team
 from gatekey.db.models.team_membership import TeamMembership, TeamRole
 from gatekey.db.models.usage_log import UsageLog
@@ -72,18 +70,25 @@ async def list_team_ids_led_by_user(session: AsyncSession, user_id: uuid.UUID) -
     discipline `require_team_role` already applies to path-parameter-scoped
     routes, extended here to a query-parameter-scoped one."""
     stmt = select(TeamMembership.team_id).where(
-        TeamMembership.user_id == user_id, TeamMembership.role == TeamRole.TEAM_LEAD
+        TeamMembership.user_id == user_id,
+        TeamMembership.role == TeamRole.TEAM_LEAD,
+        TeamMembership.removed_at.is_(None),
     )
     return frozenset((await session.execute(stmt)).scalars().all())
 
 
 async def list_teams_for_user(session: AsyncSession, user_id: uuid.UUID) -> list[Team]:
-    """Only the teams the user holds a `TeamMembership` on (design doc 5.4's
-    non-privileged `GET /v1/teams` view)."""
+    """Only the teams the user holds an ACTIVE `TeamMembership` on (design
+    doc 5.4's non-privileged `GET /v1/teams` view) - `removed_at IS NULL`
+    (added by `0049`), a removed membership must not appear here."""
     stmt = (
         select(Team)
         .join(TeamMembership, TeamMembership.team_id == Team.id)
-        .where(Team.org_id == DEFAULT_ORG_ID, TeamMembership.user_id == user_id)
+        .where(
+            Team.org_id == DEFAULT_ORG_ID,
+            TeamMembership.user_id == user_id,
+            TeamMembership.removed_at.is_(None),
+        )
         .order_by(Team.name)
     )
     return list((await session.execute(stmt)).scalars().all())
@@ -112,9 +117,15 @@ async def delete_team(session: AsyncSession, team: Team) -> None:
     history, pending or resolved, pins the team row). Flushes, does not
     commit - the caller's `team.delete` audit entry rides the same
     transaction."""
+    # `removed_at IS NULL` (added by `0049`): a team whose only remaining
+    # `TeamMembership` rows are removed (soft-deleted, restorable history)
+    # has no ACTIVE members and is deletable - matches this guard's actual
+    # intent ("don't delete a team someone is still really on").
     member_exists = (
         await session.execute(
-            select(TeamMembership.id).where(TeamMembership.team_id == team.id).limit(1)
+            select(TeamMembership.id)
+            .where(TeamMembership.team_id == team.id, TeamMembership.removed_at.is_(None))
+            .limit(1)
         )
     ).scalar_one_or_none()
     if member_exists is not None:
@@ -154,90 +165,120 @@ async def delete_team(session: AsyncSession, team: Team) -> None:
 
 
 async def get_membership(
-    session: AsyncSession, *, team_id: uuid.UUID, user_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    team_id: uuid.UUID,
+    user_id: uuid.UUID,
+    include_removed: bool = False,
 ) -> TeamMembership | None:
+    """`include_removed=False` (default, added by `0049`) - the overwhelming
+    majority of callers mean "does this user currently, actively hold this
+    membership" (RBAC, key-creation eligibility, budget reassignment).
+    `include_removed=True` is for the handful of callers that specifically
+    need the row regardless of state (e.g. `restore_team_member` itself)."""
     stmt = select(TeamMembership).where(
         TeamMembership.team_id == team_id, TeamMembership.user_id == user_id
     )
+    if not include_removed:
+        stmt = stmt.where(TeamMembership.removed_at.is_(None))
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def list_team_members(
     session: AsyncSession, team_id: uuid.UUID
 ) -> list[tuple[TeamMembership, User]]:
+    """Active members only (`removed_at IS NULL`, added by `0049`) - see
+    `list_removed_team_members` for the restore-UI counterpart."""
     stmt = (
         select(TeamMembership, User)
         .join(User, TeamMembership.user_id == User.id)
-        .where(TeamMembership.team_id == team_id)
+        .where(TeamMembership.team_id == team_id, TeamMembership.removed_at.is_(None))
         .order_by(User.name)
     )
     return [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
 
 
-async def member_has_active_keys(
-    session: AsyncSession, *, team_id: uuid.UUID, user_id: uuid.UUID
-) -> bool:
-    """ADR-4's removal gate: an active (non-revoked, non-expired) personal
-    key scoped to this team, OR an active team-attributed service-account
-    key of this user+team, blocks membership removal."""
-    personal_stmt = (
-        select(PersonalApiKey.id)
-        .where(
-            PersonalApiKey.owner_user_id == user_id,
-            PersonalApiKey.team_id == team_id,
-            PersonalApiKey.revoked_at.is_(None),
-            or_(
-                PersonalApiKey.expires_at.is_(None),
-                PersonalApiKey.expires_at > func.now(),
-            ),
-        )
-        .limit(1)
+async def list_removed_team_members(
+    session: AsyncSession, team_id: uuid.UUID
+) -> list[tuple[TeamMembership, User]]:
+    """Removed (soft-deleted) members, newest-removed first - the restore-UI
+    counterpart to `list_team_members` (added by `0049`)."""
+    stmt = (
+        select(TeamMembership, User)
+        .join(User, TeamMembership.user_id == User.id)
+        .where(TeamMembership.team_id == team_id, TeamMembership.removed_at.is_not(None))
+        .order_by(TeamMembership.removed_at.desc())
     )
-    if (await session.execute(personal_stmt)).scalar_one_or_none() is not None:
-        return True
-    sa_stmt = (
-        select(ServiceAccountKey.id)
-        .where(
-            ServiceAccountKey.user_id == user_id,
-            ServiceAccountKey.team_id == team_id,
-            ServiceAccountKey.revoked_at.is_(None),
-        )
-        .limit(1)
-    )
-    return (await session.execute(sa_stmt)).scalar_one_or_none() is not None
+    return [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
 
 
 async def remove_team_member(
     session: AsyncSession, *, team_id: uuid.UUID, user_id: uuid.UUID
 ) -> TeamMembership:
-    """Hard row delete (design doc 1.4 - history lives in `AuditEntry`),
-    gated by ADR-4's active-key check (409 `member_has_active_keys`).
-    Flushes, does not commit. Returns the removed row so the caller can
-    record its final role/budget state in the audit entry.
+    """Soft delete (`removed_at = now()`, added by `0049` - product owner
+    request: an accidental removal should be undoable via
+    `restore_team_member`). Flushes, does not commit. Returns the removed
+    row so the caller can record its final role/budget state in the audit
+    entry.
 
-    The membership row is selected `FOR UPDATE` (security review M-2) so
-    this removal serializes with a concurrent key create, which locks the
-    same row (`create_personal_key` / `create_service_account`): whichever
-    transaction wins the lock, the loser sees a consistent state - the
-    active-key check below can never miss a key committed after it ran.
+    ADR-4's old "must revoke active keys first" guard (`member_has_active_
+    keys`) is DELIBERATELY GONE - it existed because a hard delete was
+    irreversible and would otherwise orphan a still-authenticating key
+    against a vanished membership. Soft delete makes that unnecessary AND
+    means removal should take effect immediately, the same way removing
+    someone from a team works in any normal product: `api.v1.gateway.
+    common.check_budget_available()` now rejects every subsequent gateway
+    request on a removed membership with `errors.TeamMembershipRemovedError`
+    (403) - the key still authenticates, it just can't do anything, and
+    restoring the membership silently reinstates it (no separate key
+    re-issuance needed).
+
+    The membership row is selected `FOR UPDATE` (security review M-2,
+    preserved from the old hard-delete path) - serializes against a
+    concurrent budget charge or key create touching the same row.
     """
     membership = (
         await session.execute(
             select(TeamMembership)
-            .where(TeamMembership.team_id == team_id, TeamMembership.user_id == user_id)
+            .where(
+                TeamMembership.team_id == team_id,
+                TeamMembership.user_id == user_id,
+                TeamMembership.removed_at.is_(None),
+            )
             .with_for_update()
         )
     ).scalar_one_or_none()
     if membership is None:
         raise NotFoundError("Team membership not found.")
-    if await member_has_active_keys(session, team_id=team_id, user_id=user_id):
-        raise GatekeyError(
-            "Member still holds one or more active API keys scoped to this "
-            "team - revoke them first.",
-            code="member_has_active_keys",
-            status_code=409,
+    membership.removed_at = datetime.now(timezone.utc)
+    await session.flush()
+    return membership
+
+
+async def restore_team_member(
+    session: AsyncSession, *, team_id: uuid.UUID, user_id: uuid.UUID
+) -> TeamMembership:
+    """Undo `remove_team_member` (added by `0049`) - clears `removed_at`,
+    reinstating the exact same row (role, budget, spend history all
+    untouched by the removal itself). 404 if no removed membership exists
+    for this pair (either never removed, or never existed at all - same
+    anti-enumeration posture as every other lookup-failure in this
+    codebase). `FOR UPDATE`, same rationale as `remove_team_member`.
+    Flushes, does not commit."""
+    membership = (
+        await session.execute(
+            select(TeamMembership)
+            .where(
+                TeamMembership.team_id == team_id,
+                TeamMembership.user_id == user_id,
+                TeamMembership.removed_at.is_not(None),
+            )
+            .with_for_update()
         )
-    await session.delete(membership)
+    ).scalar_one_or_none()
+    if membership is None:
+        raise NotFoundError("Removed team membership not found.")
+    membership.removed_at = None
     await session.flush()
     return membership
 
@@ -421,12 +462,13 @@ __all__ = [
     "get_membership",
     "get_team",
     "get_team_usage_summary",
+    "list_removed_team_members",
     "list_team_ids_led_by_user",
     "list_team_members",
     "list_teams",
     "list_teams_for_user",
-    "member_has_active_keys",
     "remove_team_member",
+    "restore_team_member",
     "set_team_alert_config",
     "team_webhook_aad",
     "webhook_configured",

@@ -22,9 +22,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.models.content_aware_rule import ContentAwareRule
 from gatekey.db.models.model_policy import ModelPolicy
+from gatekey.db.models.team_member_model_policy import TeamMemberModelPolicy
 from gatekey.db.models.team_model_policy import TeamModelPolicy
 from gatekey.errors import GatekeyError
 from gatekey.providers.model_registry import MODEL_REGISTRY
+from gatekey.services.teams import get_membership
 
 if TYPE_CHECKING:
     # Local, TYPE_CHECKING-only import to avoid a circular import at runtime
@@ -344,16 +346,19 @@ class TeamModelPolicyCache:
 
 @dataclass(frozen=True)
 class ModelAccessDecision:
-    """Outcome of the layered org-then-team model-access resolution.
+    """Outcome of the layered org-then-team-then-member model-access
+    resolution.
 
     `blocking_layer` is None only when `allowed=True`. Phase 3 (AC4.1) adds
     `"content_classification"` here without reshaping this type, exactly the
     extension point Phase 2's design doc section 12 pre-flagged - see
-    `resolve_content_classification` below.
+    `resolve_content_classification` below. `"member"` (per-team-member
+    narrowing, one layer below `"team"`) follows the identical extension
+    pattern - see `resolve_model_access`'s member-layer check.
     """
 
     allowed: bool
-    blocking_layer: Literal["org", "team", "content_classification"] | None
+    blocking_layer: Literal["org", "team", "member", "content_classification"] | None
 
 
 def resolve_model_access(
@@ -362,17 +367,33 @@ def resolve_model_access(
     org_cache: ModelPolicyCache,
     team_cache: TeamModelPolicyCache,
     team_id: uuid.UUID | None,
+    member_cache: "MemberModelPolicyCache | None" = None,
+    user_id: uuid.UUID | None = None,
 ) -> ModelAccessDecision:
-    """Layered check: org baseline first, then the team's narrowing overlay
-    (design doc section 4). Pure, synchronous, zero I/O - two in-process
-    dict/frozenset lookups. `team_id=None` (legacy flat path) skips the team
-    layer entirely."""
+    """Layered check: org baseline, then the team's narrowing overlay, then
+    (one layer further) one specific member's own narrowing within that
+    team (design doc section 4, extended). Pure, synchronous, zero I/O -
+    at most three in-process dict/frozenset lookups, no DB access ever.
+
+    `team_id=None` (legacy flat path) skips the team AND member layers
+    entirely - a member overlay is meaningless outside a team context, same
+    as the team layer itself. `member_cache=None`/`user_id=None` (any
+    caller that hasn't been updated to pass them, e.g. an existing unit
+    test exercising only the org/team layers) skips just the member layer,
+    preserving byte-for-byte pre-member-layer behavior for every such
+    caller - this mirrors exactly how `team_cache`/`team_id` were
+    originally allowed to default away when the team layer was Phase-2-added
+    on top of the Phase-1 org-only function."""
     if not org_cache.get().is_allowed(model):
         return ModelAccessDecision(allowed=False, blocking_layer="org")
     if team_id is not None:
         team_restriction = team_cache.get(team_id)
         if team_restriction is not None and model not in team_restriction:
             return ModelAccessDecision(allowed=False, blocking_layer="team")
+        if member_cache is not None and user_id is not None:
+            member_restriction = member_cache.get(team_id, user_id)
+            if member_restriction is not None and model not in member_restriction:
+                return ModelAccessDecision(allowed=False, blocking_layer="member")
     return ModelAccessDecision(allowed=True, blocking_layer=None)
 
 
@@ -501,6 +522,196 @@ async def set_team_model_policy(
     committed = frozenset(row.models)
     if cache is not None:
         cache.set_team(team_id, committed)
+    return committed
+
+
+# ---------------------------------------------------------------------------
+# Per-team-member narrowing overlay - a third layer below the team layer
+# above: a team lead can further narrow which of the TEAM's own effective
+# models (org baseline intersected with the team's own restriction, if any)
+# one SPECIFIC member may use. The org and team layers above are untouched -
+# zero behavior change for any team that never assigns per-member overlays.
+# ---------------------------------------------------------------------------
+
+
+class MemberModelPolicyCache:
+    """Process-local cache of every team member's model-restriction overlay,
+    keyed by `(team_id, user_id)`.
+
+    Third layer below `ModelPolicyCache` (org) and `TeamModelPolicyCache`
+    (team) - same lock-free, GIL-atomic "replace the whole snapshot, never
+    mutate in place" contract, and same "a full org realistically has low
+    thousands of member overlays at most, so building a new dict on any
+    write is cheap" rationale `TeamModelPolicyCache` already establishes.
+    Warmed at startup with the identical bounded, fail-open pattern (see
+    `main.py`'s lifespan): absence of an entry for a `(team_id, user_id)`
+    pair = no restriction beyond the team's own effective set, which is
+    also the safe/permissive default an empty cache yields.
+
+    Instantiated once per process and stored on `app.state` - never
+    construct a second instance and thread it through separately.
+    """
+
+    def __init__(
+        self, initial: dict[tuple[uuid.UUID, uuid.UUID], frozenset[str]] | None = None
+    ) -> None:
+        self._snapshot: dict[tuple[uuid.UUID, uuid.UUID], frozenset[str]] = dict(initial or {})
+
+    def get(self, team_id: uuid.UUID, user_id: uuid.UUID) -> frozenset[str] | None:
+        """This member's allowed-model overlay, or None = no restriction row."""
+        return self._snapshot.get((team_id, user_id))
+
+    def set_all(self, snapshot: dict[tuple[uuid.UUID, uuid.UUID], frozenset[str]]) -> None:
+        """Full replace - the startup-warm/self-heal write."""
+        self._snapshot = dict(snapshot)
+
+    def set_member(self, team_id: uuid.UUID, user_id: uuid.UUID, models: frozenset[str]) -> None:
+        """Refresh one member's entry after a committed write - still a
+        whole-snapshot replace (new dict, single reference assignment),
+        never an in-place mutation of the live dict."""
+        replacement = dict(self._snapshot)
+        replacement[(team_id, user_id)] = models
+        self._snapshot = replacement
+
+
+class MemberModelRestrictsTeamDeniedModelError(GatekeyError):
+    """A member's model overlay may only ever narrow the TEAM's own
+    effective set (org baseline intersected with the team's own
+    restriction, if any) - listing a model outside that effective set is
+    rejected with no DB write, mirroring `TeamModelRestrictsOrgDeniedModelError`'s
+    shape one layer down. Model ids are caller input, not secret material -
+    safe in `message`."""
+
+    status_code = 422
+    code = "member_model_restricts_team_denied_model"
+
+    def __init__(self, offending_models: list[str]) -> None:
+        super().__init__(
+            "A member's model access can only narrow what their team already "
+            "allows - these model(s) are outside the team's own effective "
+            "model set: " + ", ".join(sorted(offending_models)) + "."
+        )
+        self.offending_models = offending_models
+
+
+class MemberNotOnTeamError(GatekeyError):
+    """The target user does not currently hold an ACTIVE membership on this
+    team (`TeamMembership.removed_at IS NULL` - see `services.teams.
+    get_membership`) - a model overlay for a non-member is meaningless.
+    Mirrors the same "does this user actually hold this membership" gate
+    every other per-membership write (e.g. budget reassignment via
+    `update_member_endpoint`) already enforces."""
+
+    status_code = 404
+    code = "member_not_on_team"
+
+    def __init__(self, team_id: uuid.UUID, user_id: uuid.UUID) -> None:
+        super().__init__(
+            f"User '{user_id}' does not currently hold an active membership on team '{team_id}'."
+        )
+
+
+async def load_member_policy_snapshot(
+    session: AsyncSession,
+) -> dict[tuple[uuid.UUID, uuid.UUID], frozenset[str]]:
+    """Query every member's restriction row - used at process startup only
+    (to warm `MemberModelPolicyCache`, see `main.py`'s lifespan). NEVER call
+    this from a gateway route handler (same zero-DB hot-path rule as
+    `load_policy_snapshot`/`load_team_policy_snapshot`)."""
+    rows = (await session.execute(select(TeamMemberModelPolicy))).scalars().all()
+    return {(row.team_id, row.user_id): frozenset(row.models) for row in rows}
+
+
+async def get_member_model_policy(
+    session: AsyncSession, team_id: uuid.UUID, user_id: uuid.UUID
+) -> frozenset[str] | None:
+    """Fetch one member's restriction directly from the database (None = no
+    restriction row). Control-plane read - deliberately reads through to the
+    DB, not the cache, same as `get_policy`/`get_team_model_policy`."""
+    row = (
+        await session.execute(
+            select(TeamMemberModelPolicy).where(
+                TeamMemberModelPolicy.team_id == team_id,
+                TeamMemberModelPolicy.user_id == user_id,
+            )
+        )
+    ).scalar_one_or_none()
+    return None if row is None else frozenset(row.models)
+
+
+async def set_member_model_policy(
+    session: AsyncSession,
+    team_id: uuid.UUID,
+    user_id: uuid.UUID,
+    models: list[str],
+    *,
+    cache: "MemberModelPolicyCache | None" = None,
+    self_hosted_cache: "SelfHostedModelRouteCache | None" = None,
+    custom_model_cache: "CustomModelRouteCache | None" = None,
+) -> frozenset[str]:
+    """Validate then atomically full-replace-upsert one member's restriction
+    within one team.
+
+    Raises `MemberNotOnTeamError` (404) if `user_id` doesn't currently hold
+    an ACTIVE membership on `team_id` - checked FIRST, before any model
+    validation, since a restriction for a non-member is meaningless
+    regardless of what it lists.
+
+    Narrowing guard (mirrors `set_team_model_policy`'s AC3.2 defense-in-depth
+    one layer down): re-fetches BOTH the current org baseline AND the
+    team's own current restriction directly from the DB (not the cache -
+    same "control-plane reads through to DB" precedent as `get_policy`/
+    `get_team_model_policy`) and rejects any entry that is unknown,
+    org-denied, or outside the team's own restriction with
+    `MemberModelRestrictsTeamDeniedModelError` - no DB write in that case.
+
+    Same `execution_options={"populate_existing": True}` requirement as
+    `set_team_model_policy` - see that function's docstring for the full
+    mechanism. This function's own caller (`api/v1/teams.py`'s member-
+    model-restrictions PUT handler) pre-reads the current row for its audit
+    `old_value` into the same session before calling this - without
+    `populate_existing`, the same stale-`RETURNING`-on-UPDATE trap would
+    silently re-arm `MemberModelPolicyCache` with the OLD, pre-tightening
+    restriction.
+    """
+    membership = await get_membership(session, team_id=team_id, user_id=user_id)
+    if membership is None:
+        raise MemberNotOnTeamError(team_id, user_id)
+
+    known_models = (
+        MODEL_REGISTRY.keys()
+        | (self_hosted_cache.known_model_ids() if self_hosted_cache is not None else frozenset())
+        | (custom_model_cache.known_model_ids() if custom_model_cache is not None else frozenset())
+    )
+    org_snapshot = await load_policy_snapshot(session)
+    team_restriction = await get_team_model_policy(session, team_id)
+    offending = sorted(
+        {
+            m
+            for m in models
+            if m not in known_models
+            or not org_snapshot.is_allowed(m)
+            or (team_restriction is not None and m not in team_restriction)
+        }
+    )
+    if offending:
+        raise MemberModelRestrictsTeamDeniedModelError(offending)
+
+    dedup_models = sorted(set(models))
+    insert_stmt = postgresql.insert(TeamMemberModelPolicy).values(
+        team_id=team_id, user_id=user_id, models=dedup_models
+    )
+    upsert_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=[TeamMemberModelPolicy.team_id, TeamMemberModelPolicy.user_id],
+        set_={"models": insert_stmt.excluded.models, "updated_at": func.now()},
+    ).returning(TeamMemberModelPolicy)
+    row = (
+        await session.execute(upsert_stmt, execution_options={"populate_existing": True})
+    ).scalar_one()
+    await session.commit()
+    committed = frozenset(row.models)
+    if cache is not None:
+        cache.set_member(team_id, user_id, committed)
     return committed
 
 

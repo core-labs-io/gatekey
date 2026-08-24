@@ -15,8 +15,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gatekey.constants import DEFAULT_ORG_ID
+from gatekey.db.models.org_settings import OrgSettings
 from gatekey.db.models.team import Team
 from gatekey.db.models.team_membership import TeamMembership
 from gatekey.db.models.user import User
@@ -60,7 +63,12 @@ async def get_team_membership_budget_state(
     """Single joined SELECT of one (team, user) membership's budget/spend
     state plus the team's period fields. Like `get_budget_state`, always
     reads through to the database - per-request mutable state, never
-    cacheable the `ModelPolicyCache` way."""
+    cacheable the `ModelPolicyCache` way.
+
+    `removed_at IS NULL` (added by `0049`): a removed membership must
+    resolve to `None` here exactly like a never-existing one - the caller
+    (`api.v1.gateway.common.check_budget_available`) turns that into a
+    clean `TeamMembershipRemovedError` (403), not a budget-state crash."""
     stmt = (
         select(
             TeamMembership.id,
@@ -74,7 +82,11 @@ async def get_team_membership_budget_state(
         )
         .join(User, User.id == TeamMembership.user_id)
         .join(Team, Team.id == TeamMembership.team_id)
-        .where(TeamMembership.team_id == team_id, TeamMembership.user_id == user_id)
+        .where(
+            TeamMembership.team_id == team_id,
+            TeamMembership.user_id == user_id,
+            TeamMembership.removed_at.is_(None),
+        )
     )
     row = (await session.execute(stmt)).one_or_none()
     if row is None:
@@ -113,7 +125,43 @@ async def get_budget_state(session: AsyncSession, user_id: uuid.UUID) -> UserBud
     )
 
 
-def is_budget_exhausted(state: UserBudgetState | TeamMembershipBudgetState) -> bool:
+@dataclass(frozen=True)
+class OrgBudgetState:
+    """The org-wide safeguard counter (added alongside `0045` - see that
+    migration's docstring). Unlike `UserBudgetState`/`TeamMembershipBudgetState`,
+    there's no guaranteed-to-exist FK-referenced row backing this - absence
+    of an `org_settings` row is ADR-2's normal "no ceiling configured"
+    default state, so `get_org_budget_state` below always returns a value
+    (never `None`), defaulting to unmetered."""
+
+    budget_usd: Decimal | None
+    current_spend_usd: Decimal
+
+
+async def get_org_budget_state(session: AsyncSession) -> OrgBudgetState:
+    """Single indexed-PK SELECT of the org's live spend-safeguard state.
+    Absence of a row (ADR-2: never configured) resolves to the same
+    "unmetered, zero spend" default `services.org_settings.
+    get_effective_org_settings` uses for every other org-settings field.
+
+    Deliberately not cacheable, same rationale as `get_budget_state`/
+    `get_team_membership_budget_state` above - this is checked on EVERY
+    gateway request (`api.v1.gateway.common.check_budget_available`), a
+    permanent added cost accepted deliberately: a single indexed point
+    lookup, same class of cost as those two existing checks, in exchange
+    for a real org-wide circuit breaker instead of only alerting."""
+    stmt = select(OrgSettings.budget_ceiling_usd, OrgSettings.current_spend_usd).where(
+        OrgSettings.org_id == DEFAULT_ORG_ID
+    )
+    row = (await session.execute(stmt)).one_or_none()
+    if row is None:
+        return OrgBudgetState(budget_usd=None, current_spend_usd=Decimal(0))
+    return OrgBudgetState(budget_usd=row.budget_ceiling_usd, current_spend_usd=row.current_spend_usd)
+
+
+def is_budget_exhausted(
+    state: UserBudgetState | TeamMembershipBudgetState | OrgBudgetState,
+) -> bool:
     """`NULL` budget is never exhausted (unmetered); exhausted means
     `current_spend_usd >= budget_usd` - "exhausted" means fully used
     (`>=`, not `>`), so `budget_usd = 0` blocks the very first request,
@@ -121,7 +169,9 @@ def is_budget_exhausted(state: UserBudgetState | TeamMembershipBudgetState) -> b
 
     Phase 2: identical semantics for both the legacy flat `User` counter
     and a `TeamMembership` counter (design doc section 3.2) - one shared
-    predicate, not two implementations that could drift.
+    predicate, not two implementations that could drift. The org-wide
+    safeguard counter (added alongside `0045`) reuses the exact same
+    predicate one level up, for the same reason.
     """
     return state.budget_usd is not None and state.current_spend_usd >= state.budget_usd
 
@@ -328,3 +378,111 @@ async def record_team_membership_usage_charge(
         team_webhook_alert_enabled=team_row.webhook_alert_enabled,
         team_email_alert_enabled=team_row.email_alert_enabled,
     )
+
+
+@dataclass(frozen=True)
+class OrgChargeResult:
+    """Result of the org-wide spend increment (added alongside `0045` -
+    mirrors `ChargeResult`'s `team_*` fields one level up). Always
+    populated (never `None` fields) - unlike the team charge, there's no
+    "legacy path with no aggregate" case to account for."""
+
+    old_total: Decimal
+    new_total: Decimal
+    ceiling_usd: Decimal | None
+    # 50/75/100% (added by `0046`) - NOT team's 80/100 set, see that
+    # migration's docstring.
+    alert_50_enabled: bool
+    alert_75_enabled: bool
+    alert_100_enabled: bool
+    webhook_alert_enabled: bool
+    email_alert_enabled: bool
+
+
+async def record_org_usage_charge(session: AsyncSession, *, cost: Decimal) -> OrgChargeResult:
+    """Atomically increment the org's denormalized `current_spend_usd`
+    (added alongside `0045` - see that migration's docstring).
+
+    `api.v1.gateway.common.record_usage_charge` is the single choke point
+    that calls this, ALWAYS (regardless of whether the charge went through
+    the legacy flat-`User` path or the team-scoped path) - the org
+    safeguard is meant to catch total spend across every path, not just
+    team-scoped ones.
+
+    A single `INSERT ... ON CONFLICT (org_id) DO UPDATE` (upsert-increment)
+    rather than the plain `UPDATE ... RETURNING` `record_usage_charge`/
+    `record_team_membership_usage_charge` use above: those two update rows
+    that are GUARANTEED to already exist (FK-referenced `User`/
+    `TeamMembership` rows); an `org_settings` row is NOT guaranteed to
+    exist (ADR-2: absence-of-row is the normal default state for an org
+    that has never touched org settings) - the upsert creates it on first
+    spend rather than requiring an admin to have configured something
+    first.
+
+    Deliberately its OWN transaction/commit, separate from whichever of
+    `record_usage_charge`/`record_team_membership_usage_charge` already
+    committed the user/team charge immediately before this is called (see
+    the gateway wrapper) - there is no cross-table invariant to preserve
+    atomically between them (unlike `record_team_membership_usage_charge`'s
+    own team+membership pair, which DOES need one transaction for ADR-7).
+    A crash between the two commits leaves the org total a cost-of-one-
+    request short of perfectly in sync - an accepted, tiny race, same
+    class as the pre-request check-then-charge race already accepted
+    everywhere else in this module.
+    """
+    stmt = (
+        postgresql.insert(OrgSettings)
+        .values(org_id=DEFAULT_ORG_ID, current_spend_usd=cost)
+        .on_conflict_do_update(
+            index_elements=[OrgSettings.org_id],
+            set_={"current_spend_usd": OrgSettings.current_spend_usd + cost},
+        )
+        .returning(
+            # Same NEW-values-visible-in-RETURNING trick as the team
+            # charge above: `current_spend_usd - cost` is the pre-charge
+            # total (0 for a freshly-inserted row, correctly representing
+            # "started at 0, now at cost").
+            (OrgSettings.current_spend_usd - cost).label("old_total"),
+            OrgSettings.current_spend_usd.label("new_total"),
+            OrgSettings.budget_ceiling_usd,
+            OrgSettings.alert_threshold_50_enabled,
+            OrgSettings.alert_threshold_75_enabled,
+            OrgSettings.alert_threshold_100_enabled,
+            OrgSettings.webhook_alert_enabled,
+            OrgSettings.email_alert_enabled,
+        )
+    )
+    row = (await session.execute(stmt)).one()
+    await session.commit()
+    return OrgChargeResult(
+        old_total=row.old_total,
+        new_total=row.new_total,
+        ceiling_usd=row.budget_ceiling_usd,
+        alert_50_enabled=row.alert_threshold_50_enabled,
+        alert_75_enabled=row.alert_threshold_75_enabled,
+        alert_100_enabled=row.alert_threshold_100_enabled,
+        webhook_alert_enabled=row.webhook_alert_enabled,
+        email_alert_enabled=row.email_alert_enabled,
+    )
+
+
+async def reset_org_spend(session: AsyncSession) -> OrgSettings:
+    """Explicit admin action that zeroes the org-wide spend counter (added
+    alongside `0045` - see that migration's docstring for why this is
+    manual-only, never an automatic period reset). Upserts the row first
+    (same `on_conflict_do_nothing` pattern `services.team_budget.
+    set_org_budget_ceiling` uses) so there is always a row to update, even
+    for an org that has never touched org settings. Flushes, does not
+    commit - the caller writes its own audit entry on the same transaction
+    (design doc section 7's established convention)."""
+    await session.execute(
+        postgresql.insert(OrgSettings)
+        .values(org_id=DEFAULT_ORG_ID)
+        .on_conflict_do_nothing(index_elements=[OrgSettings.org_id])
+    )
+    row = (
+        await session.execute(select(OrgSettings).where(OrgSettings.org_id == DEFAULT_ORG_ID))
+    ).scalar_one()
+    row.current_spend_usd = Decimal(0)
+    await session.flush()
+    return row

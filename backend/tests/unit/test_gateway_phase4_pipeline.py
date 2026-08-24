@@ -34,7 +34,7 @@ from gatekey.schemas.chat import (
     ChatCompletionChoice,
     ChatCompletionResponse,
     ChatCompletionUsage,
-    ChatMessage,
+    ChatCompletionResponseMessage,
 )
 from gatekey.services import budget as budget_service
 from gatekey.services import degradation as degradation_service
@@ -80,7 +80,7 @@ def _fake_response(native_model_id: str, text: str = "hi") -> ChatCompletionResp
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(role="assistant", content=text),
+                message=ChatCompletionResponseMessage(role="assistant", content=text),
                 finish_reason="stop",
             )
         ],

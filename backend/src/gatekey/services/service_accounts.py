@@ -99,12 +99,13 @@ async def create_service_account(
     for every new key; it stays optional HERE (None = legacy flat-budget
     row) so pre-Phase-2-shaped rows remain constructible (tests, legacy
     behavior - byte-for-byte unchanged). When given, the target user must
-    hold a `TeamMembership` on that team; the membership row is locked
-    (`SELECT ... FOR UPDATE`) through this transaction's commit so a
-    concurrent membership removal serializes against this create (same
-    discipline as `create_personal_key` / security review M-2) - removal
-    then sees the new key and 409s per ADR-4, never orphaning it.
-    Raises `TeamMembershipNotFoundError` if no such membership exists.
+    hold an ACTIVE `TeamMembership` on that team (`removed_at IS NULL`,
+    added by `0049`); the membership row is locked (`SELECT ... FOR
+    UPDATE`) through this transaction's commit so a concurrent removal
+    serializes against this create (same discipline as `create_personal_
+    key` / security review M-2) - whichever wins the lock, the loser sees
+    a consistent state. Raises `TeamMembershipNotFoundError` if no such
+    active membership exists.
     """
     existing_user = await get_user(session, user_id)
     if existing_user is None:
@@ -114,7 +115,11 @@ async def create_service_account(
         membership = (
             await session.execute(
                 select(TeamMembership)
-                .where(TeamMembership.team_id == team_id, TeamMembership.user_id == user_id)
+                .where(
+                    TeamMembership.team_id == team_id,
+                    TeamMembership.user_id == user_id,
+                    TeamMembership.removed_at.is_(None),
+                )
                 .with_for_update()
             )
         ).scalar_one_or_none()

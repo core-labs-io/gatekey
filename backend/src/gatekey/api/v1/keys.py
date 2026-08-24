@@ -202,7 +202,7 @@ async def list_own_keys(
     ctx: SessionContext = Depends(get_current_session),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[PersonalApiKeyResponse]:
-    rows = await list_personal_keys_for_owner(session, ctx.user_id)
+    rows = await list_personal_keys_for_owner(session, ctx.require_user_id())
     return [PersonalApiKeyResponse.model_validate(row) for row in rows]
 
 
@@ -216,13 +216,14 @@ async def create_own_key(
     design doc 5.6) and the caller must hold a membership on that team - the
     rejection is the same generic 403 whether or not the team exists,
     mirroring `require_team_role`'s anti-enumeration posture."""
-    if await get_membership(session, team_id=payload.team_id, user_id=ctx.user_id) is None:
+    user_id = ctx.require_user_id()
+    if await get_membership(session, team_id=payload.team_id, user_id=user_id) is None:
         raise ForbiddenError("You do not have the required role for this team.")
     return await _audited_create(
         session,
         actor=ctx,
-        owner_user_id=ctx.user_id,
-        created_by_user_id=ctx.user_id,
+        owner_user_id=user_id,
+        created_by_user_id=user_id,
         team_id=payload.team_id,
         name=payload.name,
         expires_at=payload.expires_at,
@@ -424,23 +425,23 @@ async def list_admin_keys(
 ) -> list[AdminKeyResponse]:
     entries: list[AdminKeyResponse] = []
     if key_type in ("app", "all"):
-        rows = (
+        app_rows = (
             await session.execute(
                 select(ServiceAccountKey, User.name).join(
                     User, User.id == ServiceAccountKey.user_id
                 )
             )
         ).all()
-        entries.extend(_app_admin_row(row, name) for row, name in rows)
+        entries.extend(_app_admin_row(row, name) for row, name in app_rows)
     if key_type in ("personal", "all"):
-        rows = (
+        personal_rows = (
             await session.execute(
                 select(PersonalApiKey, User.name).join(
                     User, User.id == PersonalApiKey.owner_user_id
                 )
             )
         ).all()
-        entries.extend(_personal_admin_row(row, name) for row, name in rows)
+        entries.extend(_personal_admin_row(row, name) for row, name in personal_rows)
     entries.sort(key=lambda e: e.created_at)
     return entries
 
@@ -649,6 +650,11 @@ async def rotate_key_now(
     )
     await session.commit()
 
+    # `previous_secret_valid_until` is nullable in general (a never-rotated
+    # key has none) but `rotate_service_account_key` unconditionally sets
+    # it as part of every successful rotation (services/service_accounts.py)
+    # - guaranteed non-None on the `row` this function just got back.
+    assert row.previous_secret_valid_until is not None
     background_tasks.add_task(
         deliver_service_account_rotation_notification,
         request.app,

@@ -43,8 +43,12 @@ ViolationBehavior = Literal["hard_block", "warn"]
 
 # Design doc section 3.1. Deliberately a small, fixed set (not a DB table -
 # no per-org region catalog exists) - `allowed_regions` on every rule is
-# validated against this at write time.
-SUPPORTED_REGIONS = frozenset({"us", "eu", "apac"})
+# validated against this at write time. "ca" (Canada) added alongside the
+# original us/eu/apac set - kept as its own bucket rather than folded into
+# "us" (see `_GCP_LOCATION_PREFIX_TO_REGION` below: GCP's real
+# `northamerica-*` Vertex AI locations are exclusively Canadian - Montreal/
+# Toronto - never American; American locations are all `us-*`-prefixed).
+SUPPORTED_REGIONS = frozenset({"us", "eu", "apac", "ca"})
 
 # Static, non-admin-configurable regions for multi-tenant cloud APIs whose
 # hosting region Gatekey has no way to change per-org. `openrouter` is
@@ -59,10 +63,14 @@ _PROVIDER_STATIC_REGION: dict[str, str] = {
 # "us-central1") -> coarse region. Deliberately narrow: only prefixes this
 # codebase can confidently map into one of `SUPPORTED_REGIONS` are listed;
 # anything else (e.g. "me-west1") falls through to `None` ("unknown") rather
-# than guessing.
+# than guessing. `northamerica` -> `ca`, not `us`: GCP's own naming reserves
+# `northamerica-northeast1`/`2` (Montreal/Toronto) exclusively for Canada -
+# every American Vertex AI location is `us-*`-prefixed instead, so this was
+# never actually ambiguous, just previously mapped into the closest
+# available bucket before `ca` existed.
 _GCP_LOCATION_PREFIX_TO_REGION: dict[str, str] = {
     "us": "us",
-    "northamerica": "us",
+    "northamerica": "ca",
     "southamerica": "us",
     "europe": "eu",
     "asia": "apac",
@@ -92,9 +100,22 @@ def resolve_model_region(route: ModelRoute, provider_key_metadata: dict | None) 
       `SUPPORTED_REGIONS`. None if the operator never set it - a residency
       rule blocks self-hosted traffic by default until an admin explicitly
       tags its region, matching hard-block-by-default's own intent.
-    - openrouter: always None - an aggregator with no single knowable
-      region (deliberate, not a gap - see design doc section 12's
-      forward-looking flag).
+    - openrouter: unknown by default (an aggregator with no single knowable
+      region - it dispatches each request to whichever underlying provider
+      it selects, which can be hosted anywhere). `provider_key_metadata
+      ["trusted_provider_region"]` (an admin-settable field, see
+      `schemas.provider_key.OpenRouterKeyRequest`) is the one exception -
+      returned verbatim, if it is one of `SUPPORTED_REGIONS` AND
+      `["trusted_provider_slugs"]` is non-empty. This is only ever safe to
+      trust because `providers.openrouter.py`'s outbound call functions
+      UNCONDITIONALLY constrain every request to exactly that provider
+      slug list whenever it's configured (see that module) - the region
+      claim here is enforced, not assumed. A configured region with an
+      empty/missing slug list (should not happen given the schema's own
+      set-together-or-not-at-all validation, but re-checked here too) is
+      treated the same as unconfigured - a bare region claim with nothing
+      actually restricting the outbound call would be exactly the kind of
+      unverifiable assumption this whole function refuses to make.
     - openai/anthropic: the static lookup above.
     """
     if route.provider == "vertex_ai":
@@ -108,6 +129,12 @@ def resolve_model_region(route: ModelRoute, provider_key_metadata: dict | None) 
         region = provider_key_metadata.get("region")
         return region if region in SUPPORTED_REGIONS else None
     if route.provider == "openrouter":
+        if provider_key_metadata is None:
+            return None
+        slugs = provider_key_metadata.get("trusted_provider_slugs")
+        region = provider_key_metadata.get("trusted_provider_region")
+        if slugs and region in SUPPORTED_REGIONS:
+            return region
         return None
     return _PROVIDER_STATIC_REGION.get(route.provider)
 

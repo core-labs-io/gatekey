@@ -30,9 +30,35 @@ def test_resolve_model_region_openai_and_anthropic_are_static_us() -> None:
     assert resolve_model_region(route, None) == "us"
 
 
-def test_resolve_model_region_openrouter_is_always_unknown() -> None:
+def test_resolve_model_region_openrouter_unconfigured_is_unknown_by_default() -> None:
     route = ModelRoute(provider="openrouter", capability=ModelCapability.CHAT, native_model_id="x")
+    assert resolve_model_region(route, None) is None
+    assert resolve_model_region(route, {}) is None
     assert resolve_model_region(route, {"anything": "here"}) is None
+
+
+def test_resolve_model_region_openrouter_trusts_configured_region_when_slugs_also_set() -> None:
+    """Real, enforced trust (see `providers.openrouter.py::_chat_request_body`,
+    which applies `provider.only` unconditionally whenever this is
+    configured) - not a bare admin claim."""
+    route = ModelRoute(provider="openrouter", capability=ModelCapability.CHAT, native_model_id="x")
+    metadata = {"trusted_provider_slugs": ["openai", "anthropic"], "trusted_provider_region": "us"}
+    assert resolve_model_region(route, metadata) == "us"
+
+
+def test_resolve_model_region_openrouter_region_without_slugs_is_unknown() -> None:
+    """Should be unreachable via the schema's own set-together-or-not-at-all
+    validation (`OpenRouterKeyRequest`), but re-checked here too - a bare
+    region claim with nothing actually restricting the outbound call must
+    never be trusted."""
+    route = ModelRoute(provider="openrouter", capability=ModelCapability.CHAT, native_model_id="x")
+    assert resolve_model_region(route, {"trusted_provider_region": "us", "trusted_provider_slugs": []}) is None
+
+
+def test_resolve_model_region_openrouter_rejects_a_region_outside_supported_set() -> None:
+    route = ModelRoute(provider="openrouter", capability=ModelCapability.CHAT, native_model_id="x")
+    metadata = {"trusted_provider_slugs": ["openai"], "trusted_provider_region": "mars"}
+    assert resolve_model_region(route, metadata) is None
 
 
 def test_resolve_model_region_vertex_ai_coarsens_location() -> None:
@@ -74,7 +100,8 @@ def test_resolve_model_region_ollama_rejects_a_region_outside_supported_set() ->
     "location,expected",
     [
         ("us-central1", "us"),
-        ("northamerica-northeast1", "us"),
+        ("northamerica-northeast1", "ca"),
+        ("northamerica-northeast2", "ca"),
         ("southamerica-east1", "us"),
         ("europe-west4", "eu"),
         ("asia-southeast1", "apac"),

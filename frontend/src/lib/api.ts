@@ -47,11 +47,17 @@ export function clearStoredToken(): void {
 export class ApiError extends Error {
   code: string;
   status: number;
+  /** Parsed from the `Retry-After` response header (seconds), when present
+   * - e.g. rate-limit (429) and the custom-model verify cooldown (429) both
+   * set this header. `undefined` when the response carried no such header,
+   * which is the overwhelming majority of errors. */
+  retryAfterSeconds?: number;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, retryAfterSeconds?: number) {
     super(message);
     this.status = status;
     this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -93,10 +99,16 @@ async function request<T>(
 
   if (!response.ok) {
     const errorPayload = (payload as { error?: { code?: string; message?: string } } | null)?.error;
+    const retryAfterHeader = response.headers.get("Retry-After");
+    const retryAfterSeconds =
+      retryAfterHeader !== null && !Number.isNaN(Number(retryAfterHeader))
+        ? Number(retryAfterHeader)
+        : undefined;
     throw new ApiError(
       response.status,
       errorPayload?.code || "unknown_error",
-      errorPayload?.message || `Request failed with status ${response.status}.`
+      errorPayload?.message || `Request failed with status ${response.status}.`,
+      retryAfterSeconds
     );
   }
 
@@ -141,7 +153,11 @@ export async function probeSsoConfigured(): Promise<boolean> {
 
 export type OrgRole = "org_admin" | "auditor";
 export type TeamRole = "team_lead" | "member";
-export type OnboardingStatus = "resolved" | "pending_profile" | "pending_approval";
+export type OnboardingStatus =
+  | "resolved"
+  | "pending_profile"
+  | "pending_approval"
+  | "pending_alert_email";
 
 export interface MeTeam {
   team_id: string;
@@ -244,7 +260,16 @@ export function listProviders(token?: string | null): Promise<ProviderKeyRespons
 export function putProviderKey(
   provider: ProviderName,
   body:
-    | { api_key: string; label?: string }
+    | {
+        api_key: string;
+        label?: string;
+        /** openrouter only - see `OpenRouterKeyForm`'s doc comment. Must
+         * be omitted (never sent, not even as empty/null) for openai/
+         * anthropic - their backend schemas `extra="forbid"` any field
+         * they don't define. */
+        trusted_provider_slugs?: string[];
+        trusted_provider_region?: string | null;
+      }
     | {
         service_account_json: Record<string, unknown>;
         project_id: string;
@@ -280,6 +305,13 @@ export function deleteProviderKeyById(provider: ProviderName, keyId: string): Pr
 
 // --- Users (Phase 1.4/1.6) ----------------------------------------------------
 
+export interface UserTeamMembership {
+  team_id: string;
+  team_name: string;
+  budget_usd: string | null;
+  current_spend_usd: string;
+}
+
 export interface UserResponse {
   id: string;
   name: string;
@@ -289,6 +321,10 @@ export interface UserResponse {
   org_role: OrgRole | null;
   created_at: string;
   updated_at: string;
+  /** Active team memberships. Non-empty means `budget_usd`/`current_spend_usd`
+   * above are dead - real enforcement uses each membership's own budget
+   * instead (see `db/models/user.py`'s docstring). */
+  team_memberships: UserTeamMembership[];
 }
 
 export function listUsers(): Promise<UserResponse[]> {
@@ -573,6 +609,15 @@ export interface TeamModelRestrictionsResponse {
   team_restriction: string[] | null;
 }
 
+/** `team_baseline` = every model this member's TEAM can currently use (org
+ * baseline intersected with the team's own restriction, if any) -
+ * `member_restriction` = this member's own narrowing, or null = the team
+ * baseline applies to them unchanged. */
+export interface TeamMemberModelRestrictionsResponse {
+  team_baseline: string[];
+  member_restriction: string[] | null;
+}
+
 export interface ReassignBudgetResponse {
   from_user_id: string;
   to_user_id: string;
@@ -659,10 +704,33 @@ export function updateTeamMember(
   });
 }
 
-/** 409 member_has_active_keys if the member still holds active keys. */
+/** Soft delete (added by `0049`) - takes effect immediately (the member's
+ * keys stop working), reversible via `restoreTeamMember`. No longer 409s
+ * on active keys existing. */
 export function removeTeamMember(teamId: string, userId: string): Promise<void> {
   return request<void>(`/v1/teams/${teamId}/members/${userId}`, {
     method: "DELETE",
+    session: adminAuth(),
+  });
+}
+
+/** Undo `removeTeamMember` (added by `0049`) - same role/budget/spend
+ * history, no key re-issuance needed. 404 if this user was never removed
+ * from this team. */
+export function restoreTeamMember(teamId: string, userId: string): Promise<TeamMemberResponse> {
+  return request<TeamMemberResponse>(`/v1/teams/${teamId}/members/${userId}/restore`, {
+    method: "POST",
+    session: adminAuth(),
+  });
+}
+
+export interface RemovedTeamMemberResponse extends TeamMemberResponse {
+  removed_at: string;
+}
+
+/** Restore-UI counterpart to the member list (added by `0049`). */
+export function listRemovedTeamMembers(teamId: string): Promise<RemovedTeamMemberResponse[]> {
+  return request<RemovedTeamMemberResponse[]>(`/v1/teams/${teamId}/members/removed`, {
     session: adminAuth(),
   });
 }
@@ -695,6 +763,34 @@ export function putTeamModelRestrictions(
     body,
     session: adminAuth(),
   });
+}
+
+/** Third layer, one below the team-wide restriction above: a team lead's
+ * per-member narrowing. 403 if a plain-member session requests anyone
+ * other than their own `userId` (self-view only - a team lead, or the
+ * org_admin bypass, can view any member's). */
+export function getMemberModelRestrictions(
+  teamId: string,
+  userId: string
+): Promise<TeamMemberModelRestrictionsResponse> {
+  return request<TeamMemberModelRestrictionsResponse>(
+    `/v1/teams/${teamId}/members/${userId}/model-restrictions`,
+    { session: adminAuth() }
+  );
+}
+
+/** Team-lead-only. 404 member_not_on_team / 422
+ * member_model_restricts_team_denied_model if the list references a
+ * non-member or tries to widen beyond the team's own effective set. */
+export function putMemberModelRestrictions(
+  teamId: string,
+  userId: string,
+  body: { models: string[] }
+): Promise<TeamMemberModelRestrictionsResponse> {
+  return request<TeamMemberModelRestrictionsResponse>(
+    `/v1/teams/${teamId}/members/${userId}/model-restrictions`,
+    { method: "PUT", body, session: adminAuth() }
+  );
 }
 
 /** `webhook_url` semantics: omitted = keep stored URL, string = replace,
@@ -777,6 +873,12 @@ export interface OrgSettingsResponse {
   max_self_serve_key_expiration_days: number | null;
   personal_key_soft_cap: number;
   auto_provision_personal_key_on_approval: boolean;
+  /** Org-wide budget safeguard (added by `0045`) - live spend, read-only. */
+  current_spend_usd: string;
+  /** Dedicated alert-recipient email (added by `0048`) - read-only here,
+   * written only via `setOrgAlertEmail`. `null` = the first-SSO-login
+   * org_admin onboarding prompt hasn't been satisfied. */
+  alert_recipient_email: string | null;
 }
 
 export function getOrgSettings(): Promise<OrgSettingsResponse> {
@@ -795,6 +897,17 @@ export function putOrgSettings(body: {
   return request<OrgSettingsResponse>("/v1/admin/org-settings", {
     method: "PUT",
     body,
+    session: adminAuth(),
+  });
+}
+
+/** The first-SSO-login org_admin onboarding action (added by `0048`) -
+ * also freely re-editable afterward from Org Settings like any other
+ * field. */
+export function setOrgAlertEmail(email: string): Promise<{ alert_recipient_email: string }> {
+  return request<{ alert_recipient_email: string }>("/v1/admin/org-settings/alert-email", {
+    method: "POST",
+    body: { email },
     session: adminAuth(),
   });
 }
@@ -2364,6 +2477,12 @@ export interface CustomModelResponse {
   pricing_as_of: string;
   verified: boolean;
   shadowed_by_registry: boolean;
+  // Model Catalog + Cross-Provider Fallback Chains (Part B) - ordered list
+  // of other model names (registry / other verified custom models /
+  // verified self-hosted model ids) Gatekey automatically tries, in order,
+  // if this model's own provider call fails. `[]` = no chain configured
+  // (byte-for-byte pre-feature behavior).
+  fallback_model_names: string[];
   created_at: string;
   updated_at: string;
 }
@@ -2380,6 +2499,8 @@ export interface CustomModelCreateRequest {
   input_price_per_million_usd: string;
   output_price_per_million_usd?: string | null;
   pricing_source?: string | null;
+  /** Max 5 entries, defaults to `[]` server-side if omitted. */
+  fallback_model_names?: string[];
 }
 
 /** Mirrors `schemas.custom_model.CustomModelUpdateRequest` - every field
@@ -2388,7 +2509,11 @@ export interface CustomModelCreateRequest {
  * `output_price_per_million_usd: null` explicitly (not omitted) to clear a
  * previously-required price when editing `capability` from `"chat"` to
  * `"embeddings"` - the backend distinguishes "omitted" from "explicit
- * null" via `model_fields_set`. */
+ * null" via `model_fields_set`.
+ *
+ * `fallback_model_names` has the identical provided-vs-omitted discipline:
+ * omit the key entirely to leave the chain unchanged, or send it (even as
+ * `[]`) to replace/clear it - never send `null` for this field. */
 export interface CustomModelUpdateRequest {
   name?: string;
   provider?: CustomModelProvider;
@@ -2397,6 +2522,7 @@ export interface CustomModelUpdateRequest {
   input_price_per_million_usd?: string;
   output_price_per_million_usd?: string | null;
   pricing_source?: string | null;
+  fallback_model_names?: string[];
 }
 
 export function listCustomModels(): Promise<CustomModelResponse[]> {
@@ -2445,6 +2571,73 @@ export function removeCustomModel(customModelId: string): Promise<void> {
 export function verifyCustomModel(customModelId: string): Promise<CustomModelResponse> {
   return request<CustomModelResponse>(`/v1/admin/custom-models/${customModelId}/verify`, {
     method: "POST",
+    session: adminAuth(),
+  });
+}
+
+// --- Model Catalog + Cross-Provider Fallback Chains (Part A: live listing) ---
+//
+// See `gatekey/model-catalog-fallback-chains-technical-design.md` section 1.
+// RBAC: `require_admin_or_auditor` (read-only, no side effect).
+
+/** One entry in a provider's live "what models does it actually have"
+ * catalog. Price fields are non-null whenever the backend has ANY
+ * authoritative price for this entry (live OpenRouter figure, or a static
+ * registry match for OpenAI/Anthropic) - the caller's rule is simply "if
+ * either is non-null, prefill it (still editable); otherwise leave blank". */
+export interface AvailableModelEntry {
+  native_model_id: string;
+  display_name: string;
+  input_price_per_million_usd: string | null;
+  output_price_per_million_usd: string | null;
+  /** The Gatekey-facing model NAME this entry is already routable/priced
+   * under (a registry key, or a verified Custom Model's `name`) - `null`
+   * means the live provider offers it but Gatekey has never priced it, so
+   * it must be registered as a Custom Model before it can be added to org
+   * model policy. */
+  routable_as: string | null;
+}
+
+/** `GET /v1/admin/custom-models/available/{provider}`. Callers must handle
+ * two specific, expected `ApiError`s distinctly from a genuine failure:
+ * - `err.code === "provider_not_configured"` (404): no `provider_keys` row
+ *   configured for this provider yet - point the admin at the Providers
+ *   screen, not a generic error.
+ * - `err.code === "custom_model_live_listing_unsupported"` (422, vertex_ai
+ *   only): expected/documented, not a bug - fall back to a plain text
+ *   native_model_id input, no error styling.
+ * Anything else (e.g. `provider_upstream_error`, 502) is a genuine failure -
+ * surface `err.message` verbatim. */
+export function listAvailableModels(provider: CustomModelProvider): Promise<AvailableModelEntry[]> {
+  return request<AvailableModelEntry[]>(`/v1/admin/custom-models/available/${provider}`, {
+    session: adminAuth(),
+  });
+}
+
+/** `GET /v1/admin/custom-models/registry-model-names` - every built-in
+ * Gatekey model name, sorted. Zero I/O backend-side. Used, alongside this
+ * org's other custom models and its self-hosted providers' model ids, as
+ * the candidate source for the fallback-chain picker. */
+export function listRegistryModelNames(): Promise<string[]> {
+  return request<string[]>("/v1/admin/custom-models/registry-model-names", {
+    session: adminAuth(),
+  });
+}
+
+/** One static `MODEL_REGISTRY` entry, provider-tagged. */
+export interface RegistryModelEntry {
+  name: string;
+  provider: ProviderName;
+}
+
+/** `GET /v1/admin/custom-models/registry-models` - every built-in Gatekey
+ * model name paired with its provider, sorted. Zero I/O backend-side.
+ * Model Policy's source for `vertex_ai` models: that provider has no live
+ * catalog listing (`listAvailableModels` rejects it with
+ * `custom_model_live_listing_unsupported`), so its checklist is sourced
+ * from this always-current registry dump instead of a hand-typed list. */
+export function listRegistryModels(): Promise<RegistryModelEntry[]> {
+  return request<RegistryModelEntry[]>("/v1/admin/custom-models/registry-models", {
     session: adminAuth(),
   });
 }

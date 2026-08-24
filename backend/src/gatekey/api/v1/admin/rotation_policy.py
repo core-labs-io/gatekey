@@ -39,6 +39,7 @@ from gatekey.services.provider_keys import (
     rotate_provider_key,
 )
 from gatekey.services.rotation import deliver_provider_key_rotation_notification
+from gatekey.db.models.rotation_policy import RotationPolicy
 from gatekey.services.rotation_policy import (
     get_org_rotation_policy,
     get_provider_key_rotation_policy,
@@ -233,6 +234,11 @@ async def rotate_provider_key_endpoint(
     )
     await session.commit()
 
+    # `previous_valid_until` is nullable in general (a never-rotated key has
+    # none) but `rotate_provider_key` unconditionally sets it as part of
+    # every successful rotation (services/provider_keys.py) - guaranteed
+    # non-None on the `provider_key` this function just got back.
+    assert provider_key.previous_valid_until is not None
     background_tasks.add_task(
         deliver_provider_key_rotation_notification,
         request.app,
@@ -245,7 +251,7 @@ async def rotate_provider_key_endpoint(
 
 async def get_provider_key_rotation_policy_for_provider(
     session: AsyncSession, provider: str
-) -> object | None:
+) -> RotationPolicy | None:
     key = await get_key(session, provider)
     if key is None:
         return None

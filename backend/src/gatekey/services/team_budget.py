@@ -47,9 +47,11 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import cast
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.constants import DEFAULT_ORG_ID
@@ -80,13 +82,21 @@ async def _allocated_member_budget(
 ) -> Decimal:
     """SUM of sibling memberships' `budget_usd` (NULL rows contribute
     nothing - unmetered members are outside the allocation arithmetic).
-    Only meaningful while the team row lock is held."""
+    Only meaningful while the team row lock is held. `removed_at IS NULL`
+    (added by `0049`) - a removed member's allocation must free up that
+    headroom for everyone else, not keep counting against the ceiling
+    forever."""
     stmt = select(func.coalesce(func.sum(TeamMembership.budget_usd), 0)).where(
-        TeamMembership.team_id == team_id
+        TeamMembership.team_id == team_id, TeamMembership.removed_at.is_(None)
     )
     if exclude_user_id is not None:
         stmt = stmt.where(TeamMembership.user_id != exclude_user_id)
-    return Decimal((await session.execute(stmt)).scalar_one())
+    # `coalesce(sum(...), 0)` guarantees a non-NULL Decimal at the SQL
+    # level; the SQLAlchemy stubs still type a SUM's scalar as
+    # `Decimal | None` (they don't reason through coalesce), so this is
+    # stub imprecision, not a real nullability gap - same category as the
+    # `CursorResult.rowcount` casts elsewhere in this codebase.
+    return cast(Decimal, (await session.execute(stmt)).scalar_one())
 
 
 def _check_headroom(
@@ -125,7 +135,20 @@ async def create_team_membership(
     always acquired before the `teams` lock here, matching the convention
     `custom_models.py`/`self_hosted_providers.py`/`org_settings.py` use for
     the `org_settings` lock). Defaults to a freshly generated id when
-    omitted, for callers that don't need the id ahead of time."""
+    omitted, for callers that don't need the id ahead of time.
+
+    `0049` (soft delete) note: the `(team_id, user_id)` unique constraint
+    is deliberately unchanged (still exactly one row, ever, per pair - see
+    `db/models/team_membership.py`'s module docstring), so this always
+    INSERTs and never transparently restores a previously-removed row over
+    itself - that's `restore_team_member`'s job, a clearly separate
+    operation, not implicit magic here (a caller-supplied `membership_id`
+    for a fresh audit-entry target_id would silently mismatch the real,
+    pre-existing row's id if this DID restore-in-place). A conflict here
+    means "this user was previously a member and was removed" - surfaced
+    as a distinct, actionable 409 telling the caller to use restore
+    instead of a generic/confusing constraint-violation error.
+    """
     team = await _lock_team(session, team_id)
     allocated = await _allocated_member_budget(session, team_id)
     _check_headroom(ceiling=team.budget_ceiling_usd, allocated=allocated, requested=budget_usd)
@@ -134,7 +157,17 @@ async def create_team_membership(
         team_id=team_id, user_id=user_id, role=role, budget_usd=budget_usd
     )
     session.add(membership)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        raise GatekeyError(
+            "This user was previously a member of this team and was "
+            "removed - restore their membership instead of adding it "
+            "again.",
+            code="member_previously_removed",
+            status_code=409,
+        ) from None
     return membership
 
 
@@ -148,10 +181,14 @@ async def update_team_membership_budget(
     """Edit an existing member's budget, ceiling-checked against the other
     members' allocation under the team lock. Flushes, does not commit."""
     team = await _lock_team(session, team_id)
+    # `removed_at IS NULL` (added by `0049`) - editing a removed member's
+    # budget through this path should 404, same as it not existing.
     membership = (
         await session.execute(
             select(TeamMembership).where(
-                TeamMembership.team_id == team_id, TeamMembership.user_id == user_id
+                TeamMembership.team_id == team_id,
+                TeamMembership.user_id == user_id,
+                TeamMembership.removed_at.is_(None),
             )
         )
     ).scalar_one_or_none()
@@ -221,7 +258,24 @@ async def approve_join_request(
         budget_usd=budget_usd,
     )
     session.add(membership)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        # Same `member_previously_removed` case as `create_team_membership`
+        # - a user who was removed, then submitted a fresh join request,
+        # is asking to be a member again, not restored into their old
+        # role/budget. `rollback()` undoes the JoinRequest status flip to
+        # APPROVED above too (same uncommitted transaction), so the
+        # request is left genuinely pending again for a retry - never a
+        # silently half-approved state.
+        await session.rollback()
+        raise GatekeyError(
+            "This user was previously a member of this team and was "
+            "removed - an org admin or team lead must restore their "
+            "membership instead of approving this request.",
+            code="member_previously_removed",
+            status_code=409,
+        ) from None
     return membership
 
 
@@ -265,12 +319,15 @@ async def reassign_budget(
             status_code=422,
         )
     await _lock_team(session, team_id)
+    # `removed_at IS NULL` (added by `0049`) - can't reassign budget
+    # to/from a removed member.
     rows = (
         (
             await session.execute(
                 select(TeamMembership).where(
                     TeamMembership.team_id == team_id,
                     TeamMembership.user_id.in_([from_user_id, to_user_id]),
+                    TeamMembership.removed_at.is_(None),
                 )
             )
         )
@@ -339,14 +396,17 @@ async def set_team_budget_ceiling(
             )
         org_ceiling = org_settings.budget_ceiling_usd if org_settings is not None else None
         if org_ceiling is not None:
-            sibling_sum = Decimal(
+            # See `_allocated_member_budget`'s comment on the `cast` here -
+            # same coalesce-vs-stub gap, not a real nullability gap.
+            sibling_sum = cast(
+                Decimal,
                 (
                     await session.execute(
                         select(func.coalesce(func.sum(Team.budget_ceiling_usd), 0)).where(
                             Team.org_id == DEFAULT_ORG_ID, Team.id != team_id
                         )
                     )
-                ).scalar_one()
+                ).scalar_one(),
             )
             _check_headroom(
                 ceiling=org_ceiling, allocated=sibling_sum, requested=budget_ceiling_usd
@@ -377,14 +437,17 @@ async def set_org_budget_ceiling(
     ).scalar_one()
 
     if budget_ceiling_usd is not None:
-        team_ceiling_sum = Decimal(
+        # See `_allocated_member_budget`'s comment on the `cast` here -
+        # same coalesce-vs-stub gap, not a real nullability gap.
+        team_ceiling_sum = cast(
+            Decimal,
             (
                 await session.execute(
                     select(func.coalesce(func.sum(Team.budget_ceiling_usd), 0)).where(
                         Team.org_id == DEFAULT_ORG_ID
                     )
                 )
-            ).scalar_one()
+            ).scalar_one(),
         )
         if budget_ceiling_usd < team_ceiling_sum:
             raise BudgetCeilingBelowAllocationError(

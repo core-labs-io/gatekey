@@ -470,40 +470,165 @@ async def test_revoked_and_expired_personal_keys_rejected_on_gateway(
     assert rejected.status_code == 401
 
 
-async def test_membership_removal_blocked_while_active_personal_key_exists(
+async def test_membership_removal_soft_deletes_and_cuts_key_access_immediately(
     client: httpx.AsyncClient, sf, migrated_database_url: str
 ) -> None:
-    """ADR-4: removal is blocked (409), not silently auto-revoking the key;
-    revoking the key unblocks removal."""
-    owner_id = await make_user(sf, "adr4-owner")
-    team_id = await make_team(sf, "adr4-team")
+    """Added by `0049`: removal is a soft delete (row survives with
+    `removed_at` set, NOT the old ADR-4-guarded hard delete) and takes
+    effect immediately - no separate "revoke keys first" step. A still-
+    valid key tied to a just-removed membership must be rejected by the
+    gateway with 403 `team_membership_removed`, not silently keep
+    working."""
+    owner_id = await make_user(sf, "soft-del-owner")
+    team_id = await make_team(sf, "soft-del-team")
     await add_membership(sf, team_id, owner_id, budget=None)
     owner_cookie = await session_cookie_headers(sf, owner_id)
     created = await client.post(
-        "/v1/keys", json={"name": "blocker", "team_id": str(team_id)}, headers=owner_cookie
+        "/v1/keys", json={"name": "still-active", "team_id": str(team_id)}, headers=owner_cookie
     )
     assert created.status_code == 201, created.text
-    key_id = created.json()["id"]
+    secret = created.json()["secret"]
 
-    admin_id = await make_user(sf, "adr4-admin", org_role=UserOrgRole.ORG_ADMIN)
+    admin_id = await make_user(sf, "soft-del-admin", org_role=UserOrgRole.ORG_ADMIN)
     admin_cookie = await session_cookie_headers(sf, admin_id)
 
-    blocked = await client.delete(f"/v1/teams/{team_id}/members/{owner_id}", headers=admin_cookie)
-    assert blocked.status_code == 409
-    assert blocked.json()["error"]["code"] == "member_has_active_keys"
-
-    revoked = await client.delete(f"/v1/admin/keys/{key_id}", headers=admin_cookie)
-    assert revoked.status_code == 204
-
+    # Removal succeeds immediately - no 409, no guard.
     removed = await client.delete(f"/v1/teams/{team_id}/members/{owner_id}", headers=admin_cookie)
     assert removed.status_code == 204
-    remaining = await fetch_val(
+
+    # Row still exists (soft delete), with removed_at now set.
+    row = await fetch_val(
         migrated_database_url,
-        "SELECT COUNT(*) FROM team_memberships WHERE team_id = $1 AND user_id = $2",
+        "SELECT removed_at FROM team_memberships WHERE team_id = $1 AND user_id = $2",
         team_id,
         owner_id,
     )
-    assert int(remaining) == 0
+    assert row is not None
+
+    # The key still authenticates but the membership check now rejects it.
+    rejected = await client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    assert rejected.status_code == 403, rejected.text
+    assert rejected.json()["error"]["code"] == "team_membership_removed"
+
+    # Restoring reinstates access with no key re-issuance needed.
+    restored = await client.post(
+        f"/v1/teams/{team_id}/members/{owner_id}/restore", headers=admin_cookie
+    )
+    assert restored.status_code == 200, restored.text
+    still_removed = await fetch_val(
+        migrated_database_url,
+        "SELECT removed_at FROM team_memberships WHERE team_id = $1 AND user_id = $2",
+        team_id,
+        owner_id,
+    )
+    assert still_removed is None
+
+
+async def test_restore_nonexistent_removal_returns_404(
+    client: httpx.AsyncClient, sf
+) -> None:
+    user_id = await make_user(sf, "restore-404-user")
+    team_id = await make_team(sf, "restore-404-team")
+    await add_membership(sf, team_id, user_id, budget=None)  # still active, never removed
+    admin_id = await make_user(sf, "restore-404-admin", org_role=UserOrgRole.ORG_ADMIN)
+    admin_cookie = await session_cookie_headers(sf, admin_id)
+
+    response = await client.post(
+        f"/v1/teams/{team_id}/members/{user_id}/restore", headers=admin_cookie
+    )
+    assert response.status_code == 404
+
+
+async def test_removed_members_excluded_from_list_but_shown_in_removed_list(
+    client: httpx.AsyncClient, sf
+) -> None:
+    team_id = await make_team(sf, "removed-list-team")
+    active_id = await make_user(sf, "removed-list-active")
+    removed_id = await make_user(sf, "removed-list-removed")
+    await add_membership(sf, team_id, active_id, budget=None)
+    await add_membership(sf, team_id, removed_id, budget=None)
+    admin_id = await make_user(sf, "removed-list-admin", org_role=UserOrgRole.ORG_ADMIN)
+    admin_cookie = await session_cookie_headers(sf, admin_id)
+
+    remove_resp = await client.delete(
+        f"/v1/teams/{team_id}/members/{removed_id}", headers=admin_cookie
+    )
+    assert remove_resp.status_code == 204
+
+    members = await client.get(f"/v1/teams/{team_id}/members", headers=admin_cookie)
+    assert members.status_code == 200
+    member_user_ids = {m["user_id"] for m in members.json()}
+    assert str(active_id) in member_user_ids
+    assert str(removed_id) not in member_user_ids
+
+    removed_list = await client.get(f"/v1/teams/{team_id}/members/removed", headers=admin_cookie)
+    assert removed_list.status_code == 200
+    removed_user_ids = {m["user_id"] for m in removed_list.json()}
+    assert removed_user_ids == {str(removed_id)}
+
+
+async def test_removed_member_budget_freed_from_team_allocation(
+    client: httpx.AsyncClient, sf
+) -> None:
+    """Added by `0049`: a removed member's `budget_usd` must stop counting
+    against the team ceiling - freeing headroom for everyone else, not
+    permanently locking it up."""
+    team_id = await make_team(sf, "freed-budget-team", ceiling=Decimal(100))
+    stays_id = await make_user(sf, "freed-budget-stays")
+    leaves_id = await make_user(sf, "freed-budget-leaves")
+    await add_membership(sf, team_id, stays_id, budget=Decimal(50))
+    await add_membership(sf, team_id, leaves_id, budget=Decimal(50))  # ceiling fully allocated
+    admin_id = await make_user(sf, "freed-budget-admin", org_role=UserOrgRole.ORG_ADMIN)
+    admin_cookie = await session_cookie_headers(sf, admin_id)
+
+    # No headroom left - adding a third member with any budget fails.
+    third_id = await make_user(sf, "freed-budget-third")
+    blocked = await client.post(
+        f"/v1/teams/{team_id}/members",
+        json={"user_id": str(third_id), "role": "member", "budget_usd": "10"},
+        headers=admin_cookie,
+    )
+    assert blocked.status_code == 422, blocked.text
+
+    # Removing the departing member frees their $50.
+    removed = await client.delete(f"/v1/teams/{team_id}/members/{leaves_id}", headers=admin_cookie)
+    assert removed.status_code == 204
+
+    allowed = await client.post(
+        f"/v1/teams/{team_id}/members",
+        json={"user_id": str(third_id), "role": "member", "budget_usd": "10"},
+        headers=admin_cookie,
+    )
+    assert allowed.status_code == 201, allowed.text
+
+
+async def test_readding_a_removed_member_is_rejected_with_actionable_error(
+    client: httpx.AsyncClient, sf
+) -> None:
+    """Added by `0049`: the `(team_id, user_id)` unique constraint is
+    unchanged - trying to `POST /members` for a previously-removed user
+    must fail with a clear, actionable error pointing at restore, not a
+    generic/confusing constraint-violation 500."""
+    team_id = await make_team(sf, "readd-team")
+    user_id = await make_user(sf, "readd-user")
+    await add_membership(sf, team_id, user_id, budget=None)
+    admin_id = await make_user(sf, "readd-admin", org_role=UserOrgRole.ORG_ADMIN)
+    admin_cookie = await session_cookie_headers(sf, admin_id)
+
+    removed = await client.delete(f"/v1/teams/{team_id}/members/{user_id}", headers=admin_cookie)
+    assert removed.status_code == 204
+
+    readd = await client.post(
+        f"/v1/teams/{team_id}/members",
+        json={"user_id": str(user_id), "role": "member", "budget_usd": None},
+        headers=admin_cookie,
+    )
+    assert readd.status_code == 409, readd.text
+    assert readd.json()["error"]["code"] == "member_previously_removed"
 
 
 # --- Session auth (services/sessions.py via /v1/auth/me) ---------------------
@@ -572,6 +697,50 @@ async def test_me_reports_pending_onboarding_states(client: httpx.AsyncClient, s
     assert submitted.status_code == 201, submitted.text
     me = await client.get("/v1/auth/me", headers=cookie)
     assert me.json()["onboarding_status"] == "pending_approval"
+
+
+async def test_org_admin_gated_on_alert_email_until_registered(client: httpx.AsyncClient, sf) -> None:
+    """Added by `0048` - org_admin (product owner's "superadmin") is routed
+    to `pending_alert_email` until `org_settings.alert_recipient_email` is
+    set, then `resolved`. Recomputed fresh on every `/me` call (never a
+    cached one-time decision, same discipline `test_me_reports_pending_
+    onboarding_states` already exercises for the non-admin path)."""
+    admin_id = await make_user(sf, "gate-admin", org_role=UserOrgRole.ORG_ADMIN)
+    cookie = await session_cookie_headers(sf, admin_id)
+
+    me = await client.get("/v1/auth/me", headers=cookie)
+    assert me.status_code == 200, me.text
+    assert me.json()["onboarding_status"] == "pending_alert_email"
+
+    set_email = await client.post(
+        "/v1/admin/org-settings/alert-email", json={"email": "ai-alerts@example.com"}, headers=cookie
+    )
+    assert set_email.status_code == 200, set_email.text
+    assert set_email.json()["alert_recipient_email"] == "ai-alerts@example.com"
+
+    me_after = await client.get("/v1/auth/me", headers=cookie)
+    assert me_after.json()["onboarding_status"] == "resolved"
+
+
+async def test_auditor_is_never_gated_on_alert_email(client: httpx.AsyncClient, sf) -> None:
+    """Auditor is read-only and doesn't manage alerts - only `org_admin` is
+    gated, per the product owner's explicit "superadmin (org level)"
+    framing."""
+    auditor_id = await make_user(sf, "gate-auditor", org_role=UserOrgRole.AUDITOR)
+    cookie = await session_cookie_headers(sf, auditor_id)
+    me = await client.get("/v1/auth/me", headers=cookie)
+    assert me.json()["onboarding_status"] == "resolved"
+
+
+async def test_alert_email_endpoint_rejects_malformed_address(
+    client: httpx.AsyncClient, sf
+) -> None:
+    admin_id = await make_user(sf, "gate-admin-bad-email", org_role=UserOrgRole.ORG_ADMIN)
+    cookie = await session_cookie_headers(sf, admin_id)
+    response = await client.post(
+        "/v1/admin/org-settings/alert-email", json={"email": "not-an-email"}, headers=cookie
+    )
+    assert response.status_code == 422
 
 
 # --- Audit-write convention (design doc section 7, AC2.4/AC4.x) --------------

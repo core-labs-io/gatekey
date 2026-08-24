@@ -39,6 +39,7 @@ from gatekey.schemas.cli_sync import (
     DeviceApproveResponse,
     DevicePollRequest,
     DevicePollResponse,
+    DeviceStartRequest,
     DeviceStartResponse,
 )
 from gatekey.services.audit import write_audit_entry
@@ -67,10 +68,18 @@ def _device_store(request: Request):
 
 
 @router.post("/start", response_model=DeviceStartResponse)
-async def start_device_auth(request: Request) -> DeviceStartResponse:
-    """No auth (AC8a.2) - the CLI has no identity yet at this point."""
+async def start_device_auth(
+    request: Request, payload: DeviceStartRequest | None = None
+) -> DeviceStartResponse:
+    """No auth (AC8a.2) - the CLI has no identity yet at this point.
+    `payload` (and its `device_label`) is entirely optional (added by
+    `0047`) - an older CLI-sync client sending no body at all still
+    works unchanged."""
     settings = request.app.state.settings
-    record = _device_store(request).start(ttl_seconds=DEFAULT_DEVICE_CODE_TTL_SECONDS)
+    device_label = payload.device_label if payload is not None else None
+    record = _device_store(request).start(
+        ttl_seconds=DEFAULT_DEVICE_CODE_TTL_SECONDS, device_label=device_label
+    )
     verification_uri = f"{settings.GATEKEY_FRONTEND_ORIGIN.rstrip('/')}/device"
     return DeviceStartResponse(
         device_code=record.device_code,
@@ -98,18 +107,24 @@ async def approve_device_auth(
     store = _device_store(request)
     if not store.is_pending(user_code=payload.user_code):
         raise NotFoundError(_UNKNOWN_OR_EXPIRED_CODE)
+    # Added by `0047` - self-reported by the CLI at `start()` time, if at
+    # all; `None` for an older CLI-sync client or one that opted not to
+    # send it.
+    device_label = store.get_device_label(user_code=payload.user_code)
 
+    user_id = ctx.require_user_id()
     team_id = await resolve_team_id_for_device_approval(
-        session, user_id=ctx.user_id, requested_team_id=payload.team_id
+        session, user_id=user_id, requested_team_id=payload.team_id
     )
 
     key_row, _key_secret = await create_personal_key(
         session,
-        owner_user_id=ctx.user_id,
-        created_by_user_id=ctx.user_id,
+        owner_user_id=user_id,
+        created_by_user_id=user_id,
         team_id=team_id,
         name=f"CLI Sync ({payload.user_code})",
         expires_at=None,
+        device_label=device_label,
     )
     await write_audit_entry(
         session,
@@ -123,6 +138,7 @@ async def approve_device_auth(
             "owner_user_id": key_row.owner_user_id,
             "team_id": key_row.team_id,
             "key_prefix": key_row.key_prefix,
+            "device_label": key_row.device_label,
         },
         source_ip=source_ip,
     )
@@ -130,7 +146,7 @@ async def approve_device_auth(
     credential_row, credential_secret = await create_cli_refresh_credential(
         session,
         org_id=DEFAULT_ORG_ID,
-        user_id=ctx.user_id,
+        user_id=user_id,
         bound_personal_key_id=key_row.id,
     )
     await write_audit_entry(

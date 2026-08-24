@@ -23,12 +23,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.models.cache_lookup_event import CacheLookupEvent
 from gatekey.db.models.degradation_event import DegradationEvent
+from gatekey.db.models.personal_api_key import PersonalApiKey
+from gatekey.db.models.team_membership import TeamMembership
 from gatekey.db.models.usage_log import UsageLog
 from gatekey.db.models.user import User
 
@@ -61,6 +63,10 @@ async def record_usage_log(
     degraded_from_model: str | None = None,
     degraded_to_model: str | None = None,
     self_hosted_provider_id: uuid.UUID | None = None,
+    source_ip: str | None = None,
+    client_user_agent: str | None = None,
+    model_fallback_attempt: int = 0,
+    model_fallback_from_model: str | None = None,
 ) -> uuid.UUID | None:
     """Best-effort insert of one `UsageLog` row. Never raises - see module
     docstring. Uses its own commit so a failure here can never roll back
@@ -97,6 +103,29 @@ async def record_usage_log(
     contract - a caller that needs the id, e.g. `api.v1.gateway.common.
     log_degradation_event()`, treats `None` as "could not link, log the
     degradation event without a usage_log reference").
+
+    `source_ip`/`client_user_agent` (migration `0047`) - request provenance
+    for off-network-usage/leaked-key monitoring. Both default to `None`
+    (byte-for-byte pre-`0047` behavior) so any call site that hasn't been
+    updated to pass them yet still works; every real gateway route handler
+    captures and passes them - see `api/v1/gateway/{chat,completions,
+    embeddings}.py`.
+
+    Model Catalog + Cross-Provider Fallback Chains (Part B, migration
+    `0050`): `model_fallback_attempt`/`model_fallback_from_model` - both
+    defaulted (`0`/`None`, byte-for-byte pre-Part-B behavior for every
+    existing call site) - mirror `failover_attempt`/`failover_key_id`'s
+    identical shape/naming convention, scoped to MODELS instead of KEYS.
+    `model_fallback_attempt=0` means the originally-dispatched model itself
+    served the request (the overwhelming majority); `model_fallback_attempt
+    =N>0` means the Nth (1-indexed) entry of that model's own `fallback_
+    model_names` served it instead - see `api.v1.gateway.common.
+    ModelFallbackResult`'s docstring. `model` (the existing column) always
+    keeps its existing meaning: the model that ULTIMATELY served/was
+    charged - i.e. `effective_model` after `dispatch_with_model_fallback()`'s
+    reassignment in `chat.py`/`embeddings.py`, exactly the same
+    "always the winner" convention `degraded_to_model` already established
+    relative to `model`.
     """
     try:
         row = UsageLog(
@@ -125,6 +154,10 @@ async def record_usage_log(
             degraded_from_model=degraded_from_model,
             degraded_to_model=degraded_to_model,
             self_hosted_provider_id=self_hosted_provider_id,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
+            model_fallback_attempt=model_fallback_attempt,
+            model_fallback_from_model=model_fallback_from_model,
         )
         session.add(row)
         await session.flush()
@@ -138,6 +171,117 @@ async def record_usage_log(
         except Exception:
             pass
         return None
+
+
+@dataclass(frozen=True)
+class UsageLogRow:
+    """One request-provenance row (added by `0047`) - `api/v1/admin/
+    usage.py`'s `GET /requests` endpoint, the row-level counterpart to
+    `get_usage_summary()`'s aggregates. `device_label` is joined in from
+    `personal_api_keys` (NOT denormalized onto `usage_logs` itself - see
+    that column's own docstring) - `None` for every service-account-key
+    row and every personal key not minted through CLI-sync device pairing.
+    """
+
+    id: uuid.UUID
+    request_id: str
+    created_at: datetime
+    user_id: uuid.UUID | None
+    user_name: str | None
+    team_id: uuid.UUID | None
+    endpoint: str
+    provider: str | None
+    model: str | None
+    status: str
+    success: bool
+    cost_usd: Decimal | None
+    source_ip: str | None
+    client_user_agent: str | None
+    device_label: str | None
+
+
+async def list_usage_logs(
+    session: AsyncSession,
+    *,
+    since: datetime,
+    until: datetime,
+    user_id: uuid.UUID | None = None,
+    team_id: uuid.UUID | None = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[list[UsageLogRow], int]:
+    """Paginated, newest-first request-provenance listing (added by
+    `0047`) - "which system did each user use" (source IP / best-effort
+    User-Agent / CLI-sync device label), for off-network-usage/leaked-key
+    monitoring. Returns `(rows, total_matching_count)` - same page-based
+    shape `api/v1/admin/audit_entries.py`'s listing endpoint already uses.
+
+    A LEFT JOIN, not denormalization, is how `device_label` gets here -
+    see `UsageLogRow`'s docstring.
+    """
+    filters = [
+        UsageLog.org_id == DEFAULT_ORG_ID,
+        UsageLog.created_at >= since,
+        UsageLog.created_at < until,
+    ]
+    if user_id is not None:
+        filters.append(UsageLog.user_id == user_id)
+    if team_id is not None:
+        filters.append(UsageLog.team_id == team_id)
+
+    total = (
+        await session.execute(select(func.count(UsageLog.id)).where(*filters))
+    ).scalar_one()
+
+    stmt = (
+        select(
+            UsageLog.id,
+            UsageLog.request_id,
+            UsageLog.created_at,
+            UsageLog.user_id,
+            User.name,
+            UsageLog.team_id,
+            UsageLog.endpoint,
+            UsageLog.provider,
+            UsageLog.model,
+            UsageLog.status,
+            UsageLog.success,
+            UsageLog.cost_usd,
+            UsageLog.source_ip,
+            UsageLog.client_user_agent,
+            PersonalApiKey.device_label,
+        )
+        .outerjoin(User, User.id == UsageLog.user_id)
+        .outerjoin(PersonalApiKey, PersonalApiKey.id == UsageLog.personal_api_key_id)
+        .where(*filters)
+        .order_by(UsageLog.created_at.desc(), UsageLog.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    rows = (await session.execute(stmt)).all()
+    return (
+        [
+            UsageLogRow(
+                id=row.id,
+                request_id=row.request_id,
+                created_at=row.created_at,
+                user_id=row.user_id,
+                user_name=row.name,
+                team_id=row.team_id,
+                endpoint=row.endpoint,
+                provider=row.provider,
+                model=row.model,
+                status=row.status,
+                success=row.success,
+                cost_usd=row.cost_usd,
+                source_ip=row.source_ip,
+                client_user_agent=row.client_user_agent,
+                device_label=row.device_label,
+            )
+            for row in rows
+        ],
+        total,
+    )
 
 
 @dataclass(frozen=True)
@@ -245,6 +389,19 @@ async def get_usage_summary(
         for row in (await session.execute(by_model_stmt)).all()
     ]
 
+    # `budget_usd` here must reflect whatever is *actually enforced* for each
+    # row's requests, which - per `check_budget_available()` - is the
+    # `TeamMembership` counter for `(UsageLog.team_id, user_id)` whenever a
+    # request was team-scoped, and the legacy flat `User.budget_usd` only for
+    # requests that weren't (never both, never guessed). A prior version of
+    # this query pulled `User.budget_usd` unconditionally, which is a dead
+    # field for any team-scoped user (see `TeamMembership`'s docstring) -
+    # the dashboard was showing a real column value with zero relationship
+    # to what actually gates that user's requests. Grouping is still
+    # per-user (matches the existing dashboard shape), so a user whose
+    # matched rows span more than one distinct team within the requested
+    # range has no single meaningful budget number - `budget_usd=None`
+    # ("Unmetered") is the honest answer there, not a guess.
     by_user_stmt = (
         select(
             User.id,
@@ -252,6 +409,9 @@ async def get_usage_summary(
             User.budget_usd,
             func.count(UsageLog.id),
             func.coalesce(func.sum(UsageLog.cost_usd), 0),
+            # `array_agg(DISTINCT ...)`, not `max()`/`min()` - Postgres has no
+            # `max(uuid)` aggregate (no default ordering operator class).
+            func.array_agg(func.distinct(UsageLog.team_id)).filter(UsageLog.team_id.is_not(None)),
         )
         .select_from(User)
         .join(UsageLog, UsageLog.user_id == User.id)
@@ -259,15 +419,39 @@ async def get_usage_summary(
         .group_by(User.id, User.name, User.budget_usd)
         .order_by(func.coalesce(func.sum(UsageLog.cost_usd), 0).desc())
     )
-    spend_by_user = [
-        SpendByUser(
-            user=row[1],
-            requests=int(row[3] or 0),
-            spend_usd=Decimal(row[4] or 0),
-            budget_usd=row[2],
-        )
-        for row in (await session.execute(by_user_stmt)).all()
+    by_user_rows = (await session.execute(by_user_stmt)).all()
+
+    single_team_pairs = [
+        (row[0], row[5][0]) for row in by_user_rows if row[5] and len(row[5]) == 1
     ]
+    membership_budget: dict[tuple[uuid.UUID, uuid.UUID], Decimal | None] = {}
+    if single_team_pairs:
+        membership_stmt = select(
+            TeamMembership.user_id, TeamMembership.team_id, TeamMembership.budget_usd
+        ).where(
+            TeamMembership.removed_at.is_(None),
+            tuple_(TeamMembership.user_id, TeamMembership.team_id).in_(single_team_pairs),
+        )
+        for m_row in (await session.execute(membership_stmt)).all():
+            membership_budget[(m_row[0], m_row[1])] = m_row[2]
+
+    spend_by_user = []
+    for row in by_user_rows:
+        distinct_team_ids = row[5] or []
+        if len(distinct_team_ids) == 1:
+            budget_usd = membership_budget.get((row[0], distinct_team_ids[0]))
+        elif not distinct_team_ids:
+            budget_usd = row[2]
+        else:
+            budget_usd = None
+        spend_by_user.append(
+            SpendByUser(
+                user=row[1],
+                requests=int(row[3] or 0),
+                spend_usd=Decimal(row[4] or 0),
+                budget_usd=budget_usd,
+            )
+        )
 
     return UsageSummary(
         total_spend_usd=total_spend_usd,
@@ -305,10 +489,26 @@ async def get_phase4_dashboard_metrics(
     until: datetime,
     team_id: uuid.UUID | None = None,
     provider: str | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> Phase4DashboardMetrics:
     """AC4.5.1/AC4.5.5: the three new dashboard metric cards, computed over
     `[since, until)`, filterable identically to `get_usage_summary` (team/
-    provider).
+    provider), plus `user_id` (post-ship addition for `GET /v1/me/usage` -
+    see `api/v1/me.py` - the self-service "my usage" view needs the
+    caller's own Phase 4 numbers, not org/team-wide ones).
+
+    `user_id` filtering is only as accurate as the underlying tables allow:
+    `usage_logs` and `degradation_events` both have a `user_id` column, so
+    failover count, degraded-request count, and cost-saved-via-degradation
+    are genuinely scoped to the caller when `user_id` is passed. `cache_
+    lookup_events` has NO `user_id` column (team_id/provider only, by
+    design - see that model's docstring) - `cache_hit_rate`/`cache_hits`/
+    `cache_misses`/`cost_saved_caching_usd` therefore stay team/org-scoped
+    even when `user_id` is passed, not silently narrowed to look personal
+    when they aren't. A true per-user cache metric would need a schema
+    migration (a new `cache_lookup_events.user_id` column) - not done here;
+    this is an honest, flagged limitation of `GET /v1/me/usage`'s cache
+    figures, not a bug to paper over.
 
     - **Cache hit rate**: from `cache_lookup_events` (Postgres audit log of
       every cache lookup, hit or miss - see that model's docstring), NOT
@@ -343,6 +543,8 @@ async def get_phase4_dashboard_metrics(
         CacheLookupEvent.occurred_at >= since,
         CacheLookupEvent.occurred_at < until,
     ]
+    # `user_id` deliberately NOT applied here - see the docstring's
+    # `user_id` paragraph: cache_lookup_events has no user_id column.
     if team_id is not None:
         cache_filter.append(CacheLookupEvent.team_id == team_id)
     if provider is not None:
@@ -366,6 +568,8 @@ async def get_phase4_dashboard_metrics(
         usage_filter.append(UsageLog.team_id == team_id)
     if provider is not None:
         usage_filter.append(UsageLog.provider == provider)
+    if user_id is not None:
+        usage_filter.append(UsageLog.user_id == user_id)
 
     failover_stmt = select(func.count(UsageLog.id)).where(
         *usage_filter, UsageLog.failover_attempt > 0
@@ -391,6 +595,8 @@ async def get_phase4_dashboard_metrics(
     ]
     if team_id is not None:
         degradation_filter.append(DegradationEvent.team_id == team_id)
+    if user_id is not None:
+        degradation_filter.append(DegradationEvent.user_id == user_id)
     degradation_stmt = select(
         func.coalesce(func.sum(DegradationEvent.original_cost - DegradationEvent.degraded_cost), 0)
     ).where(*degradation_filter)

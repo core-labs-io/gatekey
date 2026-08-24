@@ -4,7 +4,7 @@
 
 import { useEffect, useState } from "react";
 import { ConsoleShell } from "@/components/ConsoleShell";
-import { Modal, ConfirmDialog, DataTable, Badge, BudgetBar, FieldError, useToast } from "@/components/ui";
+import { Modal, ConfirmDialog, DataTable, Badge, FieldError, useToast } from "@/components/ui";
 import {
   ApiError,
   createUser,
@@ -97,6 +97,16 @@ function OrgRoleModal({
   );
 }
 
+/** No budget field here, deliberately (see `docs/design/` note on the
+ * legacy `User.budget_usd` field): a user cannot hold a working key of any
+ * kind without first being added to a team, and every key created since
+ * Phase 2 must carry a `team_id` - so a per-user budget set here could never
+ * actually gate a real request. Real budgets are set per (team, member) on
+ * that team's Members page (`/teams/[teamId]` or, for a Team Lead,
+ * `/team/members`). The backend/schema still carry the field unchanged, for
+ * a pre-Phase-2 org's existing non-team-scoped keys - this console just no
+ * longer offers a way to edit it, to avoid presenting a control that looks
+ * live but (for any current or future user) never is. */
 function UserFormModal({
   initial,
   onClose,
@@ -108,8 +118,6 @@ function UserFormModal({
 }) {
   const toast = useToast();
   const [name, setName] = useState(initial?.name ?? "");
-  const [unmetered, setUnmetered] = useState(initial ? initial.budget_usd === null : true);
-  const [budget, setBudget] = useState(initial?.budget_usd ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -117,11 +125,10 @@ function UserFormModal({
     setBusy(true);
     setError(null);
     try {
-      const budget_usd = unmetered ? null : budget || "0";
       if (initial) {
-        await updateUser(initial.id, { name, budget_usd });
+        await updateUser(initial.id, { name });
       } else {
-        await createUser({ name, budget_usd });
+        await createUser({ name, budget_usd: null });
       }
       toast.push("success", initial ? "User updated." : "User created.");
       onSaved();
@@ -138,28 +145,15 @@ function UserFormModal({
         <label>Name</label>
         <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. ana@acme.co" />
       </div>
-      <div className="field">
-        <label>Budget (USD)</label>
-        <input
-          type="text"
-          value={unmetered ? "" : budget}
-          onChange={(e) => setBudget(e.target.value)}
-          disabled={unmetered}
-          placeholder="100.00"
-        />
-      </div>
-      <div className="field" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <input
-          type="checkbox"
-          id="unmetered"
-          checked={unmetered}
-          onChange={(e) => setUnmetered(e.target.checked)}
-          style={{ width: "auto" }}
-        />
-        <label htmlFor="unmetered" style={{ margin: 0 }}>
-          Unmetered (no spend cutoff)
-        </label>
-      </div>
+      {initial ? (
+        <div className="field-hint">
+          Budget is set per team, on that team&apos;s Members page - see the Budget column below.
+        </div>
+      ) : (
+        <div className="field-hint">
+          Add {name.trim() || "them"} to a team next to give them a working key and a budget.
+        </div>
+      )}
       <FieldError message={error} />
       <div className="modal-actions">
         <button className="btn btn-secondary" onClick={onClose} disabled={busy}>
@@ -233,7 +227,7 @@ export default function UsersPage() {
           loading={loading}
           rows={rows}
           rowKey={(r) => r.id}
-          emptyState="No users yet. Add one to start tracking budget/spend."
+          emptyState="No users yet. Add one, then add them to a team to give them a key and a budget."
           searchText={(r) => `${r.name} ${r.org_role ?? ""}`}
           searchPlaceholder="Filter users..."
           initialSort={{ key: "name", dir: "asc" }}
@@ -256,24 +250,54 @@ export default function UsersPage() {
               key: "budget",
               header: "Budget",
               align: "right",
-              sortValue: (r) => (r.budget_usd === null ? null : Number(r.budget_usd)),
-              render: (r) => (r.budget_usd === null ? "Unmetered" : `$${Number(r.budget_usd).toFixed(2)}`),
+              // Real, per-team numbers only - see `UserFormModal`'s
+              // docstring for why there is no user-level number to fall
+              // back to. A single membership has one real figure to show;
+              // more than one has no single number that's honest, so a
+              // team-scoped label (with a hover title) takes its place; zero
+              // memberships means no key of theirs could ever be charged.
+              sortValue: (r) =>
+                r.team_memberships.length === 1
+                  ? r.team_memberships[0].budget_usd === null
+                    ? null
+                    : Number(r.team_memberships[0].budget_usd)
+                  : null,
+              render: (r) => {
+                if (r.team_memberships.length === 1) {
+                  const m = r.team_memberships[0];
+                  return m.budget_usd === null ? "Unmetered" : `$${Number(m.budget_usd).toFixed(2)}`;
+                }
+                if (r.team_memberships.length > 1) {
+                  const title = r.team_memberships
+                    .map((m) => `${m.team_name}: ${m.budget_usd === null ? "Unmetered" : `$${Number(m.budget_usd).toFixed(2)}`}`)
+                    .join(", ");
+                  return <span title={title}>{r.team_memberships.length} teams</span>;
+                }
+                return <span className="text-muted">&mdash;</span>;
+              },
             },
             {
               key: "spent",
               header: "Spent",
               align: "right",
-              sortValue: (r) => Number(r.current_spend_usd),
-              render: (r) => `$${Number(r.current_spend_usd).toFixed(2)}`,
+              sortValue: (r) =>
+                r.team_memberships.length === 1 ? Number(r.team_memberships[0].current_spend_usd) : null,
+              render: (r) => {
+                if (r.team_memberships.length === 1) return `$${Number(r.team_memberships[0].current_spend_usd).toFixed(2)}`;
+                return <span className="text-muted">&mdash;</span>;
+              },
             },
             {
               key: "status",
               header: "Status",
               align: "right",
               render: (r) => {
-                if (r.budget_usd === null) return <Badge tone="green">Active</Badge>;
-                const spend = Number(r.current_spend_usd);
-                const budget = Number(r.budget_usd);
+                if (r.team_memberships.length === 0) return <Badge tone="gray">No team</Badge>;
+                if (r.team_memberships.length > 1) return <Badge tone="gray">Team-scoped</Badge>;
+                const { budget_usd, current_spend_usd } = r.team_memberships[0];
+                if (budget_usd === null) return <Badge tone="green">Active</Badge>;
+                const spend = Number(current_spend_usd);
+                const budget = Number(budget_usd);
                 if (spend >= budget) return <Badge tone="red">Budget exhausted</Badge>;
                 if (budget > 0 && spend / budget >= 0.9) return <Badge tone="amber">Near limit</Badge>;
                 return <Badge tone="green">Active</Badge>;

@@ -16,7 +16,6 @@ policy configured+triggered and asserted the substitution never happens -
 
 from __future__ import annotations
 
-import uuid
 from decimal import Decimal
 
 import pytest

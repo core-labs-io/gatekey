@@ -54,11 +54,27 @@ fully capture what happened for a custom-model request. See design doc
 section 2.6 for the full rationale and its one known, low-severity
 limitation.
 
+`fallback_model_names` (Model Catalog + Cross-Provider Fallback Chains)
+-------------------------------------------------------------------------
+Added by migration `0050`. See `gatekey/model-catalog-fallback-chains-
+technical-design.md` section 2.1 for the full design rationale. `JSONB`
+list-of-strings, not a normalized child table - identical convention to
+`SelfHostedProvider.models` (the direct structural precedent for "a small,
+admin-authored, ordered list of model-id strings that belongs to one parent
+row"). An empty list (the default) means "no fallback chain configured" -
+byte-for-byte pre-this-feature behavior for every existing custom model.
+Write-time validation (chain length, self-reference, duplicates,
+resolvability) is app-layer-only (`services/custom_models.py`) - none of it
+is expressible as a static SQL CHECK, matching `SelfHostedProvider.models`'
+own collision guards.
+
 Migration ownership
 --------------------
 Names/definitions here must stay in lockstep with the explicit DDL in
-`alembic/versions/0044_create_custom_models.py` - that migration, not
-`Base.metadata.create_all()`, is the source of truth for actual DDL.
+`alembic/versions/0044_create_custom_models.py` (table creation) and
+`alembic/versions/0050_add_fallback_model_names_to_custom_models.py`
+(`fallback_model_names`) - those migrations, not `Base.metadata.
+create_all()`, are the source of truth for actual DDL.
 """
 
 from __future__ import annotations
@@ -80,7 +96,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import Enum as SAEnum
 
@@ -162,6 +178,14 @@ class CustomModel(Base):
     pricing_as_of: Mapped[date] = mapped_column(Date, nullable=False)
 
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+
+    # Model Catalog + Cross-Provider Fallback Chains (migration `0050`) - see
+    # module docstring "fallback_model_names". JSONB list-of-strings,
+    # mirroring `SelfHostedProvider.models`'s exact shape. `[]` (the
+    # default) means "no fallback chain configured".
+    fallback_model_names: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

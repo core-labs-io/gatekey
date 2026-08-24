@@ -94,6 +94,54 @@ def test_openrouter_request_forbids_extra_fields():
         OpenRouterKeyRequest(api_key="sk-valid", unexpected_field="nope")
 
 
+def test_openrouter_request_defaults_to_no_trust_restriction():
+    model = OpenRouterKeyRequest(api_key="sk-valid")
+    assert model.trusted_provider_slugs == []
+    assert model.trusted_provider_region is None
+
+
+def test_openrouter_request_accepts_slugs_and_region_together():
+    model = OpenRouterKeyRequest(
+        api_key="sk-valid", trusted_provider_slugs=["openai", "anthropic"], trusted_provider_region="us"
+    )
+    assert model.trusted_provider_slugs == ["openai", "anthropic"]
+    assert model.trusted_provider_region == "us"
+
+
+def test_openrouter_request_rejects_slugs_without_region():
+    with pytest.raises(ValidationError):
+        OpenRouterKeyRequest(api_key="sk-valid", trusted_provider_slugs=["openai"])
+
+
+def test_openrouter_request_rejects_region_without_slugs():
+    with pytest.raises(ValidationError):
+        OpenRouterKeyRequest(api_key="sk-valid", trusted_provider_region="us")
+
+
+def test_openrouter_request_rejects_region_outside_supported_set():
+    with pytest.raises(ValidationError):
+        OpenRouterKeyRequest(api_key="sk-valid", trusted_provider_slugs=["openai"], trusted_provider_region="mars")
+
+
+def test_openrouter_request_rejects_blank_slug():
+    with pytest.raises(ValidationError):
+        OpenRouterKeyRequest(api_key="sk-valid", trusted_provider_slugs=["openai", "  "], trusted_provider_region="us")
+
+
+def test_openrouter_request_rejects_duplicate_slugs():
+    with pytest.raises(ValidationError):
+        OpenRouterKeyRequest(
+            api_key="sk-valid", trusted_provider_slugs=["openai", "openai"], trusted_provider_region="us"
+        )
+
+
+def test_openrouter_request_strips_whitespace_from_slugs():
+    model = OpenRouterKeyRequest(
+        api_key="sk-valid", trusted_provider_slugs=["  openai  "], trusted_provider_region="us"
+    )
+    assert model.trusted_provider_slugs == ["openai"]
+
+
 def test_ollama_request_accepts_base_url_and_bearer_token():
     model = OllamaKeyRequest(base_url="http://localhost:11434", bearer_token="secret")
     assert model.base_url == "http://localhost:11434"

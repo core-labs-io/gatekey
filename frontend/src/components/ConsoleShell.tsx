@@ -43,6 +43,7 @@ const ORG_ADMIN_NAV: NavGroup[] = [
     items: [
       { href: "/dashboard", label: "Dashboard" },
       { href: "/providers", label: "Providers" },
+      { href: "/model-catalog", label: "Model Catalog" },
       { href: "/users", label: "Users" },
       { href: "/service-accounts", label: "Service Accounts" },
       { href: "/model-policy", label: "Model Policy" },
@@ -92,6 +93,7 @@ const AUDITOR_NAV: NavGroup[] = [
       { href: "/org-usage", label: "Org Usage" },
       { href: "/org-logs", label: "Org Logs" },
       { href: "/policy-viewer", label: "Policy Viewer" },
+      { href: "/model-catalog", label: "Model Catalog" },
     ],
   },
   // AI oversight - Auditor gets the identical read-only view

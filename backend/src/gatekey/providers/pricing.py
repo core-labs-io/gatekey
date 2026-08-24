@@ -217,6 +217,12 @@ PRICING_TABLE: dict[str, PricingEntry] = {
         as_of="2026-07-28",
         source="https://openrouter.ai/openai/gpt-4o-mini",
     ),
+    "openrouter/meta/muse-spark-1.2": PricingEntry(
+        input_price_per_million_usd=Decimal("1.25"),
+        output_price_per_million_usd=Decimal("4.25"),
+        as_of="2026-08-22",
+        source="https://openrouter.ai/meta/muse-spark-1.2",
+    ),
 }
 
 

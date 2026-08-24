@@ -23,7 +23,12 @@ from gatekey.providers.base import ProviderValidator
 from gatekey.providers.registry import build_validator_registry
 from gatekey.providers.vertex_ai import VertexAITokenCache
 from gatekey.services.encryption import EnvKeyProvider, KeyProvider
-from gatekey.services.model_policy import ContentAwareRuleCache, ModelPolicyCache, TeamModelPolicyCache
+from gatekey.services.model_policy import (
+    ContentAwareRuleCache,
+    MemberModelPolicyCache,
+    ModelPolicyCache,
+    TeamModelPolicyCache,
+)
 from gatekey.services.cli_refresh_credentials import (
     REFRESH_CREDENTIAL_PREFIX,
     get_active_cli_refresh_credential_by_hash,
@@ -133,6 +138,15 @@ def get_team_model_policy_cache(request: Request) -> TeamModelPolicyCache:
     `main.create_app`'s lifespan, same single-instance contract as
     `get_model_policy_cache` above."""
     return request.app.state.team_model_policy_cache
+
+
+def get_member_model_policy_cache(request: Request) -> MemberModelPolicyCache:
+    """Fetch the shared, in-process `MemberModelPolicyCache` stashed on
+    `app.state` (per-team-member model narrowing, one layer below
+    `TeamModelPolicyCache`) - built once per process in `main.create_app`'s
+    lifespan, same single-instance contract as `get_team_model_policy_cache`
+    above."""
+    return request.app.state.member_model_policy_cache
 
 
 def get_content_aware_rule_cache(request: Request) -> ContentAwareRuleCache:
@@ -438,8 +452,13 @@ async def _get_team_membership(
     session: AsyncSession, *, team_id: uuid.UUID, user_id: uuid.UUID | None
 ) -> TeamMembership | None:
     # Lives here (private) until BD-14's `services/teams.py` exists to own it.
+    # `removed_at IS NULL` (added by `0049`) - a removed member must lose
+    # every team-scoped RBAC grant immediately, the same request this
+    # filter first takes effect on.
     stmt = select(TeamMembership).where(
-        TeamMembership.team_id == team_id, TeamMembership.user_id == user_id
+        TeamMembership.team_id == team_id,
+        TeamMembership.user_id == user_id,
+        TeamMembership.removed_at.is_(None),
     )
     return (await session.execute(stmt)).scalar_one_or_none()
 

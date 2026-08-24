@@ -333,6 +333,93 @@ async def test_ollama_row_decrypts_successfully_with_bearer_token(
 
 
 @pytest.mark.asyncio
+async def test_openrouter_row_with_trusted_providers_populates_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The residency-enforcement fields (`services.residency.
+    resolve_model_region`'s openrouter branch; `providers.openrouter.py`'s
+    `provider.only` injection) both trust this credential field - prove
+    `get_decrypted_provider_credential` actually populates it from the
+    row's non-secret `key_metadata`, not just the schema/service-layer
+    write path."""
+    key_provider = _key_provider()
+    aad = build_aad(str(DEFAULT_ORG_ID), "openrouter")
+    encrypted = encrypt_secret(
+        json.dumps("sk-or-secret").encode("utf-8"), aad=aad, key_provider=key_provider
+    )
+    row = _make_row(
+        provider="openrouter",
+        ciphertext=encrypted.ciphertext,
+        nonce=encrypted.nonce,
+        auth_tag=encrypted.auth_tag,
+        key_metadata={"trusted_provider_slugs": ["openai", "anthropic"], "trusted_provider_region": "us"},
+    )
+    _patch_get_key(monkeypatch, row)
+
+    credential = await get_decrypted_provider_credential(
+        _UnusedSessionSentinel(), "openrouter", key_provider=key_provider
+    )
+
+    assert isinstance(credential, ApiKeyCredential)
+    assert credential.api_key == "sk-or-secret"
+    assert credential.trusted_provider_slugs == ("openai", "anthropic")
+
+
+@pytest.mark.asyncio
+async def test_openrouter_row_without_trusted_providers_leaves_credential_unrestricted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_provider = _key_provider()
+    aad = build_aad(str(DEFAULT_ORG_ID), "openrouter")
+    encrypted = encrypt_secret(
+        json.dumps("sk-or-secret").encode("utf-8"), aad=aad, key_provider=key_provider
+    )
+    row = _make_row(
+        provider="openrouter",
+        ciphertext=encrypted.ciphertext,
+        nonce=encrypted.nonce,
+        auth_tag=encrypted.auth_tag,
+        key_metadata={},
+    )
+    _patch_get_key(monkeypatch, row)
+
+    credential = await get_decrypted_provider_credential(
+        _UnusedSessionSentinel(), "openrouter", key_provider=key_provider
+    )
+
+    assert isinstance(credential, ApiKeyCredential)
+    assert credential.trusted_provider_slugs == ()
+
+
+@pytest.mark.asyncio
+async def test_openai_row_never_populates_trusted_provider_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`trusted_provider_slugs` is openrouter-only - openai/anthropic must
+    always get `()`, even if a row somehow carried unrelated metadata."""
+    key_provider = _key_provider()
+    aad = build_aad(str(DEFAULT_ORG_ID), "openai")
+    encrypted = encrypt_secret(
+        json.dumps("sk-openai-secret").encode("utf-8"), aad=aad, key_provider=key_provider
+    )
+    row = _make_row(
+        provider="openai",
+        ciphertext=encrypted.ciphertext,
+        nonce=encrypted.nonce,
+        auth_tag=encrypted.auth_tag,
+        key_metadata={"trusted_provider_slugs": ["should-be-ignored"], "trusted_provider_region": "us"},
+    )
+    _patch_get_key(monkeypatch, row)
+
+    credential = await get_decrypted_provider_credential(
+        _UnusedSessionSentinel(), "openai", key_provider=key_provider
+    )
+
+    assert isinstance(credential, ApiKeyCredential)
+    assert credential.trusted_provider_slugs == ()
+
+
+@pytest.mark.asyncio
 async def test_ollama_row_decrypts_successfully_with_blank_bearer_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -29,8 +29,7 @@ import pytest
 from sqlalchemy import select
 
 from gatekey.api.v1.gateway.common import check_budget_available
-from gatekey.db.models.team import Team, TeamPeriodEnd, TeamPeriodType
-from gatekey.db.models.team_membership import TeamMembership
+from gatekey.db.models.team import Team, TeamPeriodEnd
 from gatekey.errors import BudgetCeilingExceededError, BudgetExhaustedError
 from gatekey.services import budget as budget_service
 from gatekey.services.join_requests import submit_join_request

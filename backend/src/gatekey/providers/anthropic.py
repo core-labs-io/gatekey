@@ -43,6 +43,16 @@ finish_reason-only chunk on `message_delta` (once its `stop_reason` is
 present). The generator returns (stops cleanly, yielding nothing further)
 on `message_stop` - it never yields a `[DONE]` sentinel; that's the
 route-handler layer's job, same as `providers/openai.py`.
+
+Model Catalog (Part A, `services/model_catalog.py`) - `list_models()`
+-----------------------------------------------------------------------
+`GET /v1/models?limit=1000` (the documented max, single call, no
+`after_id`/`before_id` cursor-following - see the Model Catalog technical
+design doc section 1.5 for the deliberate, justified bound; Anthropic's
+real model count is nowhere near 1000). Maps `{data: [{id, display_name,
+...}]}` with no pricing filled in - `services/model_catalog.py` fills that
+in afterward via its `MODEL_REGISTRY`/`PRICING_TABLE` reverse index, not
+this module.
 """
 
 from __future__ import annotations
@@ -72,9 +82,10 @@ from gatekey.schemas.chat import (
     ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionResponseMessage,
     ChatCompletionUsage,
-    ChatMessage,
 )
+from gatekey.schemas.custom_model import AvailableModelEntry
 
 if TYPE_CHECKING:
     # See providers/openai.py's identical block for why this is
@@ -107,6 +118,12 @@ _STOP_REASON_MAP: dict[str, str] = {
 # https://docs.anthropic.com/en/api/versioning before shipping, in case a
 # newer version has since become the recommended default.
 ANTHROPIC_API_VERSION = "2023-06-01"
+
+# `list_models()`'s single-call page size - the documented max, deliberately
+# not followed by cursor-pagination (`after_id`/`before_id`) - see this
+# module's docstring "Model Catalog" section / Model Catalog technical
+# design doc section 1.5.
+_ANTHROPIC_MODELS_LIST_LIMIT = 1000
 
 
 class AnthropicValidator(ProviderValidator):
@@ -201,7 +218,7 @@ def _translate_chat_response(native_model_id: str, data: dict[str, Any]) -> Chat
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(role="assistant", content=text),
+                message=ChatCompletionResponseMessage(role="assistant", content=text),
                 finish_reason=_map_stop_reason(data.get("stop_reason")),
             )
         ],
@@ -368,3 +385,41 @@ async def stream_chat_completion(
                     return
     except httpx.HTTPError as exc:
         raise provider_call_error_from_exception(exc, _PROVIDER_NAME) from None
+
+
+async def list_models(
+    client: httpx.AsyncClient,
+    credential: ApiKeyCredential,
+    *,
+    timeout_seconds: float = _DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+) -> list[AvailableModelEntry]:
+    """`GET /v1/models?limit=1000` - see module docstring "Model Catalog"
+    section for why this is a single call, not cursor-following.
+
+    Raises `providers.base.ProviderCallError` on a network failure or a
+    non-2xx response. No pricing is filled in here (both price fields
+    always `None`) - `services.model_catalog.list_available_models()` fills
+    them in afterward via its own `MODEL_REGISTRY`/`PRICING_TABLE` reverse
+    index.
+    """
+    try:
+        response = await client.get(
+            ANTHROPIC_MODELS_URL,
+            params={"limit": _ANTHROPIC_MODELS_LIST_LIMIT},
+            headers=_auth_headers(credential),
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        raise provider_call_error_from_exception(exc, _PROVIDER_NAME) from None
+    if response.status_code >= 400:
+        raise provider_call_error_from_response(response, _PROVIDER_NAME)
+    data = response.json()
+    return [
+        AvailableModelEntry(
+            native_model_id=entry["id"],
+            display_name=entry.get("display_name") or entry["id"],
+            input_price_per_million_usd=None,
+            output_price_per_million_usd=None,
+        )
+        for entry in data.get("data", [])
+    ]

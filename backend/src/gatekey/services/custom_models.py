@@ -146,6 +146,22 @@ No FK from `usage_logs`
 --------------------------
 See `db.models.custom_model.CustomModel`'s module docstring - deliberate,
 not implemented here or anywhere else.
+
+`fallback_model_names` write-time validation (Model Catalog + Cross-Provider
+Fallback Chains, Part B)
+-------------------------------------------------------------------------------
+See `gatekey/model-catalog-fallback-chains-technical-design.md` section 2.3
+for the full rationale. `_validate_fallback_model_names()` is a SEPARATE
+helper from `_validate_custom_model_write()`'s other guards (called from it,
+not merged into it) because it validates a fundamentally different kind of
+thing - not this row's own field values, but whether each entry in a list
+resolves to some OTHER routable model right now. Deliberately short-circuits
+to a zero-I/O no-op when `fallback_model_names` is empty (the overwhelming
+majority of every create/edit, including every pre-this-feature row) rather
+than unconditionally issuing the two lookup queries below - matching this
+codebase's established "zero I/O for the common, feature-not-configured
+case" discipline (e.g. `check_and_apply_degradation()`'s identical early
+return in `api/v1/gateway/common.py`).
 """
 
 from __future__ import annotations
@@ -205,6 +221,21 @@ _EMBEDDINGS_CAPABLE_PROVIDERS: frozenset[str] = frozenset({"openai", "vertex_ai"
 # codebase (e.g. `PROVIDER_KEY_HEALTH_CHECK_INTERVAL_SECONDS`) - technical
 # design doc section 6.2.
 _CUSTOM_MODEL_VERIFY_COOLDOWN_SECONDS = 30
+
+# Model Catalog + Cross-Provider Fallback Chains (technical design doc
+# section 2.3): each configured entry, on total exhaustion, costs one full
+# extra pipeline pass plus one real outbound provider round trip (section
+# 2.5) - worst-case added request latency scales linearly with chain length,
+# and unlike the existing same-provider key failover (which is capped at
+# exactly one retry by construction, since a `ProviderKey` has exactly one
+# `failover_target_id`), a cross-provider chain needs more than one
+# candidate to be useful at all (the whole point is surviving more than one
+# provider having a bad moment simultaneously). Five is small enough to
+# bound worst-case latency to roughly the cost of five ordinary requests'
+# worth of timeout budget, while still comfortably exceeding "more than one
+# backup" for any realistic set of interchangeable models an admin would
+# configure.
+_MODEL_FALLBACK_MAX_CHAIN_LENGTH = 5
 
 # Fixed, minimal verification payloads (technical design doc section 2.3
 # step 4) - synthetic, non-user content, never logged/charged.
@@ -377,6 +408,69 @@ class CustomModelVerifyCooldownError(GatekeyError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class CustomModelFallbackChainTooLongError(GatekeyError):
+    """`len(fallback_model_names) > 5` (`_MODEL_FALLBACK_MAX_CHAIN_LENGTH`)
+    - see the Model Catalog technical design doc section 2.3 for the
+    latency-bound rationale. 422, no DB write."""
+
+    status_code = 422
+    code = "custom_model_fallback_chain_too_long"
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"fallback_model_names may contain at most "
+            f"{_MODEL_FALLBACK_MAX_CHAIN_LENGTH} entries."
+        )
+
+
+class CustomModelFallbackSelfReferenceError(GatekeyError):
+    """A custom model's own `name` appears in its own `fallback_model_names`
+    - trivially a no-op loop even under the single-level walk (the model
+    would just skip itself at hop time), rejected at write time instead of
+    left as a confusing dead entry. 422, no DB write."""
+
+    status_code = 422
+    code = "custom_model_fallback_self_reference"
+
+    def __init__(self) -> None:
+        super().__init__("fallback_model_names may not include the custom model's own name.")
+
+
+class CustomModelFallbackDuplicateEntryError(GatekeyError):
+    """`fallback_model_names` contains the same name twice (exact-match,
+    case-sensitive - the same string-identity semantics `resolve_route()`'s
+    dict lookup already uses everywhere else in this codebase). 422, no DB
+    write."""
+
+    status_code = 422
+    code = "custom_model_fallback_duplicate_entry"
+
+    def __init__(self) -> None:
+        super().__init__("fallback_model_names may not contain the same entry twice.")
+
+
+class CustomModelFallbackUnresolvableModelError(GatekeyError):
+    """One entry in `fallback_model_names` does not currently resolve to any
+    routable model (not a `MODEL_REGISTRY` key, not another VERIFIED
+    `custom_models` row in this org, not a model id claimed by a VERIFIED
+    `self_hosted_providers` row in this org). Write-time-only - see
+    `resolve_and_dispatch_hop()`'s docstring (section 2.5) for why the
+    runtime walk treats this exact same condition as a skip, not a crash,
+    since routability can change again after this check passes (a
+    referenced custom model can be un-verified or deleted later). 422, no
+    DB write."""
+
+    status_code = 422
+    code = "custom_model_fallback_unresolvable_model"
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"fallback_model_names entry '{name}' does not currently resolve "
+            "to a routable model (not a known registry model, verified "
+            "custom model, or verified self-hosted model id in this org)."
+        )
+
+
 # ---------------------------------------------------------------------------
 # CustomModelRouteCache (technical design doc section 5 row 2)
 # ---------------------------------------------------------------------------
@@ -397,6 +491,18 @@ class CustomModelCacheEntry:
     config data (an admin-set USD rate), never secret material - safe to
     cache at the same tier as every other `*Cache` class' values, mirroring
     `SelfHostedRouteEntry.cost_basis_per_gpu_hour`'s identical rationale.
+
+    `fallback_model_names` (Model Catalog + Cross-Provider Fallback Chains,
+    Part B) - an immutable `tuple`, not the mutable `list` the DB/JSONB
+    round-trip naturally produces. This is what makes the "single-level, no
+    recursion" constraint *structurally* enforced at the one call site that
+    walks it (`api.v1.gateway.common.dispatch_with_model_fallback()`): that
+    loop binds `candidates = entry.fallback_model_names` exactly once,
+    before the loop starts, and never re-derives a list from inside the loop
+    body - there is no code path left that could even attempt to fetch a
+    second-order chain. See the Model Catalog technical design doc section
+    2.2 for the full rationale (the tuple type is redundant-but-cheap
+    defense in depth on top of that discipline, not the primary mechanism).
     """
 
     id: uuid.UUID
@@ -405,6 +511,7 @@ class CustomModelCacheEntry:
     native_model_id: str
     input_price_per_million_usd: Decimal
     output_price_per_million_usd: Decimal | None
+    fallback_model_names: tuple[str, ...] = ()
 
 
 class CustomModelRouteCache:
@@ -483,6 +590,7 @@ async def load_custom_model_route_snapshot(
             native_model_id=row.native_model_id,
             input_price_per_million_usd=row.input_price_per_million_usd,
             output_price_per_million_usd=row.output_price_per_million_usd,
+            fallback_model_names=tuple(row.fallback_model_names),
         )
     return snapshot
 
@@ -583,6 +691,85 @@ async def _self_hosted_model_ids_for_org(session: AsyncSession) -> set[str]:
     return claimed
 
 
+async def _verified_custom_model_names_for_org(session: AsyncSession) -> set[str]:
+    """Every `name` claimed by a VERIFIED `custom_models` row in this org -
+    used by `_validate_fallback_model_names()` (Model Catalog technical
+    design doc section 2.3) to check whether a `fallback_model_names` entry
+    resolves to another routable custom model. Mirrors `_self_hosted_model_
+    ids_for_org`'s "query the ORM class directly" discipline (no circular
+    import), but - unlike that helper - filters `WHERE verified = true`:
+    only a verified custom model is ever actually routable
+    (`CustomModelRouteCache`'s own docstring), so an unverified one must not
+    be accepted as a resolvable fallback target."""
+    stmt = select(CustomModel.name).where(
+        CustomModel.org_id == DEFAULT_ORG_ID, CustomModel.verified.is_(True)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    return set(rows)
+
+
+async def _verified_self_hosted_model_ids_for_org(session: AsyncSession) -> set[str]:
+    """Every model id claimed by a VERIFIED `self_hosted_providers` row in
+    this org - the self-hosted-target sibling of
+    `_verified_custom_model_names_for_org()` above, used by
+    `_validate_fallback_model_names()`. Unlike `_self_hosted_model_ids_for_
+    org` (the name-collision guard's helper, which deliberately does NOT
+    filter on `verified` - a colliding name is a hazard regardless of
+    verification state), this one DOES filter `WHERE verified = true`: only
+    a verified self-hosted endpoint is ever actually routable
+    (`SelfHostedModelRouteCache`'s own docstring), so an unverified one must
+    not be accepted as a resolvable fallback target."""
+    stmt = select(SelfHostedProvider).where(
+        SelfHostedProvider.org_id == DEFAULT_ORG_ID, SelfHostedProvider.verified.is_(True)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    claimed: set[str] = set()
+    for row in rows:
+        claimed.update(row.models)
+    return claimed
+
+
+async def _validate_fallback_model_names(
+    session: AsyncSession, *, own_name: str, fallback_model_names: list[str]
+) -> None:
+    """Write-time validation for `fallback_model_names` (Model Catalog +
+    Cross-Provider Fallback Chains technical design doc section 2.3).
+
+    Zero-I/O no-op when `fallback_model_names` is empty (the overwhelming
+    majority of every create/edit) - see module docstring. No DB write
+    happens in any raised case (called BEFORE the row is inserted/
+    committed, same discipline as `_validate_custom_model_write`).
+
+    Raises `CustomModelFallbackChainTooLongError` (`len() >
+    _MODEL_FALLBACK_MAX_CHAIN_LENGTH`), `CustomModelFallbackSelfReference
+    Error` (`own_name` appears in its own chain),
+    `CustomModelFallbackDuplicateEntryError` (an exact-match duplicate
+    entry), or `CustomModelFallbackUnresolvableModelError` (an entry that is
+    neither a `MODEL_REGISTRY` key, a verified custom model name in this
+    org, nor a verified self-hosted model id in this org) - see those
+    classes' docstrings.
+    """
+    if not fallback_model_names:
+        return
+    if len(fallback_model_names) > _MODEL_FALLBACK_MAX_CHAIN_LENGTH:
+        raise CustomModelFallbackChainTooLongError()
+    if own_name in fallback_model_names:
+        raise CustomModelFallbackSelfReferenceError()
+    if len(set(fallback_model_names)) != len(fallback_model_names):
+        raise CustomModelFallbackDuplicateEntryError()
+
+    verified_custom_names = await _verified_custom_model_names_for_org(session)
+    verified_self_hosted_ids = await _verified_self_hosted_model_ids_for_org(session)
+    for candidate in fallback_model_names:
+        if (
+            candidate in MODEL_REGISTRY
+            or candidate in verified_custom_names
+            or candidate in verified_self_hosted_ids
+        ):
+            continue
+        raise CustomModelFallbackUnresolvableModelError(candidate)
+
+
 async def _validate_custom_model_write(
     session: AsyncSession,
     *,
@@ -591,6 +778,7 @@ async def _validate_custom_model_write(
     capability: ModelCapability,
     input_price_per_million_usd: Decimal,
     output_price_per_million_usd: Decimal | None,
+    fallback_model_names: list[str],
 ) -> None:
     """Runs every write-time guard EXCEPT the own-table name-uniqueness
     guard (enforced via `UNIQUE(org_id, name)` + `IntegrityError` at
@@ -620,6 +808,16 @@ async def _validate_custom_model_write(
     if name in MODEL_REGISTRY:
         raise CustomModelNameRegistryCollisionError(name)
 
+    # Model Catalog + Cross-Provider Fallback Chains (Part B, technical
+    # design doc section 2.3): deliberately checked here, BEFORE the
+    # DB-touching collision guard below - a no-op (zero I/O) whenever
+    # `fallback_model_names` is empty (see `_validate_fallback_model_names`'s
+    # own docstring), and its own pure sub-checks (chain-too-long/self-
+    # reference/duplicate-entry) can therefore still reject before ANY DB
+    # access, matching this function's "cheapest checks first" discipline
+    # for every guard above.
+    await _validate_fallback_model_names(session, own_name=name, fallback_model_names=fallback_model_names)
+
     # Serialize against services.self_hosted_providers's mirror-image guard
     # for the remainder of this transaction (through the caller's own
     # insert/update + commit) - see module docstring "Bidirectional
@@ -643,6 +841,7 @@ async def register_custom_model(
     input_price_per_million_usd: Decimal,
     output_price_per_million_usd: Decimal | None,
     pricing_source: str | None,
+    fallback_model_names: list[str] | None = None,
 ) -> CustomModel:
     """Validate then insert a new `custom_models` row.
 
@@ -663,10 +862,22 @@ async def register_custom_model(
     `CustomModelEmbeddingsProviderUnsupportedError`/
     `CustomModelCapabilityPricingMismatchError`/
     `CustomModelNameRegistryCollisionError`/
-    `CustomModelNameSelfHostedCollisionError` (422, no write) or
+    `CustomModelNameSelfHostedCollisionError`/
+    `CustomModelFallbackChainTooLongError`/
+    `CustomModelFallbackSelfReferenceError`/
+    `CustomModelFallbackDuplicateEntryError`/
+    `CustomModelFallbackUnresolvableModelError` (422, no write) or
     `CustomModelNameConflictError` (409, transaction rolled back) - see
     those classes' docstrings.
+
+    `fallback_model_names` (Model Catalog + Cross-Provider Fallback Chains,
+    Part B) defaults to `[]` ("no fallback chain configured") and is ALWAYS
+    validated (`_validate_custom_model_write`'s new parameter), regardless
+    of whether it was explicitly passed - unlike `edit_custom_model`'s
+    `_provided`-gated re-validation, there is no "unchanged from the
+    existing row" case on a fresh insert.
     """
+    effective_fallback_model_names = list(fallback_model_names) if fallback_model_names else []
     await _validate_custom_model_write(
         session,
         name=name,
@@ -674,6 +885,7 @@ async def register_custom_model(
         capability=capability,
         input_price_per_million_usd=input_price_per_million_usd,
         output_price_per_million_usd=output_price_per_million_usd,
+        fallback_model_names=effective_fallback_model_names,
     )
 
     resolved_id = custom_model_id if custom_model_id is not None else uuid.uuid4()
@@ -689,6 +901,7 @@ async def register_custom_model(
         pricing_source=pricing_source,
         pricing_as_of=date.today(),
         verified=False,
+        fallback_model_names=effective_fallback_model_names,
     )
     session.add(row)
     try:
@@ -712,6 +925,8 @@ async def edit_custom_model(
     output_price_per_million_usd: Decimal | None = None,
     output_price_per_million_usd_provided: bool = False,
     pricing_source: str | None = None,
+    fallback_model_names: list[str] | None = None,
+    fallback_model_names_provided: bool = False,
 ) -> CustomModel:
     """Partial update of an existing row - every parameter left at its
     default leaves that field unchanged.
@@ -748,7 +963,21 @@ async def edit_custom_model(
     an edit that touches only `pricing_source` (matching `edit_self_hosted_
     provider`'s identical "only re-validate what could actually have
     changed" discipline), since the row's already-persisted state was
-    necessarily valid the last time this guard ran.
+    necessarily valid the last time this guard ran. Also re-run whenever
+    `fallback_model_names_provided` (Model Catalog + Cross-Provider Fallback
+    Chains, Part B) - see that parameter's own note below.
+
+    `fallback_model_names`/`fallback_model_names_provided` mirror `output_
+    price_per_million_usd`/`output_price_per_million_usd_provided`'s exact
+    `_provided`-boolean disambiguation: an edit must be able to explicitly
+    clear a chain back to `[]` (both an explicit `[]` AND an explicit `null`
+    clear it - either way the row ends up with `[]`), which a bare `is not
+    None` check on `fallback_model_names` alone could never distinguish from
+    "omitted". Editing `fallback_model_names` does NOT reset `verified`
+    (technical design doc section 2.4) - unlike `native_model_id`/
+    `provider`/`capability`, the row's own routability is unaffected by what
+    its fallback chain points at (only what happens if its OWN provider call
+    fails).
 
     Raises `CustomModelNotFoundError` (404) if `custom_model_id` doesn't
     reference a row in this org, or any of the same 422/409 errors
@@ -771,6 +1000,11 @@ async def edit_custom_model(
         if output_price_per_million_usd_provided
         else row.output_price_per_million_usd
     )
+    effective_fallback_model_names = (
+        (list(fallback_model_names) if fallback_model_names is not None else [])
+        if fallback_model_names_provided
+        else (list(row.fallback_model_names) if row.fallback_model_names else [])
+    )
 
     revalidate = (
         name is not None
@@ -778,6 +1012,7 @@ async def edit_custom_model(
         or capability is not None
         or input_price_per_million_usd is not None
         or output_price_per_million_usd_provided
+        or fallback_model_names_provided
     )
     if revalidate:
         await _validate_custom_model_write(
@@ -787,6 +1022,7 @@ async def edit_custom_model(
             capability=effective_capability,
             input_price_per_million_usd=effective_input_price,
             output_price_per_million_usd=effective_output_price,
+            fallback_model_names=effective_fallback_model_names,
         )
 
     if name is not None:
@@ -803,6 +1039,8 @@ async def edit_custom_model(
         row.output_price_per_million_usd = output_price_per_million_usd
     if pricing_source is not None:
         row.pricing_source = pricing_source
+    if fallback_model_names_provided:
+        row.fallback_model_names = effective_fallback_model_names
 
     # Deliberately based on "was this parameter provided at all" (not "did
     # it actually change the stored value") - identical convention to

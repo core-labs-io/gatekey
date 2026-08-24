@@ -27,7 +27,7 @@ from gatekey.api.v1.admin.usage import (
 )
 from gatekey.db.session import get_db_session
 from gatekey.services.sessions import SessionContext, get_current_session
-from gatekey.services.usage_logs import get_usage_summary
+from gatekey.services.usage_logs import get_phase4_dashboard_metrics, get_usage_summary
 
 router = APIRouter(prefix="/v1/me", tags=["me"])
 
@@ -39,9 +39,19 @@ async def get_my_usage_endpoint(
     session: AsyncSession = Depends(get_db_session),
 ) -> UsageSummaryResponse:
     now = datetime.now(timezone.utc)
-    summary = await get_usage_summary(
-        session, since=now - _RANGE_DELTAS[range], until=now, user_id=ctx.user_id
-    )
+    user_id = ctx.require_user_id()
+    since = now - _RANGE_DELTAS[range]
+    summary = await get_usage_summary(session, since=since, until=now, user_id=user_id)
+    # Post-ship fix: this call, and the 8 phase4=* fields below, were
+    # missing entirely - UsageSummaryResponse has had no default for its
+    # Phase 4 fields since they were added, so every call to this endpoint
+    # was raising a Pydantic ValidationError (an unhandled 500) before this
+    # fix. See services/usage_logs.py's get_phase4_dashboard_metrics
+    # docstring for why cache_hit_rate/cache_hits/cache_misses/
+    # cost_saved_caching_usd stay team/org-scoped rather than per-user even
+    # though this call passes user_id (cache_lookup_events has no user_id
+    # column) - a real, flagged limitation, not an oversight.
+    phase4 = await get_phase4_dashboard_metrics(session, since=since, until=now, user_id=user_id)
     return UsageSummaryResponse(
         total_spend_usd=summary.total_spend_usd,
         request_count=summary.request_count,
@@ -62,4 +72,12 @@ async def get_my_usage_endpoint(
             )
             for u in summary.spend_by_user
         ],
+        cache_hit_rate=phase4.cache_hit_rate,
+        cache_hits=phase4.cache_hits,
+        cache_misses=phase4.cache_misses,
+        failover_events_count=phase4.failover_events_count,
+        degraded_requests_count=phase4.degraded_requests_count,
+        cost_saved_caching_usd=phase4.cost_saved_caching_usd,
+        cost_saved_degradation_usd=phase4.cost_saved_degradation_usd,
+        cost_saved_total_usd=phase4.cost_saved_total_usd,
     )

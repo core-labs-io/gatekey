@@ -63,6 +63,23 @@ that served the request when `route.provider == "self_hosted"`. `provider`
 query discriminator the admin UI/export use to visibly label self-hosted
 cost figures "estimated" (AC5.5.7). See
 `gatekey/phase-5-technical-design.md` sections 2.3/4.1.
+
+`model_fallback_attempt`/`model_fallback_from_model` (Model Catalog +
+Cross-Provider Fallback Chains, migration `0050`)
+------------------------------------------------------------------------
+Directly mirrors `failover_attempt`/`failover_key_id`'s existing shape and
+naming convention (an int count + the "from" identifier, `0`/`NULL` on the
+overwhelming majority of rows), scoped to models instead of keys. Deliberately
+NOT a reuse of `original_model`/`degraded_from_model`/`degraded_to_model` -
+those already belong to graceful degradation's own, distinct, decided-
+BEFORE-dispatch substitution; model-fallback is a dispatch-failure-
+triggered substitution decided AFTER a call already failed, and both can
+legitimately apply to the same request. `model_fallback_from_model` is a
+plain `Text` column with no FK, consistent with `degraded_from_model`/
+`degraded_to_model`'s identical no-FK-to-a-model-names-table choice (there
+is no models table to reference; `custom_models.name` isn't even unique
+across time the way an id would be). See
+`gatekey/model-catalog-fallback-chains-technical-design.md` section 2.7.
 """
 
 from __future__ import annotations
@@ -99,6 +116,9 @@ class UsageLog(Base):
         Index("ix_usage_logs_degraded_to", "degraded_to_model"),
         # Phase 5: self-hosted provider queries
         Index("ix_usage_logs_self_hosted_provider_id", "self_hosted_provider_id"),
+        # Model Catalog + Cross-Provider Fallback Chains: fallback event
+        # queries - mirrors `ix_usage_logs_failover`'s composite shape.
+        Index("ix_usage_logs_model_fallback", "model_fallback_attempt", "model_fallback_from_model"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -189,6 +209,30 @@ class UsageLog(Base):
         ForeignKey("self_hosted_providers.id", ondelete="SET NULL"),
         nullable=True,
     )
+
+    # Model Catalog + Cross-Provider Fallback Chains (migration `0050`) - see
+    # module docstring "model_fallback_attempt"/"model_fallback_from_model".
+    # model_fallback_attempt: 0 = original model served, >0 = 1-indexed
+    # position in that model's fallback_model_names that ultimately served.
+    # model_fallback_from_model: the model whose chain was walked (NULL
+    # unless model_fallback_attempt > 0).
+    model_fallback_attempt: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    model_fallback_from_model: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Request provenance (added by `0047`) - "which system did each user
+    # use" for off-network-usage/leaked-key monitoring. `source_ip` reuses
+    # the exact trusted-proxy-aware resolution the audit trail already
+    # uses (`api.deps.get_source_ip`); `client_user_agent` is best-effort
+    # and client-supplied (spoofable - a hint, not a security control). A
+    # real device/MAC address is not obtainable from a remote HTTP client
+    # under any circumstance - see migration `0047`'s docstring for why
+    # that's not attempted here; `personal_api_keys.device_label` (CLI-sync
+    # self-reported, joined in at report time, not denormalized onto every
+    # row here) is the stronger signal for that narrower case.
+    source_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    client_user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

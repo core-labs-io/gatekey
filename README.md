@@ -12,6 +12,44 @@ performs inference itself, nothing phones home, and every component runs in
 infrastructure you control. Switching an existing app onto Gatekey means
 changing only two things: the base URL and the API key.
 
+## Why organizations use Gatekey: controlling AI spend
+
+Without a gateway, AI spend is scattered across however many provider
+accounts and API keys your teams have signed up for on their own — nobody
+has one place to see it, let alone stop it before the bill arrives. Gatekey
+puts every team's AI usage through one governed layer, so spend is
+something you control instead of something you discover.
+
+- 💰 **Set real budgets, not just alerts.** Give every org, team, and
+  person a spend limit. Gatekey checks it on every single request and
+  enforces a hard cutoff — spend can't run past what you set, because
+  finance found out from a dashboard, not from the bill.
+
+- 📉 **Degrade gracefully instead of shutting off.** As a team's spend
+  approaches its limit, Gatekey can automatically switch its requests to a
+  cheaper model instead of hard-failing outright — work keeps moving while
+  spend comes back under control.
+
+- 📊 **See exactly who is spending what, in one place.** A single
+  dashboard shows spend by team, by person, and by model, across every
+  provider you use — no more piecing cost together from separate provider
+  invoices.
+
+- 🔒 **Keep spend on cheap, approved models by default.** Restrict which
+  models each team or person can call — an Org Admin sets what's allowed
+  org-wide, and a Team Lead can narrow it further for their own people, so
+  nobody accidentally racks up cost on your most expensive model when a
+  cheaper one would do.
+
+- 🧾 **Consolidate every provider key into one place.** Bring your existing
+  OpenAI, Anthropic, Google, or OpenRouter keys (or your own self-hosted
+  models) under one gateway instead of scattered, unmanaged keys per team —
+  so nothing is quietly spending outside anyone's view.
+
+Existing apps don't need to be rewritten to get any of this — Gatekey is a
+drop-in, OpenAI-compatible proxy, so switching means changing a base URL and
+an API key.
+
 ## How it fits
 
 ```mermaid

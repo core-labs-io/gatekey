@@ -42,10 +42,12 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from typing import cast
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select, text
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -690,7 +692,11 @@ async def delete_org_access_schedule(
     )
     result = await session.execute(stmt)
     await session.commit()
-    deleted = (result.rowcount or 0) > 0
+    # sqlalchemy's async `execute()` is typed to return the generic
+    # `Result[Any]` regardless of statement kind (a known stub
+    # imprecision) - the concrete runtime type for a DELETE/UPDATE is
+    # always `CursorResult`, which does have `.rowcount`.
+    deleted = (cast(CursorResult, result).rowcount or 0) > 0
     if deleted and cache is not None:
         cache.set_org(None)
     return deleted
@@ -702,7 +708,11 @@ async def delete_team_access_schedule(
     stmt = delete(AccessSchedule).where(AccessSchedule.scope_team_id == team_id)
     result = await session.execute(stmt)
     await session.commit()
-    deleted = (result.rowcount or 0) > 0
+    # sqlalchemy's async `execute()` is typed to return the generic
+    # `Result[Any]` regardless of statement kind (a known stub
+    # imprecision) - the concrete runtime type for a DELETE/UPDATE is
+    # always `CursorResult`, which does have `.rowcount`.
+    deleted = (cast(CursorResult, result).rowcount or 0) > 0
     if deleted and cache is not None:
         cache.set_team(team_id, None)
     return deleted
@@ -714,7 +724,11 @@ async def delete_service_account_access_schedule(
     stmt = delete(AccessSchedule).where(AccessSchedule.scope_service_account_id == service_account_id)
     result = await session.execute(stmt)
     await session.commit()
-    deleted = (result.rowcount or 0) > 0
+    # sqlalchemy's async `execute()` is typed to return the generic
+    # `Result[Any]` regardless of statement kind (a known stub
+    # imprecision) - the concrete runtime type for a DELETE/UPDATE is
+    # always `CursorResult`, which does have `.rowcount`.
+    deleted = (cast(CursorResult, result).rowcount or 0) > 0
     if deleted and cache is not None:
         cache.set_service_account(service_account_id, None)
     return deleted

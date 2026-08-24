@@ -77,10 +77,12 @@ from gatekey.providers.vertex_ai import VertexAITokenCache
 from gatekey.services.dlp import build_analyzer_engine
 from gatekey.services.model_policy import (
     ContentAwareRuleCache,
+    MemberModelPolicyCache,
     ModelPolicyCache,
     ModelPolicySnapshot,
     TeamModelPolicyCache,
     load_content_aware_rule_snapshot,
+    load_member_policy_snapshot,
     load_policy_snapshot,
     load_team_policy_snapshot,
 )
@@ -164,6 +166,27 @@ async def _warm_team_model_policy_cache(app: FastAPI) -> None:
         app.state.team_model_policy_cache.set_all(snapshot)
     except Exception:
         logger.warning("team_model_policy_bootstrap_failed", exc_info=True)
+
+
+async def _warm_member_model_policy_cache(app: FastAPI) -> None:
+    """Bounded, fail-open warm of `MemberModelPolicyCache` (per-team-member
+    model narrowing, one layer below `TeamModelPolicyCache`).
+
+    Identical ADR-3-style contract to `_warm_team_model_policy_cache` above:
+    any failure (DB unreachable, timeout) is caught and logged, and the
+    cache stays at its empty default - which means "no member overlay", the
+    safe/permissive absence-of-row state, exactly like the team cache's own
+    default. Never raises. Called from the lifespan's initial bootstrap and
+    again at the end of a successful org-policy self-heal, alongside the
+    team-overlay warm (same shared failure cause - a DB that wasn't ready
+    yet)."""
+    try:
+        async with asyncio.timeout(_MODEL_POLICY_BOOTSTRAP_TIMEOUT_SECONDS):
+            async with app.state.db_session_factory() as session:
+                snapshot = await load_member_policy_snapshot(session)
+        app.state.member_model_policy_cache.set_all(snapshot)
+    except Exception:
+        logger.warning("member_model_policy_bootstrap_failed", exc_info=True)
 
 
 async def _warm_residency_and_content_aware_caches(app: FastAPI) -> None:
@@ -453,6 +476,8 @@ async def _model_policy_self_heal(app: FastAPI) -> None:
             # `set_team` on committed data, and an empty entry just means
             # "no restriction" - the permissive default either way).
             await _warm_team_model_policy_cache(app)
+            # Same rationale, one layer further: the per-member overlay warm.
+            await _warm_member_model_policy_cache(app)
         else:
             # A concurrent admin PUT committed (and called cache.set())
             # while this attempt's own read was in flight - the cache is
@@ -522,11 +547,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # loads share the same DB; if the org load failed, the team load
         # would too, and the self-heal retries both together).
         app.state.team_model_policy_cache = TeamModelPolicyCache()
+        # Same fail-open discipline, one layer further: the per-team-member
+        # overlay cache - constructed empty (= "no member has any overlay,
+        # the team's own effective set applies unchanged") and warmed below
+        # only if the org-baseline bootstrap succeeds.
+        app.state.member_model_policy_cache = MemberModelPolicyCache()
         app.state.model_policy_self_heal_task = None
         try:
             snapshot = await _load_model_policy_snapshot_bounded(app)
             app.state.model_policy_cache.set(snapshot)
             await _warm_team_model_policy_cache(app)
+            await _warm_member_model_policy_cache(app)
         except Exception:
             logger.warning("model_policy_bootstrap_failed", exc_info=True)
             # Cache stays at its zero-I/O default (unconfigured/permissive)

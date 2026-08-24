@@ -18,8 +18,14 @@ pipeline error (`provider_not_configured`), never `residency_violation`.
 
 from __future__ import annotations
 
+import json
+
 import asyncpg
+import httpx
 import pytest
+from fastapi import FastAPI
+
+from gatekey.api.deps import get_provider_http_client
 
 from .conftest import to_asyncpg_dsn
 
@@ -144,3 +150,107 @@ async def test_downgrading_hard_block_to_warn_is_audited_as_weakened(
     assert downgrade_resp.status_code == 200, downgrade_resp.text
 
     assert await _count_residency_audit_entries(migrated_database_url, "residency_rule.weakened") >= 1
+
+
+def _canned_openrouter_response() -> dict:
+    return {
+        "id": "chatcmpl-residency-test",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": "openai/gpt-4o-mini",
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+    }
+
+
+async def test_openrouter_without_trusted_providers_blocked_by_us_only_residency_rule(
+    app: FastAPI, client, auth_headers, default_user_id, default_team_id
+) -> None:
+    """The exact scenario this feature was built for: an admin has a real
+    OpenRouter key configured (no `trusted_provider_slugs`/`_region` set)
+    and an active "us"-only hard-block rule - the request must still be
+    blocked, because nothing has actually restricted where OpenRouter might
+    route this specific call. Confirms the pre-feature behavior is
+    unchanged for anyone who hasn't opted into the new fields."""
+    secret = await _make_service_account_secret(
+        client, auth_headers, user_id=default_user_id, team_id=default_team_id
+    )
+    key_resp = await client.put(
+        "/v1/admin/providers/openrouter/key",
+        json={"api_key": "sk-or-test-no-restriction"},
+        headers=auth_headers,
+    )
+    assert key_resp.status_code == 200, key_resp.text
+
+    rule_resp = await client.put(
+        "/v1/admin/residency-rules",
+        json={"allowed_regions": ["us"], "violation_behavior": "hard_block"},
+        headers=auth_headers,
+    )
+    assert rule_resp.status_code == 200, rule_resp.text
+
+    response = await client.post(
+        "/v1/chat/completions",
+        json={"model": "openrouter/openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "residency_violation"
+
+
+async def test_openrouter_with_trusted_providers_satisfies_us_only_residency_rule(
+    app: FastAPI, client, auth_headers, default_user_id, default_team_id
+) -> None:
+    """With `trusted_provider_slugs`/`trusted_provider_region="us"`
+    configured, the SAME rule that blocked the request above must now let
+    it through - AND the actual outbound OpenRouter call must carry
+    `provider.only` restricted to exactly that list, proving the region
+    claim is enforced, not just asserted (see `services.residency.
+    resolve_model_region`'s openrouter branch)."""
+    secret = await _make_service_account_secret(
+        client, auth_headers, user_id=default_user_id, team_id=default_team_id
+    )
+    key_resp = await client.put(
+        "/v1/admin/providers/openrouter/key",
+        json={
+            "api_key": "sk-or-test-restricted",
+            "trusted_provider_slugs": ["openai", "anthropic"],
+            "trusted_provider_region": "us",
+        },
+        headers=auth_headers,
+    )
+    assert key_resp.status_code == 200, key_resp.text
+    assert key_resp.json()["metadata"] == {
+        "trusted_provider_slugs": ["openai", "anthropic"],
+        "trusted_provider_region": "us",
+    }
+
+    rule_resp = await client.put(
+        "/v1/admin/residency-rules",
+        json={"allowed_regions": ["us"], "violation_behavior": "hard_block"},
+        headers=auth_headers,
+    )
+    assert rule_resp.status_code == 200, rule_resp.text
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=_canned_openrouter_response())
+
+    app.dependency_overrides[get_provider_http_client] = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    )
+    try:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "openrouter/openai/gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": f"Bearer {secret}"},
+        )
+    finally:
+        del app.dependency_overrides[get_provider_http_client]
+
+    assert response.status_code == 200, response.text
+    assert captured["body"]["provider"] == {"only": ["openai", "anthropic"]}

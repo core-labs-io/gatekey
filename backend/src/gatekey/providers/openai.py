@@ -20,6 +20,17 @@ rather than constructing one itself - callers (ultimately app startup, a
 later task) are expected to build one pooled client once and pass it into
 every call, per the design doc's connection-reuse requirement. These
 methods never construct their own client.
+
+Model Catalog (Part A, `services/model_catalog.py`) - `list_models()`
+-----------------------------------------------------------------------
+`GET /v1/models` (the exact same URL `OpenAIValidator.validate()` already
+calls for a different purpose - key validation, not catalog listing) - see
+the Model Catalog technical design doc section 1.5. Returns EVERY entry
+`{data: [{id, ...}]}` maps to, with no pricing filled in
+(`input_price_per_million_usd`/`output_price_per_million_usd` both `None`)
+- `services/model_catalog.py` fills those in afterward via its
+`MODEL_REGISTRY`/`PRICING_TABLE` reverse index, not this module (this
+module has no pricing knowledge of any kind).
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ from gatekey.schemas.chat import (
     EmbeddingsRequest,
     EmbeddingsResponse,
 )
+from gatekey.schemas.custom_model import AvailableModelEntry
 
 if TYPE_CHECKING:
     # Imported only for type hints, not at runtime: `services.proxy_keys`
@@ -263,3 +275,39 @@ async def create_embeddings(
     if response.status_code >= 400:
         raise provider_call_error_from_response(response, _PROVIDER_NAME)
     return EmbeddingsResponse.model_validate(response.json())
+
+
+async def list_models(
+    client: httpx.AsyncClient,
+    credential: ApiKeyCredential,
+    *,
+    timeout_seconds: float = _DEFAULT_INFERENCE_TIMEOUT_SECONDS,
+) -> list[AvailableModelEntry]:
+    """`GET /v1/models` - see module docstring "Model Catalog" section.
+
+    Raises `providers.base.ProviderCallError` on a network failure or a
+    non-2xx response, same as every other inference-adjacent method above.
+    No pricing is filled in here (both price fields always `None`) -
+    `services.model_catalog.list_available_models()` fills them in
+    afterward via its own `MODEL_REGISTRY`/`PRICING_TABLE` reverse index.
+    """
+    try:
+        response = await client.get(
+            OPENAI_MODELS_URL,
+            headers=_auth_headers(credential),
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        raise provider_call_error_from_exception(exc, _PROVIDER_NAME) from None
+    if response.status_code >= 400:
+        raise provider_call_error_from_response(response, _PROVIDER_NAME)
+    data = response.json()
+    return [
+        AvailableModelEntry(
+            native_model_id=entry["id"],
+            display_name=entry["id"],
+            input_price_per_million_usd=None,
+            output_price_per_million_usd=None,
+        )
+        for entry in data.get("data", [])
+    ]
