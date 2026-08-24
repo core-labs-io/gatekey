@@ -1,9 +1,23 @@
 """OpenAI-compatible Pydantic v2 request/response models (Phase 1.2, BD-8).
 
 Scope for 1.2 is intentionally text-only: `ChatMessage.content` is a plain
-string. Tool/function calls, multi-part content (e.g. `[{"type": "text",
-...}]`), and vision/image content are all explicitly out of scope for this
-phase (see the architect's design doc, section 3) and are not modeled here.
+string internally, and everywhere downstream (DLP scan, token counting,
+every provider adapter) still only ever sees `str`. Tool/function calls and
+vision/image content remain explicitly out of scope (see the architect's
+design doc, section 3) and are not modeled here.
+
+Post-ship fix: `ChatMessage._normalize_content_parts` (below) accepts the
+OpenAI "content parts" array wire shape (`[{"type": "text", "text": "..."}]`)
+in addition to a bare string. Real-world OpenAI-compatible clients (Kilo
+Code, Cursor, the OpenAI SDKs' own type defs) send that array shape
+unconditionally for plain text, not just for vision - a strict `content:
+str` schema 422s on every message from those clients, which breaks this
+module's own stated "drop-in replacement for a direct provider SDK call"
+goal. The parts array is flattened to a plain string at the request
+boundary; a non-text part (e.g. `image_url`) is still rejected with a clear
+422, since vision genuinely isn't implemented past this point - this is a
+wire-format accommodation, not an expansion of what content this phase
+actually understands.
 
 Request schemas (`ChatCompletionRequest`, `CompletionRequest`,
 `EmbeddingsRequest`, and the `ChatMessage` they nest) deliberately use
@@ -26,19 +40,40 @@ depends on strict/forbid behavior.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class ChatMessage(BaseModel):
     """A single chat message. Text-only in 1.2 - no tool calls, no
-    multi-part/vision content."""
+    vision content. `content` accepts either a bare string or the OpenAI
+    "content parts" array shape (flattened to a string) - see module
+    docstring."""
 
     model_config = ConfigDict(extra="ignore")
 
     role: Literal["system", "user", "assistant"]
     content: str
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _normalize_content_parts(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        texts: list[str] = []
+        for part in value:
+            part_type = part.get("type") if isinstance(part, dict) else None
+            if part_type != "text":
+                raise ValueError(
+                    "Only text content parts are supported (got part type "
+                    f"{part_type!r}) - vision/image content is not implemented."
+                )
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise ValueError("Content part missing a string 'text' field.")
+            texts.append(text)
+        return "".join(texts)
 
 
 class ChatCompletionStreamOptions(BaseModel):
@@ -81,9 +116,29 @@ class ChatCompletionUsage(BaseModel):
     total_tokens: int
 
 
+class ChatCompletionResponseMessage(BaseModel):
+    """A completion's response message - deliberately NOT `ChatMessage`
+    (added post-ship, alongside a live crash fix). `ChatCompletionResponse`
+    is validated directly against the raw upstream provider response
+    (`ChatCompletionResponse.model_validate(response.json())` in
+    `providers/openai.py`/`openrouter.py`/`ollama.py`) - real providers,
+    especially reasoning models, legitimately return `content: null` (all
+    the response budget spent on hidden reasoning tokens, a tool-call-only
+    turn, etc.) per OpenAI's own actual API contract. `ChatMessage.content`
+    is `str` (never `None`) by design for INBOUND request messages (Phase
+    1.2 is text-only, no tool calls) - reusing it here would have silently
+    also loosened request validation, not just fixed the response side.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    role: Literal["system", "user", "assistant"]
+    content: str | None
+
+
 class ChatCompletionChoice(BaseModel):
     index: int
-    message: ChatMessage
+    message: ChatCompletionResponseMessage
     finish_reason: str | None = None
 
 

@@ -16,17 +16,31 @@ statements (see `services.budget`).
 `role` is per-team (a user can be `team_lead` on one team and `member` on
 another - AC1.2); org-wide roles live on `users.org_role` instead.
 
-Removal is a hard row delete, not a soft `revoked_at` marker - unlike
-keys/sessions, a membership's full history is already durably captured by
-`AuditEntry`, so the live row only represents current state. `ON DELETE
-CASCADE` on both FKs; member/key cleanup ordering is gated at the
-service layer regardless (design doc ADR-4).
+Removal (`removed_at`, added by `0049`)
+----------------------------------------
+Was a hard row delete; is now a soft marker - product owner request: an
+accidental removal (or team deletion cascade... no, teams still block
+delete while members exist) should be undoable. `removed_at IS NULL` =
+active; NOT NULL = removed. The unique constraint on `(team_id, user_id)`
+is DELIBERATELY UNCHANGED (still exactly one row, ever, ever per pair) -
+"re-adding" a previously-removed user is `services.team_budget.
+create_team_membership` transparently restoring + updating that same row,
+not a second INSERT; see that function's docstring. Every query that
+means "does this user currently have this membership" (budget checks,
+gateway auth, RBAC, key-creation eligibility gates, alert recipients,
+period rollover) MUST filter `removed_at IS NULL` - a query that doesn't
+is very likely a real bug (a removed member silently retaining access/
+budget), not a stylistic choice. `ON DELETE CASCADE` on both FKs is now
+purely a safety net for the user/team row itself being hard-deleted
+(unusual - `users`/`teams` are themselves never hard-deleted by normal
+product flows either), not the primary removal path anymore.
 
 Migration ownership
 --------------------
 Names/definitions here must stay in lockstep with the explicit DDL in
-`alembic/versions/0008_create_team_memberships.py` - that migration, not
-`Base.metadata.create_all()`, is the source of truth for actual DDL
+`alembic/versions/0008_create_team_memberships.py` and `alembic/versions/
+0049_soft_delete_team_memberships.py` - those migrations, not
+`Base.metadata.create_all()`, are the source of truth for actual DDL
 (including the `team_role` enum type, created by `0007` - hence
 `create_type=False` below).
 """
@@ -75,6 +89,13 @@ class TeamMembership(Base):
         UniqueConstraint("team_id", "user_id", name="uq_team_memberships_team_id_user_id"),
         Index("ix_team_memberships_user_id", "user_id"),
         Index("ix_team_memberships_team_id", "team_id"),
+        # Added by `0049` - see module docstring "Removal".
+        Index(
+            "ix_team_memberships_active",
+            "team_id",
+            "user_id",
+            postgresql_where=text("removed_at IS NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -106,6 +127,11 @@ class TeamMembership(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+    # Soft-delete marker (added by `0049`) - see module docstring "Removal".
+    # NULL = active (the overwhelming majority of rows, and of queries -
+    # matches this column's own server default so existing rows are
+    # unaffected by the migration).
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     team: Mapped["Team"] = relationship("Team")
     user: Mapped["User"] = relationship("User")

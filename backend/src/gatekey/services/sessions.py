@@ -56,6 +56,49 @@ class SessionContext:
     org_role: Literal["org_admin", "auditor"] | None
     display_label: str  # name/email snapshot, for audit actor_label
 
+    def require_user_id(self) -> uuid.UUID:
+        """`user_id`, narrowed to non-`None` for callers on a route that
+        only ever receives a `SessionContext` from `get_current_session`
+        (the cookie-only, personal-route dependency - see that function's
+        docstring: "the base dependency for every non-admin,
+        session-authenticated route"), never from the break-glass path.
+
+        Post-ship fix: mypy flagged ~15 call sites across auth.py,
+        onboarding.py, keys.py, auth_device.py, teams.py, and
+        gateway/common.py passing `ctx.user_id` (typed `UUID | None`
+        because the SAME dataclass also represents the break-glass caller,
+        whose `user_id` is genuinely `None`) into functions expecting a
+        real `UUID`. Those call sites are all behind `get_current_session`,
+        which hard-fails 401 before ever returning a context with a `None`
+        user_id - the nullability was real at the *type* level but not at
+        the *reachable-value* level for any of them. This method documents
+        and enforces that distinction once, at the type boundary, instead
+        of a defensive `if ctx.user_id is None: raise ...` repeated at
+        every call site for a case that cannot actually occur there. Do
+        NOT call this after any dependency that can legitimately return
+        `BREAK_GLASS_SESSION_CONTEXT` (`require_admin`/`require_role` and
+        similar admin-surface dependencies) - it will raise for the one
+        caller (a real break-glass request) that's supposed to be allowed
+        through with no user_id at all.
+        """
+        if self.user_id is None:
+            raise UnauthorizedError(
+                "This route requires a real user session, not the break-glass admin token."
+            )
+        return self.user_id
+
+    def require_session_id(self) -> uuid.UUID:
+        """`session_id`, narrowed to non-`None` - same rationale as
+        `require_user_id()` (both fields are set together or not at all,
+        per this class's own docstring), used by routes that need the
+        session row itself (e.g. `/v1/auth/logout`'s `revoke_session`
+        call) rather than the user it belongs to."""
+        if self.session_id is None:
+            raise UnauthorizedError(
+                "This route requires a real user session, not the break-glass admin token."
+            )
+        return self.session_id
+
 
 # The break-glass GATEKEY_ADMIN_TOKEN acting as an org_admin-equivalent
 # caller on Phase 2 session-RBAC surfaces (product spec locked decision #1:

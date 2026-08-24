@@ -34,7 +34,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gatekey.api.deps import require_admin_or_auditor
 from gatekey.db.session import get_db_session
 from gatekey.errors import UnsupportedRequestError
-from gatekey.services.usage_logs import get_phase4_dashboard_metrics, get_usage_summary
+from gatekey.services.usage_logs import (
+    get_phase4_dashboard_metrics,
+    get_usage_summary,
+    list_usage_logs,
+)
 
 # Phase 2 (section 5.8): auth moved from router-level `require_admin` to the
 # endpoint's own `require_admin_or_auditor` - identical acceptance for the
@@ -273,4 +277,96 @@ async def export_usage_summary_endpoint(
         iter([buffer.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename_stub}.csv"},
+    )
+
+
+# ============================================================================
+# Request-level provenance listing (added by `0047`) - "which system did
+# each user use" (source IP / best-effort User-Agent / CLI-sync device
+# label), row-level detail alongside `/summary`'s aggregates. Same
+# page-based pagination shape `api/v1/admin/audit_entries.py`'s listing
+# endpoint already uses.
+# ============================================================================
+
+REQUESTS_PAGE_SIZE = 50
+
+
+class UsageLogItemResponse(BaseModel):
+    id: uuid.UUID
+    request_id: str
+    created_at: datetime
+    user_id: uuid.UUID | None
+    user_name: str | None
+    team_id: uuid.UUID | None
+    endpoint: str
+    provider: str | None
+    model: str | None
+    status: str
+    success: bool
+    cost_usd: Decimal | None
+    source_ip: str | None
+    client_user_agent: str | None
+    device_label: str | None
+
+
+class UsageLogsPageResponse(BaseModel):
+    entries: list[UsageLogItemResponse]
+    page: int
+    page_size: int
+    total: int
+
+
+@router.get(
+    "/requests",
+    response_model=UsageLogsPageResponse,
+    dependencies=[Depends(require_admin_or_auditor)],
+)
+async def list_usage_requests_endpoint(
+    range: TimeRange = Query(default="7d"),
+    start: datetime | None = Query(default=None),
+    end: datetime | None = Query(default=None),
+    user_id: uuid.UUID | None = Query(default=None),
+    team_id: uuid.UUID | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> UsageLogsPageResponse:
+    """Newest-first, filterable request-level detail - `source_ip`/
+    `client_user_agent`/`device_label` are the point of this endpoint
+    (off-network-usage/leaked-key monitoring); everything else mirrors
+    `/summary`'s existing filter/window conventions so the two endpoints
+    feel like one surface."""
+    since, until = _resolve_window(range, start, end)
+    rows, total = await list_usage_logs(
+        session,
+        since=since,
+        until=until,
+        user_id=user_id,
+        team_id=team_id,
+        page=page,
+        page_size=REQUESTS_PAGE_SIZE,
+    )
+    return UsageLogsPageResponse(
+        entries=[
+            UsageLogItemResponse(
+                id=row.id,
+                request_id=row.request_id,
+                created_at=row.created_at,
+                user_id=row.user_id,
+                user_name=row.user_name,
+                team_id=row.team_id,
+                endpoint=row.endpoint,
+                provider=row.provider,
+                model=row.model,
+                status=row.status,
+                success=row.success,
+                cost_usd=row.cost_usd,
+                source_ip=row.source_ip,
+                client_user_agent=row.client_user_agent,
+                device_label=row.device_label,
+            )
+            for row in rows
+        ],
+        page=page,
+        page_size=REQUESTS_PAGE_SIZE,
+        total=total,
     )

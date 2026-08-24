@@ -59,3 +59,18 @@ def test_poll_unknown_device_code_returns_404() -> None:
         response = client.post("/v1/auth/device/poll", json={"device_code": "bogus"})
         assert response.status_code == 404
         assert response.json()["error"]["code"] == "not_found"
+
+
+def test_device_start_accepts_optional_device_label() -> None:
+    """Added by `0047` - self-reported device label. Both an explicit
+    label AND no body at all (an older CLI-sync client) must keep working
+    - see `approve_device_auth`'s integration-test coverage for where the
+    label actually reaches the `PersonalApiKey` row."""
+    with TestClient(create_app(_settings())) as client:
+        with_label = client.post(
+            "/v1/auth/device/start", json={"device_label": "amits-macbook-pro"}
+        )
+        assert with_label.status_code == 200
+
+        no_body = client.post("/v1/auth/device/start")
+        assert no_body.status_code == 200

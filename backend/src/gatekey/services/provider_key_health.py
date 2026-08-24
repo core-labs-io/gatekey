@@ -51,7 +51,7 @@ from gatekey.services import proxy_keys as proxy_keys_service
 from gatekey.services.encryption import KeyProvider
 from gatekey.services.shared_state import SharedStateStore
 
-HealthStatus = Literal["healthy", "degraded", "down", "unavailable"]
+HealthStatus = Literal["healthy", "degraded", "down", "unavailable", "unknown"]
 
 logger = logging.getLogger("gatekey")
 
@@ -411,8 +411,8 @@ async def refresh_single_provider_key_health(
             # `except` branch below, not silently reported healthy.
             # `result.detail` is documented safe-to-log (see
             # `providers.base.ValidationResult`'s docstring).
-            error_message = result.detail or "Provider rejected the key or was unreachable."
-            health_status = "unavailable"
+            error_message: str | None = result.detail or "Provider rejected the key or was unreachable."
+            health_status: HealthStatus = "unavailable"
             logger.warning("health_check_error", extra={"key_id": str(key.id), "error": error_message})
 
             await session.execute(

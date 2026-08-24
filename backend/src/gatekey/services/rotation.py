@@ -208,6 +208,10 @@ class RotationEmailNotifier:
 
         def _send_sync() -> None:
             settings = self._settings
+            # Guaranteed by the `smtp_enabled()` check above - mypy can't
+            # narrow across the `asyncio.to_thread` closure boundary into
+            # this nested function (same as `shadow_ai.EmailNotifier.send`).
+            assert settings.GATEKEY_SMTP_HOST is not None
             message = EmailMessage()
             message["Subject"] = f"Gatekey: '{event.key_name}' credential rotated"
             message["From"] = settings.GATEKEY_SMTP_FROM_ADDRESS

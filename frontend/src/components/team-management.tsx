@@ -32,9 +32,12 @@ import {
   getTeamDegradationPolicy,
   getTeamDlpOverride,
   getTeamFailoverOverride,
+  getMemberModelRestrictions,
   getTeamModelRestrictions,
   getTeamResidencyRule,
+  listRemovedTeamMembers,
   listTeamRateLimitRules,
+  putMemberModelRestrictions,
   putTeamAccessSchedule,
   putTeamCacheSettings,
   putTeamDlpOverride,
@@ -44,6 +47,7 @@ import {
   reassignTeamBudget,
   rejectJoinRequest,
   removeTeamMember,
+  restoreTeamMember,
   updateTeamDegradationPolicy,
   updateTeamMember,
   updateTeamRateLimitRule,
@@ -52,6 +56,7 @@ import {
   type MeTeam,
   type RateLimitOnLimit,
   type RateLimitRuleResponse,
+  type RemovedTeamMemberResponse,
   type ResidencyViolationBehavior,
   type TeamDetailResponse,
   type TeamMemberResponse,
@@ -356,6 +361,7 @@ export function MembersSection({
   const toast = useToast();
   const [formOpen, setFormOpen] = useState<null | "new" | TeamMemberResponse>(null);
   const [keysFor, setKeysFor] = useState<TeamMemberResponse | null>(null);
+  const [modelAccessFor, setModelAccessFor] = useState<TeamMemberResponse | null>(null);
   const [reassignOpen, setReassignOpen] = useState(false);
   const [removing, setRemoving] = useState<TeamMemberResponse | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
@@ -363,24 +369,44 @@ export function MembersSection({
 
   const headroom = computeHeadroom(detail);
 
+  const [removedOpen, setRemovedOpen] = useState(false);
+  const [removedMembers, setRemovedMembers] = useState<RemovedTeamMemberResponse[] | null>(null);
+  const [restoreBusy, setRestoreBusy] = useState<string | null>(null);
+
   async function handleRemove(member: TeamMemberResponse) {
     setRemoveBusy(true);
     setRemoveError(null);
     try {
       await removeTeamMember(teamId, member.user_id);
-      toast.push("success", `${member.name} removed from the team.`);
+      toast.push("success", `${member.name} removed from the team. Their access is cut off immediately - restore them anytime from "Removed members" below.`);
       setRemoving(null);
       onChanged();
     } catch (err) {
-      if (err instanceof ApiError && err.code === "member_has_active_keys") {
-        setRemoveError(
-          "This member still holds active API keys scoped to this team - revoke them first."
-        );
-      } else {
-        setRemoveError(err instanceof ApiError ? err.message : "Failed to remove member.");
-      }
+      setRemoveError(err instanceof ApiError ? err.message : "Failed to remove member.");
     } finally {
       setRemoveBusy(false);
+    }
+  }
+
+  async function loadRemovedMembers() {
+    try {
+      setRemovedMembers(await listRemovedTeamMembers(teamId));
+    } catch (err) {
+      toast.push("error", err instanceof ApiError ? err.message : "Failed to load removed members.");
+    }
+  }
+
+  async function handleRestore(member: RemovedTeamMemberResponse) {
+    setRestoreBusy(member.user_id);
+    try {
+      await restoreTeamMember(teamId, member.user_id);
+      toast.push("success", `${member.name} restored - their existing keys work again immediately.`);
+      await loadRemovedMembers();
+      onChanged();
+    } catch (err) {
+      toast.push("error", err instanceof ApiError ? err.message : "Failed to restore member.");
+    } finally {
+      setRestoreBusy(null);
     }
   }
 
@@ -438,6 +464,9 @@ export function MembersSection({
                 <button className="btn-link" onClick={() => setKeysFor(m)}>
                   Manage API keys
                 </button>{" "}
+                <button className="btn-link" onClick={() => setModelAccessFor(m)}>
+                  Model access
+                </button>{" "}
                 <button
                   className="btn-link"
                   style={{ color: "var(--red)" }}
@@ -485,6 +514,14 @@ export function MembersSection({
           onClose={() => setKeysFor(null)}
         />
       ) : null}
+      {modelAccessFor ? (
+        <MemberModelAccessModal
+          teamId={teamId}
+          userId={modelAccessFor.user_id}
+          memberName={modelAccessFor.name}
+          onClose={() => setModelAccessFor(null)}
+        />
+      ) : null}
       {reassignOpen ? (
         <ReassignBudgetModal
           teamId={teamId}
@@ -500,7 +537,8 @@ export function MembersSection({
         <ConfirmDialog
           title={`Remove ${removing.name} from this team?`}
           consequence={
-            removeError ?? "Their membership and its budget allocation will be deleted."
+            removeError ??
+            "Their keys stop working immediately. This is reversible - restore them anytime from \"Removed members\" below, with the same role, budget, and spend history."
           }
           confirmLabel="Remove member"
           busy={removeBusy}
@@ -508,6 +546,48 @@ export function MembersSection({
           onConfirm={() => handleRemove(removing)}
         />
       ) : null}
+
+      <div style={{ marginTop: 20 }}>
+        <button
+          className="btn-link"
+          onClick={() => {
+            const next = !removedOpen;
+            setRemovedOpen(next);
+            if (next && removedMembers === null) void loadRemovedMembers();
+          }}
+        >
+          {removedOpen ? "▾" : "▸"} Removed members
+        </button>
+        {removedOpen ? (
+          <DataTable
+            rows={removedMembers ?? []}
+            rowKey={(m) => m.user_id}
+            emptyState="No removed members."
+            columns={[
+              { key: "name", header: "Name", render: (m) => m.name },
+              {
+                key: "removed_at",
+                header: "Removed",
+                render: (m) => new Date(m.removed_at).toLocaleString(),
+              },
+              {
+                key: "actions",
+                header: "Actions",
+                align: "right",
+                render: (m) => (
+                  <button
+                    className="btn-link"
+                    disabled={restoreBusy === m.user_id}
+                    onClick={() => handleRestore(m)}
+                  >
+                    {restoreBusy === m.user_id ? "Restoring..." : "Restore"}
+                  </button>
+                ),
+              },
+            ]}
+          />
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -595,6 +675,116 @@ export function ModelRestrictionsCard({ teamId }: { teamId: string }) {
         </button>
       </div>
     </div>
+  );
+}
+
+// --- Per-member model access (third layer, below ModelRestrictionsCard) -----
+
+/** A team lead narrows ONE member's access within the team's own effective
+ * set (org baseline intersected with the team's restriction, if any) -
+ * mirrors `ModelRestrictionsCard` one layer down: same "fetch baseline +
+ * current restriction, checkbox grid, null = everything checked, full-
+ * replace on save" shape, scoped to `teamBaseline` instead of `org_baseline`
+ * and to one `(teamId, userId)` pair instead of the whole team. */
+export function MemberModelAccessModal({
+  teamId,
+  userId,
+  memberName,
+  onClose,
+}: {
+  teamId: string;
+  userId: string;
+  memberName: string;
+  onClose: () => void;
+}) {
+  const toast = useToast();
+  const [baseline, setBaseline] = useState<string[]>([]);
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getMemberModelRestrictions(teamId, userId)
+      .then((data) => {
+        if (cancelled) return;
+        setBaseline(data.team_baseline);
+        // null restriction = the team baseline applies to them unchanged -> all checked.
+        setChecked(new Set(data.member_restriction ?? data.team_baseline));
+      })
+      .catch((err) => {
+        if (!cancelled)
+          setError(err instanceof ApiError ? err.message : "Failed to load model access.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [teamId, userId]);
+
+  async function handleSave() {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await putMemberModelRestrictions(teamId, userId, { models: [...checked] });
+      setBaseline(result.team_baseline);
+      setChecked(new Set(result.member_restriction ?? result.team_baseline));
+      toast.push("success", `Model access saved for ${memberName}.`);
+      onClose();
+    } catch (err) {
+      // 422 member_model_restricts_team_denied_model passes through verbatim.
+      setError(err instanceof ApiError ? err.message : "Failed to save model access.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title={`Model access - ${memberName}`} onClose={onClose}>
+      <p className="text-muted" style={{ marginTop: 0 }}>
+        Choose which of this team&apos;s own models {memberName} can use. This can only narrow
+        what the team already allows, never widen it - models outside the team&apos;s set are not
+        shown at all.
+      </p>
+      {loading ? (
+        <div className="skeleton skeleton-text" />
+      ) : baseline.length === 0 ? (
+        <div className="text-muted">
+          This team has no models enabled yet - set the team&apos;s own model restrictions first.
+        </div>
+      ) : (
+        <div className="model-checkbox-grid">
+          {baseline.map((model) => (
+            <label key={model} className="model-checkbox">
+              <input
+                type="checkbox"
+                checked={checked.has(model)}
+                onChange={(e) => {
+                  const next = new Set(checked);
+                  if (e.target.checked) next.add(model);
+                  else next.delete(model);
+                  setChecked(next);
+                }}
+              />
+              {model}
+            </label>
+          ))}
+        </div>
+      )}
+      <FieldError message={error} />
+      <div className="modal-actions">
+        <button className="btn btn-secondary" onClick={onClose} disabled={busy}>
+          Cancel
+        </button>
+        <button className="btn btn-primary" onClick={handleSave} disabled={busy || loading}>
+          {busy ? "Saving..." : "Save model access"}
+        </button>
+      </div>
+    </Modal>
   );
 }
 

@@ -69,7 +69,12 @@ from gatekey.errors import GatekeyError
 from gatekey.services.audit import write_audit_entry
 from gatekey.services.service_accounts import hash_secret
 from gatekey.services.team_budget import create_team_membership
-from gatekey.services.teams import get_membership, list_team_members, remove_team_member
+from gatekey.services.teams import (
+    get_membership,
+    list_team_members,
+    remove_team_member,
+    restore_team_member,
+)
 from gatekey.services.teams import delete_team as _delete_team
 
 if TYPE_CHECKING:
@@ -685,18 +690,48 @@ async def add_scim_group_members(
     """Ratified decision: `budget_usd=NULL` on create (unmetered, not `$0`) -
     delegates to `services.team_budget.create_team_membership`, whose
     headroom check is a no-op for a `None` request (module docstring).
-    Idempotent: a user already a member is silently skipped, no error, no
-    duplicate audit entry.
+    Idempotent: a user already an ACTIVE member is silently skipped, no
+    error, no duplicate audit entry.
+
+    `0049` (soft delete): a user who was PREVIOUSLY a member and was
+    removed gets RESTORED here, not the `member_previously_removed` 409
+    `create_team_membership` gives an interactive caller - the external
+    IdP is telling us this user currently belongs to the group, and SCIM
+    sync is meant to be fully automatic; a human having to separately
+    click "restore" to make automated sync converge would defeat the
+    point. `get_membership(..., include_removed=True)` distinguishes the
+    three cases (active/removed/never-existed) up front so the restore
+    path never even touches `create_team_membership`'s own id-generation
+    contract.
 
     Lock-ordering fix (CMR-14 security review, broader systemic audit): the
-    audit entry is written BEFORE `create_team_membership`, which takes
-    `SELECT ... FOR UPDATE` on `teams` - see `api/v1/teams.py`'s
-    `add_member_endpoint`/`services/team_budget.py`'s module docstring
-    addendum. `membership_id` is generated here (mirroring
-    `custom_models.py`'s `custom_model_id` pattern) so `target_id` is known
-    before the lock."""
+    audit entry is written BEFORE `create_team_membership`/
+    `restore_team_member`, both of which take `SELECT ... FOR UPDATE` on
+    `teams` - see `api/v1/teams.py`'s `add_member_endpoint`/`services/
+    team_budget.py`'s module docstring addendum. `membership_id` is
+    generated here (mirroring `custom_models.py`'s `custom_model_id`
+    pattern) so `target_id` is known before the lock - only meaningful for
+    the create path; the restore path's audit entry uses the real,
+    pre-existing row id instead (same as `restore_member_endpoint`).
+    """
     for user_id in member_user_ids:
-        if await get_membership(session, team_id=team.id, user_id=user_id) is not None:
+        existing = await get_membership(
+            session, team_id=team.id, user_id=user_id, include_removed=True
+        )
+        if existing is not None and existing.removed_at is None:
+            continue  # already an active member
+        if existing is not None and existing.removed_at is not None:
+            await write_audit_entry(
+                session,
+                actor=actor,
+                action="scim_group.member.restore",
+                target_type="team_membership",
+                target_id=str(existing.id),
+                old_value=None,
+                new_value={"team_id": str(team.id), "user_id": str(user_id)},
+                source_ip=source_ip,
+            )
+            await restore_team_member(session, team_id=team.id, user_id=user_id)
             continue
         membership_id = uuid.uuid4()
         await write_audit_entry(
@@ -718,6 +753,16 @@ async def add_scim_group_members(
                 membership_id=membership_id,
             )
         except IntegrityError:
+            raise ScimError(
+                400, "One or more member values reference an unknown user.", scim_type="invalidValue"
+            ) from None
+        except GatekeyError:
+            # `member_previously_removed` from `create_team_membership` -
+            # should be unreachable now that the restore path above
+            # handles this case first, but if a race lands a removal
+            # between the `include_removed=True` read and here, surface
+            # the same generic invalidValue SCIM error rather than the
+            # interactive-endpoint-shaped 409.
             raise ScimError(
                 400, "One or more member values reference an unknown user.", scim_type="invalidValue"
             ) from None

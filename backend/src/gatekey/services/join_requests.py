@@ -73,11 +73,15 @@ def compute_escalation_reason(
 
 
 async def _team_has_lead(session: AsyncSession, team_id: uuid.UUID) -> bool:
+    """`removed_at IS NULL` (added by `0049`) - a REMOVED team_lead must
+    not count as "this team has a lead", or a request would wrongly never
+    escalate to org_admin with no one left to actually approve it."""
     stmt = (
         select(TeamMembership.id)
         .where(
             TeamMembership.team_id == team_id,
             TeamMembership.role == TeamRole.TEAM_LEAD,
+            TeamMembership.removed_at.is_(None),
         )
         .limit(1)
     )
@@ -216,11 +220,14 @@ async def list_admin_queue(
     (see module docstring). The lead-exists test is SQL (`EXISTS`); the
     business-day arithmetic is Python over the (small) pending set."""
     now = now or datetime.now(timezone.utc)
+    # `removed_at IS NULL` (added by `0049`) - same reasoning as
+    # `_team_has_lead` above.
     lead_exists = (
         select(TeamMembership.id)
         .where(
             TeamMembership.team_id == JoinRequest.team_id,
             TeamMembership.role == TeamRole.TEAM_LEAD,
+            TeamMembership.removed_at.is_(None),
         )
         .exists()
     )

@@ -31,7 +31,7 @@ from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.models.join_request import JoinRequest, JoinRequestStatus
 from gatekey.db.models.team import Team
 from gatekey.db.models.team_membership import TeamMembership
-from gatekey.db.models.user import User
+from gatekey.db.models.user import User, UserOrgRole
 from gatekey.db.session import get_db_session
 from gatekey.errors import NotFoundError, UnauthorizedError
 from gatekey.services.oidc import (
@@ -44,6 +44,7 @@ from gatekey.services.oidc import (
     fetch_discovery_document,
     validate_id_token,
 )
+from gatekey.services.org_settings import get_effective_org_settings
 from gatekey.services.sessions import (
     SESSION_COOKIE_NAME,
     SessionContext,
@@ -61,6 +62,11 @@ router = APIRouter(prefix="/v1/auth", tags=["auth"])
 _REDIRECT_APP = "/"
 _REDIRECT_PENDING_APPROVAL = "/onboarding/pending"
 _REDIRECT_PROFILE = "/onboarding/profile"
+# Added by `0048` - first-SSO-login org_admin onboarding (product owner
+# request, distinct from the two routes above which are for regular,
+# non-admin users). Auditors are NOT gated here - read-only, don't manage
+# alerts.
+_REDIRECT_ALERT_EMAIL = "/onboarding/alert-email"
 
 # The login-state cookie only ever needs to travel back to these auth routes.
 _LOGIN_STATE_COOKIE_PATH = "/v1/auth"
@@ -78,6 +84,11 @@ def _require_sso_configured(request: Request) -> Settings:
 @router.get("/sso/login")
 async def sso_login(request: Request) -> RedirectResponse:
     settings = _require_sso_configured(request)
+    # `_require_sso_configured` already gate-checked `oidc_enabled()`, which
+    # is exactly `GATEKEY_OIDC_ISSUER_URL is not None` (config.py) - real at
+    # this point, just not narrowed by mypy across the function-call
+    # boundary.
+    assert settings.GATEKEY_OIDC_ISSUER_URL is not None
     discovery = await fetch_discovery_document(
         request.app.state.provider_http_client, settings.GATEKEY_OIDC_ISSUER_URL
     )
@@ -96,12 +107,29 @@ async def sso_login(request: Request) -> RedirectResponse:
 
 
 async def _resolve_post_login_redirect(session: AsyncSession, user: User) -> str:
-    """Design doc 2.1 step 5 - route by state, computed fresh every time."""
+    """Design doc 2.1 step 5 - route by state, computed fresh every time.
+
+    Added by `0048`: an `org_admin` (NOT `auditor` - read-only, doesn't
+    manage alerts) is routed to the alert-email onboarding prompt until
+    `org_settings.alert_recipient_email` is set - every SSO login re-checks
+    this fresh (same "never a cached one-time decision" discipline as
+    every other state this function resolves), so it re-fires if the email
+    is ever cleared later, not just on a user's literal first-ever login.
+    """
     if user.org_role is not None:
+        if user.org_role == UserOrgRole.ORG_ADMIN:
+            org = await get_effective_org_settings(session)
+            if org.alert_recipient_email is None:
+                return _REDIRECT_ALERT_EMAIL
         return _REDIRECT_APP
+    # `removed_at IS NULL` (added by `0049`) - a user whose only membership
+    # was removed must re-enter onboarding (profile/join-request), not be
+    # treated as already resolved.
     membership_exists = (
         await session.execute(
-            select(TeamMembership.id).where(TeamMembership.user_id == user.id).limit(1)
+            select(TeamMembership.id)
+            .where(TeamMembership.user_id == user.id, TeamMembership.removed_at.is_(None))
+            .limit(1)
         )
     ).scalar_one_or_none()
     if membership_exists is not None:
@@ -136,6 +164,7 @@ async def sso_callback(
         raise UnauthorizedError("Invalid or expired SSO login state.")
 
     http_client = request.app.state.provider_http_client
+    assert settings.GATEKEY_OIDC_ISSUER_URL is not None  # see sso_login's identical comment
     discovery = await fetch_discovery_document(http_client, settings.GATEKEY_OIDC_ISSUER_URL)
     tokens = await exchange_code(
         http_client, discovery, settings, code=code, code_verifier=login_state["code_verifier"]
@@ -194,7 +223,7 @@ async def logout(
     ctx: SessionContext = Depends(get_current_session),
     session: AsyncSession = Depends(get_db_session),
 ) -> Response:
-    await revoke_session(session, ctx.session_id)
+    await revoke_session(session, ctx.require_session_id())
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
     return response
@@ -212,7 +241,9 @@ class MeResponse(BaseModel):
     email: str | None
     org_role: Literal["org_admin", "auditor"] | None
     teams: list[MeTeam]
-    onboarding_status: Literal["resolved", "pending_profile", "pending_approval"]
+    onboarding_status: Literal[
+        "resolved", "pending_profile", "pending_approval", "pending_alert_email"
+    ]
 
 
 @router.get("/me", response_model=MeResponse)
@@ -224,11 +255,13 @@ async def me(
         await session.execute(select(User).where(User.id == ctx.user_id))
     ).scalar_one()
 
+    # `removed_at IS NULL` (added by `0049`) - a removed membership must
+    # not appear in the caller's own team list.
     membership_rows = (
         await session.execute(
             select(TeamMembership, Team.name)
             .join(Team, TeamMembership.team_id == Team.id)
-            .where(TeamMembership.user_id == user.id)
+            .where(TeamMembership.user_id == user.id, TeamMembership.removed_at.is_(None))
             .order_by(Team.name)
         )
     ).all()
@@ -239,7 +272,12 @@ async def me(
 
     # Same routing-by-state logic as the callback, recomputed fresh (2.1
     # step 5's explicit "never cached as a one-time decision").
-    if user.org_role is not None or teams:
+    if user.org_role == UserOrgRole.ORG_ADMIN:
+        org = await get_effective_org_settings(session)
+        onboarding_status = (
+            "pending_alert_email" if org.alert_recipient_email is None else "resolved"
+        )
+    elif user.org_role is not None or teams:
         onboarding_status = "resolved"
     else:
         pending = (

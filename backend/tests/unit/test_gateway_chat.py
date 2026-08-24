@@ -25,7 +25,7 @@ from gatekey.schemas.chat import (
     ChatCompletionChunkDelta,
     ChatCompletionResponse,
     ChatCompletionUsage,
-    ChatMessage,
+    ChatCompletionResponseMessage,
 )
 from gatekey.services.model_policy import ModelPolicySnapshot
 from gatekey.services import usage_logs as usage_logs_service
@@ -57,7 +57,7 @@ def _fake_response(native_model_id: str, text: str) -> ChatCompletionResponse:
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(role="assistant", content=text),
+                message=ChatCompletionResponseMessage(role="assistant", content=text),
                 finish_reason="stop",
             )
         ],

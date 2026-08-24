@@ -12,6 +12,19 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class DeviceStartRequest(BaseModel):
+    """`POST /v1/auth/device/start` optional body (added by `0047`) -
+    `device_label` is self-reported by the CLI (the machine being paired
+    knows its own hostname; the approving browser doesn't) and later
+    stamped onto the minted `PersonalApiKey.device_label`. Every field
+    optional / the body itself optional - existing CLI-sync clients that
+    send no body at all must keep working unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_label: str | None = Field(default=None, max_length=255)
+
+
 class DeviceStartResponse(BaseModel):
     """`POST /v1/auth/device/start` - standard OAuth 2.0 Device
     Authorization Grant shape (design doc 8.2, AC8a.2)."""

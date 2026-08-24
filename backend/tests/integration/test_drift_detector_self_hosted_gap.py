@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 import asyncpg
 import httpx

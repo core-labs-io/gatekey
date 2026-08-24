@@ -188,6 +188,11 @@ class DeviceAuthRecord:
     # that delivers it (one-time-reveal, same discipline as every other
     # plaintext secret in this codebase).
     refresh_credential_plaintext: str | None = field(default=None, repr=False)
+    # Self-reported by the CLI at `start()` time (added by `0047`) - the
+    # machine being paired knows its own hostname; the approving browser
+    # doesn't. Read by `approve_device_auth()` via `get_device_label()`
+    # and stamped onto the newly-minted `PersonalApiKey.device_label`.
+    device_label: str | None = None
 
 
 DevicePollOutcome = Literal["pending", "approved", "expired", "not_found"]
@@ -230,6 +235,7 @@ class DeviceAuthStore:
         *,
         now: datetime | None = None,
         ttl_seconds: int = DEFAULT_DEVICE_CODE_TTL_SECONDS,
+        device_label: str | None = None,
     ) -> DeviceAuthRecord:
         now = now or datetime.now(timezone.utc)
         self._sweep_expired(now)
@@ -239,10 +245,24 @@ class DeviceAuthStore:
             device_code=device_code,
             user_code=user_code,
             expires_at=now + timedelta(seconds=ttl_seconds),
+            device_label=device_label,
         )
         self._by_device_code[device_code] = record
         self._by_user_code[user_code] = device_code
         return record
+
+    def get_device_label(self, *, user_code: str, now: datetime | None = None) -> str | None:
+        """Best-effort read of the self-reported device label for a
+        pending/approved request (added by `0047`) - `None` if the CLI
+        didn't send one, or the `user_code` is unknown/expired. Called by
+        `approve_device_auth()` right after `is_pending()`, before minting
+        the `PersonalApiKey` row."""
+        now = now or datetime.now(timezone.utc)
+        self._sweep_expired(now)
+        device_code = self._by_user_code.get(user_code)
+        if device_code is None:
+            return None
+        return self._by_device_code[device_code].device_label
 
     def is_pending(self, *, user_code: str, now: datetime | None = None) -> bool:
         """Read-only check: does `user_code` refer to a not-yet-approved,

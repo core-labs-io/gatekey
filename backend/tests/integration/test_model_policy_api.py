@@ -208,7 +208,7 @@ async def test_fresh_org_default_permissive_registry_model_succeeds(
         ChatCompletionChoice,
         ChatCompletionResponse,
         ChatCompletionUsage,
-        ChatMessage,
+        ChatCompletionResponseMessage,
     )
     from gatekey.services.proxy_keys import ApiKeyCredential
 
@@ -223,7 +223,7 @@ async def test_fresh_org_default_permissive_registry_model_succeeds(
             choices=[
                 ChatCompletionChoice(
                     index=0,
-                    message=ChatMessage(role="assistant", content="hi"),
+                    message=ChatCompletionResponseMessage(role="assistant", content="hi"),
                     finish_reason="stop",
                 )
             ],

@@ -57,9 +57,10 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import delete, select, update
+from sqlalchemy.engine import CursorResult
 
 from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.models.audit_entry import AuditEntry
@@ -286,6 +287,10 @@ async def run_due_rotations(session: "AsyncSession", app: "FastAPI") -> int:
             await session.rollback()
             continue
         row, _secret = rotated
+        # Guaranteed non-None: rotate_service_account_key always sets this
+        # as part of a successful rotation - see the identical assert/
+        # comment in api/v1/keys.py's manual "Rotate now" route.
+        assert row.previous_secret_valid_until is not None
         overlap_expires_at = row.previous_secret_valid_until
         await session.commit()
         fired += 1
@@ -326,7 +331,9 @@ async def _purge_rows_older_than(session: "AsyncSession", model, cutoff: datetim
         )
         result = await session.execute(stmt)
         await session.commit()
-        deleted_this_round = result.rowcount or 0
+        # See the identical comment in services/access_schedules.py - a
+        # known sqlalchemy stub imprecision, not a real type mismatch.
+        deleted_this_round = cast(CursorResult, result).rowcount or 0
         total_deleted += deleted_this_round
         if deleted_this_round < _PURGE_BATCH_SIZE:
             break

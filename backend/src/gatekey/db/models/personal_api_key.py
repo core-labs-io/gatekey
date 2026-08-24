@@ -97,6 +97,13 @@ class PersonalApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Self-reported by the CLI-sync tool at `POST /v1/auth/device/start`
+    # time (added by `0047`) - the machine being paired knows its own
+    # hostname; the approving browser doesn't. NULL for every key not
+    # minted through the device-code flow (self-service-portal personal
+    # keys, all service-account keys). See `services.cli_refresh_
+    # credentials.DeviceAuthStore` for where this is captured.
+    device_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

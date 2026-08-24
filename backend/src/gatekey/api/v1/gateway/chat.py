@@ -77,6 +77,7 @@ from gatekey.api.deps import (
     get_key_provider,
     get_model_policy_cache,
     get_provider_http_client,
+    get_member_model_policy_cache,
     get_rate_limit_cache,
     get_residency_rule_cache,
     get_self_hosted_model_route_cache,
@@ -92,9 +93,8 @@ from gatekey.api.v1.gateway.common import (
     build_cache_headers,
     build_degradation_headers,
     build_failover_headers,
+    build_model_fallback_headers,
     build_rate_limit_headers,
-    call_provider_with_failover,
-    call_self_hosted_provider,
     check_access_schedule,
     check_and_apply_degradation,
     check_budget_available,
@@ -103,6 +103,7 @@ from gatekey.api.v1.gateway.common import (
     check_rate_limit,
     check_residency,
     check_response_cache,
+    dispatch_with_model_fallback,
     log_degradation_event,
     log_gateway_request,
     new_request_id,
@@ -130,7 +131,12 @@ from gatekey.schemas.chat import ChatCompletionChunk, ChatCompletionRequest, Cha
 from gatekey.services.access_schedules import AccessScheduleCache
 from gatekey.services.degradation import DegradationPolicyCache
 from gatekey.services.encryption import KeyProvider
-from gatekey.services.model_policy import ContentAwareRuleCache, ModelPolicyCache, TeamModelPolicyCache
+from gatekey.services.model_policy import (
+    ContentAwareRuleCache,
+    MemberModelPolicyCache,
+    ModelPolicyCache,
+    TeamModelPolicyCache,
+)
 from gatekey.services.provider_key_health import TeamFailoverOverrideCache
 from gatekey.services.custom_models import (
     CustomModelCacheEntry,
@@ -229,7 +235,25 @@ def _sse_frame(chunk: ChatCompletionChunk) -> bytes:
     return f"data: {chunk.model_dump_json()}\n\n".encode("utf-8")
 
 
-def _is_usage_chunk(chunk: ChatCompletionChunk) -> bool:
+def _is_dedicated_usage_chunk(chunk: ChatCompletionChunk) -> bool:
+    """True only for the OpenAI-native shape: a SEPARATE terminal frame
+    with empty `choices`, carrying nothing but `usage`. That shape is an
+    opt-in extra (`stream_options.include_usage`) OpenAI only sends
+    AFTER the real content/`finish_reason` frame, so it's safe to
+    withhold from the client entirely when they didn't ask for it.
+
+    Post-ship fix: this used to be the ONLY shape `_handle()` recognized
+    for billing purposes too (via `captured_usage`) - but OpenRouter (and
+    likely other providers) attaches `usage` directly to the SAME chunk
+    that carries the real `finish_reason`/content, not a separate empty-
+    choices frame. That chunk has non-empty `choices`, so this check
+    correctly returns False for it - see `_handle()`, which now captures
+    `usage` off ANY chunk it appears on, independent of this function.
+    This function's only remaining job is "is it safe to suppress this
+    frame from the client" - a chunk with non-empty `choices` always
+    carries content/`finish_reason` the client needs and must never be
+    suppressed, regardless of whether it also happens to carry usage.
+    """
     return not chunk.choices and chunk.usage is not None
 
 
@@ -267,6 +291,13 @@ async def _sse_event_stream(
     org_id: uuid.UUID | None = None,
     rate_limit_store: SharedStateStore | None = None,
     rate_limit_cache: RateLimitCache | None = None,
+    source_ip: str | None = None,
+    client_user_agent: str | None = None,
+    # Model Catalog + Cross-Provider Fallback Chains (Part B) - mirrors
+    # `failover_attempt`/`failover_key_id`'s identical threading. `0`/`None`
+    # (the defaults) for every request that never triggered fallback.
+    model_fallback_attempt: int = 0,
+    model_fallback_from_model: str | None = None,
 ) -> AsyncIterator[bytes]:
     disconnected = False
     result_status = "ok"
@@ -281,8 +312,14 @@ async def _sse_event_stream(
 
     def _handle(chunk: ChatCompletionChunk) -> bytes | None:
         nonlocal captured_usage
-        if _is_usage_chunk(chunk):
+        # Capture for billing off ANY chunk carrying usage - independent
+        # of whether it's a dedicated trailing frame or attached to the
+        # real content/finish_reason chunk (see `_is_dedicated_usage_
+        # chunk`'s docstring). Last-write-wins is fine: at most one chunk
+        # in a real stream ever carries non-None usage.
+        if chunk.usage is not None:
             captured_usage = chunk.usage
+        if _is_dedicated_usage_chunk(chunk):
             return _sse_frame(chunk) if client_wants_usage else None
         return _sse_frame(chunk)
 
@@ -445,6 +482,10 @@ async def _sse_event_stream(
             degraded_from_model=degraded_from_model,
             degraded_to_model=degraded_to_model,
             self_hosted_provider_id=self_hosted_provider_id,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
+            model_fallback_attempt=model_fallback_attempt,
+            model_fallback_from_model=model_fallback_from_model,
         )
         if (
             result_status == "ok"
@@ -477,6 +518,7 @@ async def create_chat_completion(
     token_cache: VertexAITokenCache = Depends(get_vertex_token_cache),
     cache: ModelPolicyCache = Depends(get_model_policy_cache),
     team_cache: TeamModelPolicyCache = Depends(get_team_model_policy_cache),
+    member_cache: MemberModelPolicyCache = Depends(get_member_model_policy_cache),
     residency_cache: ResidencyRuleCache = Depends(get_residency_rule_cache),
     content_aware_cache: ContentAwareRuleCache = Depends(get_content_aware_rule_cache),
     dlp_engine: AnalyzerEngine = Depends(get_dlp_analyzer_engine),
@@ -523,6 +565,15 @@ async def create_chat_completion(
         # Request object, so this is never the "genuinely unavailable" None
         # case.
         source_ip = get_source_ip(request, request.app.state.settings)
+        # Request provenance for usage_logs (migration `0047`) - captured
+        # once here alongside `source_ip` for the identical reason, and
+        # threaded into every `record_usage_log()` call below, PLUS into
+        # `_sse_event_stream` as explicit kwargs (not recomputed from
+        # `request.app` inside that function - it's unit-tested directly
+        # with a minimal `Request` test double that has no real `.app`,
+        # same reasoning as every other value already threaded into it
+        # rather than re-derived internally).
+        client_user_agent = request.headers.get("user-agent")
         await check_access_schedule(
             session, ctx, cache=access_schedule_cache, source_ip=source_ip
         )
@@ -546,22 +597,22 @@ async def create_chat_completion(
         )
         provider_for_log = route.provider
         self_hosted_provider_id_for_log = route.self_hosted_provider_id
-        # Phase 5 (5.5): the self-hosted route's cost basis, captured ONCE
-        # here (not re-read from the cache again at charge time) - see
-        # `compute_self_hosted_cost`'s call sites below. `None` for every
-        # non-self-hosted request.
-        self_hosted_route_entry = (
-            self_hosted_cache.get(body.model) if route.provider == "self_hosted" else None
-        )
-        # CMR-4: mirrors `self_hosted_route_entry` above, captured ONCE here
-        # - the sole discriminator is `route.custom_model_id is not None`
-        # (never `route.provider`, per the technical design doc section
-        # 2.2/8.1 flag 4 - a provider-string check would silently misfire
-        # against a static route to the same provider).
-        custom_model_route_entry = (
-            custom_model_cache.get(body.model) if route.custom_model_id is not None else None
-        )
-        check_model_policy(body.model, cache, team_cache, ctx.team_id)
+        # Phase 5 (5.5)/CMR-4: `self_hosted_route_entry`/`custom_model_
+        # route_entry` are no longer captured here - Model Catalog + Cross-
+        # Provider Fallback Chains (Part B) means the model that ULTIMATELY
+        # serves this request can differ from `route`/`body.model` (a
+        # fallback candidate can be a DIFFERENT self-hosted/custom model
+        # than the one originally requested, unlike graceful degradation's
+        # `downgrade_target_model`, which `validate_downgrade_target_model()`
+        # restricts to `MODEL_REGISTRY` keys only). Both are now derived
+        # AFTER dispatch, keyed off `effective_route`/`effective_model`
+        # POST-`dispatch_with_model_fallback()` - see the streaming/
+        # non-streaming branches below - so cost computation always reflects
+        # whichever hop actually served the request, never the originally
+        # requested one (Model Catalog technical design doc section 2.5/2.6
+        # + the security review's "cost must key off served_route/
+        # served_model" check).
+        check_model_policy(body.model, cache, team_cache, ctx.team_id, member_cache, ctx.user_id)
         if route.capability != ModelCapability.CHAT:
             raise HttpUnsupportedRequestError(
                 f"Model '{body.model}' does not support chat completions "
@@ -618,6 +669,8 @@ async def create_chat_completion(
                 success=True,
                 cache_hit=True,
                 self_hosted_provider_id=route.self_hosted_provider_id,
+                source_ip=source_ip,
+                client_user_agent=client_user_agent,
             )
             for key, value in response_headers.items():
                 response.headers[key] = value
@@ -684,6 +737,7 @@ async def create_chat_completion(
                 degraded_route=candidate_route,
                 model_policy_cache=cache,
                 team_model_policy_cache=team_cache,
+                member_model_policy_cache=member_cache,
                 content_aware_cache=content_aware_cache,
                 residency_cache=residency_cache,
                 category_findings=dlp_result.category_findings,
@@ -702,54 +756,84 @@ async def create_chat_completion(
 
         if body.stream:
 
-            async def _streaming_call(credential: Any) -> tuple[Any, Any]:
-                gen = _create_streaming(
-                    effective_route.provider,
-                    effective_route.native_model_id,
-                    body,
-                    credential,
-                    http_client,
-                    token_cache,
-                )
-                try:
-                    first_item: Any = await gen.__anext__()
-                except StopAsyncIteration:
-                    first_item = _STREAM_EMPTY
-                return gen, first_item
+            def _build_streaming_call(candidate_route: ModelRoute) -> Any:
+                async def _streaming_call(credential: Any) -> tuple[Any, Any]:
+                    gen = _create_streaming(
+                        candidate_route.provider,
+                        candidate_route.native_model_id,
+                        body,
+                        credential,
+                        http_client,
+                        token_cache,
+                    )
+                    try:
+                        first_item: Any = await gen.__anext__()
+                    except StopAsyncIteration:
+                        first_item = _STREAM_EMPTY
+                    return gen, first_item
+
+                return _streaming_call
 
             try:
-                # Phase 5 (5.5, design doc section 2.3(b)/wiring checklist
-                # row 7): self-hosted endpoints never participate in Phase
-                # 4's provider_keys-scoped backup-group failover mechanism -
-                # `call_self_hosted_provider()` instead, a simpler sibling
-                # with no retry/failover.
-                if effective_route.provider == "self_hosted":
-                    failover = await call_self_hosted_provider(
-                        session,
-                        route=effective_route,
-                        key_provider=key_provider,
-                        call_fn=_streaming_call,
-                    )
-                else:
-                    failover = await call_provider_with_failover(
-                        session,
-                        request.app,
-                        route=effective_route,
-                        org_id=ctx.org_id,
-                        team_id=ctx.team_id,
-                        request_id=request_id,
-                        key_provider=key_provider,
-                        health_store=shared_state_store,
-                        team_override_cache=team_override_cache,
-                        call_fn=_streaming_call,
-                    )
+                # Model Catalog + Cross-Provider Fallback Chains (Part B):
+                # wraps `call_self_hosted_provider`/`call_provider_with_
+                # failover` - see `common.dispatch_with_model_fallback()`'s
+                # docstring. Streaming scope boundary (technical design doc
+                # section 2.6): `_streaming_call`'s `call_fn` only ever
+                # calls `gen.__anext__()` ONCE to obtain `first_item` - a
+                # `ProviderCallError` there propagates exactly like a
+                # non-streaming failure, so fallback applies identically at
+                # this pre-first-byte point. A failure MID-stream (after
+                # `first_item` was already yielded and bytes are already on
+                # the wire) is `_sse_event_stream`'s own, untouched `except
+                # ProviderCallError` path below - this call site is never
+                # reached again once that generator has started.
+                fallback_result = await dispatch_with_model_fallback(
+                    session,
+                    request.app,
+                    ctx,
+                    original_route=effective_route,
+                    original_model=effective_model,
+                    custom_model_cache=custom_model_cache,
+                    self_hosted_cache=self_hosted_cache,
+                    model_policy_cache=cache,
+                    team_model_policy_cache=team_cache,
+                member_model_policy_cache=member_cache,
+                    content_aware_cache=content_aware_cache,
+                    residency_cache=residency_cache,
+                    category_findings=dlp_result.category_findings,
+                    source_ip=source_ip,
+                    request_id=request_id,
+                    key_provider=key_provider,
+                    health_store=shared_state_store,
+                    team_override_cache=team_override_cache,
+                    build_call_fn=_build_streaming_call,
+                )
             except ProviderUnsupportedRequestError as exc:
                 raise HttpUnsupportedRequestError(str(exc)) from None
             except ProviderCallError as exc:
                 raise ProviderUpstreamError(str(exc), upstream_status_code=exc.status_code) from None
+            failover = fallback_result.failover
+            effective_route = fallback_result.served_route
+            effective_model = fallback_result.served_model
             gen, first_item = failover.result
             timer.mark("provider_response_received")
             response_headers.update(build_failover_headers(failover))
+            response_headers.update(build_model_fallback_headers(fallback_result))
+            # CMR-4/Phase 5 (5.5): re-derived against the WINNING hop
+            # (`effective_route`/`effective_model`, post-fallback), never the
+            # originally requested model - see the module docstring note
+            # above `check_model_policy()`'s call site.
+            custom_model_route_entry = (
+                custom_model_cache.get(effective_model)
+                if effective_route.custom_model_id is not None
+                else None
+            )
+            self_hosted_route_entry = (
+                self_hosted_cache.get(effective_model)
+                if effective_route.provider == "self_hosted"
+                else None
+            )
 
             return StreamingResponse(
                 _sse_event_stream(
@@ -790,51 +874,74 @@ async def create_chat_completion(
                     ),
                     rate_limit_store=shared_state_store,
                     rate_limit_cache=rate_limit_cache,
+                    source_ip=source_ip,
+                    client_user_agent=client_user_agent,
+                    model_fallback_attempt=fallback_result.fallback_attempt,
+                    model_fallback_from_model=fallback_result.fallback_from_model,
                 ),
                 media_type="text/event-stream",
                 headers=response_headers,
             )
 
-        async def _non_streaming_call(credential: Any) -> ChatCompletionResponse:
-            return await _create_non_streaming(
-                effective_route.provider,
-                effective_route.native_model_id,
-                body,
-                credential,
-                http_client,
-                token_cache,
-            )
+        def _build_non_streaming_call(candidate_route: ModelRoute) -> Any:
+            async def _non_streaming_call(credential: Any) -> ChatCompletionResponse:
+                return await _create_non_streaming(
+                    candidate_route.provider,
+                    candidate_route.native_model_id,
+                    body,
+                    credential,
+                    http_client,
+                    token_cache,
+                )
+
+            return _non_streaming_call
 
         try:
-            # Phase 5 (5.5, design doc section 2.3(b)/wiring checklist row
-            # 7) - see the identical branch in the streaming block above.
-            if effective_route.provider == "self_hosted":
-                failover = await call_self_hosted_provider(
-                    session,
-                    route=effective_route,
-                    key_provider=key_provider,
-                    call_fn=_non_streaming_call,
-                )
-            else:
-                failover = await call_provider_with_failover(
-                    session,
-                    request.app,
-                    route=effective_route,
-                    org_id=ctx.org_id,
-                    team_id=ctx.team_id,
-                    request_id=request_id,
-                    key_provider=key_provider,
-                    health_store=shared_state_store,
-                    team_override_cache=team_override_cache,
-                    call_fn=_non_streaming_call,
-                )
+            # Model Catalog + Cross-Provider Fallback Chains (Part B): wraps
+            # `call_self_hosted_provider`/`call_provider_with_failover` -
+            # see the identical branch in the streaming block above / `common.
+            # dispatch_with_model_fallback()`'s docstring.
+            fallback_result = await dispatch_with_model_fallback(
+                session,
+                request.app,
+                ctx,
+                original_route=effective_route,
+                original_model=effective_model,
+                custom_model_cache=custom_model_cache,
+                self_hosted_cache=self_hosted_cache,
+                model_policy_cache=cache,
+                team_model_policy_cache=team_cache,
+                member_model_policy_cache=member_cache,
+                content_aware_cache=content_aware_cache,
+                residency_cache=residency_cache,
+                category_findings=dlp_result.category_findings,
+                source_ip=source_ip,
+                request_id=request_id,
+                key_provider=key_provider,
+                health_store=shared_state_store,
+                team_override_cache=team_override_cache,
+                build_call_fn=_build_non_streaming_call,
+            )
         except ProviderUnsupportedRequestError as exc:
             raise HttpUnsupportedRequestError(str(exc)) from None
         except ProviderCallError as exc:
             raise ProviderUpstreamError(str(exc), upstream_status_code=exc.status_code) from None
+        failover = fallback_result.failover
+        effective_route = fallback_result.served_route
+        effective_model = fallback_result.served_model
         provider_response = failover.result
         timer.mark("provider_response_received")
         response_headers.update(build_failover_headers(failover))
+        response_headers.update(build_model_fallback_headers(fallback_result))
+        # CMR-4/Phase 5 (5.5): re-derived against the WINNING hop
+        # (`effective_route`/`effective_model`, post-fallback) - see the
+        # module docstring note above `check_model_policy()`'s call site.
+        custom_model_route_entry = (
+            custom_model_cache.get(effective_model) if effective_route.custom_model_id is not None else None
+        )
+        self_hosted_route_entry = (
+            self_hosted_cache.get(effective_model) if effective_route.provider == "self_hosted" else None
+        )
 
         cost_usd: Decimal | None = None
         precomputed_cost_usd: Decimal | None = None
@@ -902,12 +1009,20 @@ async def create_chat_completion(
                 degraded_from_model=degradation_outcome.original_model,
                 degraded_to_model=degradation_outcome.degraded_model,
                 self_hosted_provider_id=effective_route.self_hosted_provider_id,
+                source_ip=source_ip,
+                client_user_agent=client_user_agent,
+                model_fallback_attempt=fallback_result.fallback_attempt,
+                model_fallback_from_model=fallback_result.fallback_from_model,
             )
             raise
 
         # Phase 4 (AC4.3.7): write-through cache population - miss only,
         # never for a degraded response (see module docstring), and never
-        # when this request's content was redacted by DLP (AC4.3.6).
+        # when this request's content was redacted by DLP (AC4.3.6). Model
+        # Catalog (Part B): never for a fallback-served response either
+        # (`route` here is deliberately still the ORIGINALLY REQUESTED
+        # route/cache key, unchanged - see `write_response_cache()`'s
+        # docstring).
         await write_response_cache(
             ctx,
             route,
@@ -916,7 +1031,11 @@ async def create_chat_completion(
             response_body=provider_response.model_dump(mode="json"),
             input_tokens=provider_response.usage.prompt_tokens,
             output_tokens=provider_response.usage.completion_tokens,
-            skip_write=dlp_result.redacted_texts is not None or degradation_outcome.triggered,
+            skip_write=(
+                dlp_result.redacted_texts is not None
+                or degradation_outcome.triggered
+                or fallback_result.fallback_attempt > 0
+            ),
         )
 
         timer.mark("flush_complete")
@@ -954,6 +1073,10 @@ async def create_chat_completion(
             degraded_from_model=degradation_outcome.original_model,
             degraded_to_model=degradation_outcome.degraded_model,
             self_hosted_provider_id=effective_route.self_hosted_provider_id,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
+            model_fallback_attempt=fallback_result.fallback_attempt,
+            model_fallback_from_model=fallback_result.fallback_from_model,
         )
         if degradation_outcome.triggered:
             assert degradation_outcome.original_model is not None
@@ -991,5 +1114,7 @@ async def create_chat_completion(
             status=exc.code,
             success=False,
             self_hosted_provider_id=self_hosted_provider_id_for_log,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
         )
         raise

@@ -141,9 +141,13 @@ async def create_personal_key(
     team_id: uuid.UUID,
     name: str,
     expires_at: datetime | None,
+    device_label: str | None = None,
 ) -> tuple[PersonalApiKey, str]:
     """Create a personal key. Returns `(row, plaintext_secret)` - the
     plaintext exists only in this return value, never persisted or logged.
+    `device_label` (added by `0047`) is only ever passed by the CLI-sync
+    device-code approval route - every other caller (self-service portal,
+    team-lead-assisted create) leaves it `None`.
 
     Enforces org_settings' `personal_key_soft_cap` (active keys per owner)
     and `max_self_serve_key_expiration_days` (applied to delegated creates
@@ -151,17 +155,22 @@ async def create_personal_key(
     *authorization* checks; the membership *existence* check below is this
     function's own (security review M-2): the owner's `TeamMembership` row
     is locked (`SELECT ... FOR UPDATE`) through the caller's commit, so a
-    concurrent membership removal serializes against this create - removal
-    either wins first (this re-check then 404s, no orphaned key) or blocks
-    until the key exists and 409s per ADR-4's active-key gate. Mirrors
+    concurrent removal serializes against this create - whichever
+    transaction wins the lock, the loser sees a consistent state (a
+    removal that lands first makes this 404; a create that lands first
+    just succeeds - `0049`'s soft delete no longer blocks removal on
+    active keys existing, so there's no ADR-4 409 case left here). Mirrors
     `team_budget.py`'s locking discipline. Flushes, does not commit.
     """
+    # `removed_at IS NULL` (added by `0049`) - a removed member must not be
+    # able to mint a NEW key for a team they no longer belong to.
     membership_id = (
         await session.execute(
             select(TeamMembership.id)
             .where(
                 TeamMembership.team_id == team_id,
                 TeamMembership.user_id == owner_user_id,
+                TeamMembership.removed_at.is_(None),
             )
             .with_for_update()
         )
@@ -203,6 +212,7 @@ async def create_personal_key(
         key_prefix=key_prefix,
         secret_hash=hash_secret(secret),
         expires_at=expires_at,
+        device_label=device_label,
     )
     session.add(row)
     await session.flush()

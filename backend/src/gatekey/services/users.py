@@ -14,6 +14,8 @@ function's docstring.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -21,11 +23,59 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.models.service_account_key import ServiceAccountKey
+from gatekey.db.models.team import Team
+from gatekey.db.models.team_membership import TeamMembership
 from gatekey.db.models.user import User
 
 
 class UserNotFoundError(Exception):
     """Raised where a caller needs a clean not-found signal distinct from `None`."""
+
+
+@dataclass(frozen=True)
+class ActiveTeamMembership:
+    team_id: uuid.UUID
+    team_name: str
+    budget_usd: Decimal | None
+    current_spend_usd: Decimal
+
+
+async def get_active_team_memberships(
+    session: AsyncSession, user_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, list[ActiveTeamMembership]]:
+    """Bulk-fetch each id's active (`removed_at IS NULL`) `TeamMembership`
+    rows, joined for the team name - one query for any number of users, so
+    `list_users_endpoint` doesn't pay an N+1. Used to populate
+    `UserResponse.team_memberships` (see that field's docstring): the admin
+    console needs this to know whether the legacy `User.budget_usd` field it
+    might be about to edit is actually live for a given user, or dead (Phase
+    2, A6 - see `db/models/user.py`'s docstring)."""
+    if not user_ids:
+        return {}
+    stmt = (
+        select(
+            TeamMembership.user_id,
+            TeamMembership.team_id,
+            Team.name,
+            TeamMembership.budget_usd,
+            TeamMembership.current_spend_usd,
+        )
+        .join(Team, Team.id == TeamMembership.team_id)
+        .where(TeamMembership.user_id.in_(user_ids), TeamMembership.removed_at.is_(None))
+    )
+    result: dict[uuid.UUID, list[ActiveTeamMembership]] = {}
+    for user_id, team_id, team_name, budget_usd, current_spend_usd in (
+        await session.execute(stmt)
+    ).all():
+        result.setdefault(user_id, []).append(
+            ActiveTeamMembership(
+                team_id=team_id,
+                team_name=team_name,
+                budget_usd=budget_usd,
+                current_spend_usd=current_spend_usd,
+            )
+        )
+    return result
 
 
 async def create_user(

@@ -74,7 +74,7 @@ async def submit_join_request_endpoint(
     the partial unique index, mapped in `submit_join_request`)."""
     row = await submit_join_request(
         session,
-        requester_user_id=ctx.user_id,
+        requester_user_id=ctx.require_user_id(),
         requester_name=payload.full_name,
         team_id=payload.team_id,
     )
@@ -103,7 +103,7 @@ async def onboarding_status_endpoint(
 ) -> JoinRequestResponse:
     """The caller's current/most-recent request (AC6.10's holding screen) -
     404 if they have never submitted one."""
-    latest = await get_latest_join_request(session, ctx.user_id)
+    latest = await get_latest_join_request(session, ctx.require_user_id())
     if latest is None:
         raise NotFoundError("No join request found for the current user.")
     row, team_name = latest

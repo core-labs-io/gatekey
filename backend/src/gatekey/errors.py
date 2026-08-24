@@ -253,16 +253,23 @@ class ModelDeniedError(GatekeyError):
         self,
         model: str,
         *,
-        blocking_layer: Literal["org", "team", "content_classification"] = "org",
+        blocking_layer: Literal["org", "team", "member", "content_classification"] = "org",
     ) -> None:
         # Phase 2 (BD-13); Phase 3 (BD-6) adds the content_classification
-        # branch (AC4.1) - the message names the blocking layer so the
-        # caller/frontend can render plain language per AC3.3 -
-        # `code`/`status_code` are unchanged across all three.
+        # branch (AC4.1); per-team-member narrowing adds the "member" branch
+        # one layer below "team" - the message names the blocking layer so
+        # the caller/frontend can render plain language per AC3.3 -
+        # `code`/`status_code` are unchanged across all four.
         if blocking_layer == "team":
             message = (
                 f"Model '{model}' is permitted by this organization's model access "
                 "policy but excluded by your team's model restriction (team restriction)."
+            )
+        elif blocking_layer == "member":
+            message = (
+                f"Model '{model}' is permitted by your team but not assigned to you "
+                "specifically - ask your team lead to enable it for your account "
+                "(member restriction)."
             )
         elif blocking_layer == "content_classification":
             message = (
@@ -539,6 +546,57 @@ class BudgetExhaustedError(GatekeyError):
         )
         self.budget_usd = budget_usd
         self.current_spend_usd = current_spend_usd
+
+
+class OrgBudgetExhaustedError(GatekeyError):
+    """The ORG-WIDE spend safeguard (added alongside migration `0045`) has
+    been exhausted - distinct from `BudgetExhaustedError` (a single user's
+    own budget) on purpose: these are different situations for the caller.
+    A user hitting their own cap should talk to their team lead; the whole
+    org hitting this one means every team/user is blocked regardless of
+    their individual budgets, and only an org admin can raise the org
+    ceiling or reset the counter (`POST /v1/admin/org-settings/reset-spend`).
+
+    402 Payment Required, same reasoning as `BudgetExhaustedError`.
+    """
+
+    status_code = status.HTTP_402_PAYMENT_REQUIRED
+    code = "org_budget_exhausted"
+
+    def __init__(self, *, budget_usd: Decimal, current_spend_usd: Decimal) -> None:
+        super().__init__(
+            f"The organization has exhausted its org-wide budget of "
+            f"${budget_usd:,.2f} USD (current spend: ${current_spend_usd:,.2f} USD). "
+            "Contact your Gatekey org admin.",
+            extra={
+                "budget_usd": str(budget_usd),
+                "current_spend_usd": str(current_spend_usd),
+            },
+        )
+        self.budget_usd = budget_usd
+        self.current_spend_usd = current_spend_usd
+
+
+class TeamMembershipRemovedError(GatekeyError):
+    """The caller's key resolves to a `(team_id, user_id)` whose
+    `TeamMembership` has been removed (added by migration `0049`, soft-
+    delete) - the same real, reachable outcome that used to be structurally
+    impossible under the old hard-delete-blocked-while-keys-exist guard
+    (ADR-4). Removing a member now takes effect immediately (no separate
+    "revoke their keys first" step) - this is what actually enforces that:
+    the key still authenticates, but every gateway request past that point
+    is rejected here. 403, not 401 - the credential itself is still valid,
+    the caller has simply lost standing on this specific team.
+    """
+
+    status_code = status.HTTP_403_FORBIDDEN
+    code = "team_membership_removed"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "This key's team membership has been removed. Contact your "
+            "team lead or org admin if this is unexpected."
+        )
 
 
 # ---------------------------------------------------------------------------

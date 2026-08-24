@@ -21,7 +21,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from gatekey.constants import DEFAULT_ORG_ID
 from gatekey.db.models.shadow_ai_ingest_event import ShadowAiIngestEvent

@@ -16,15 +16,44 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.api.deps import require_admin, require_role
-from gatekey.db.models.user import UserOrgRole
+from gatekey.db.models.user import User, UserOrgRole
 from gatekey.db.session import get_db_session
 from gatekey.errors import GatekeyError, NotFoundError
-from gatekey.schemas.user import UserCreateRequest, UserResponse, UserUpdateRequest
+from gatekey.schemas.user import TeamMembershipSummary, UserCreateRequest, UserResponse, UserUpdateRequest
 from gatekey.services.audit import write_audit_entry
 from gatekey.services.sessions import SessionContext
-from gatekey.services.users import create_user, delete_user, get_user, list_users, update_user
+from gatekey.services.users import (
+    ActiveTeamMembership,
+    create_user,
+    delete_user,
+    get_active_team_memberships,
+    get_user,
+    list_users,
+    update_user,
+)
 
 router = APIRouter(prefix="/v1/admin/users", tags=["admin", "users"], dependencies=[Depends(require_admin)])
+
+
+def _to_user_response(row: User, memberships: list[ActiveTeamMembership]) -> UserResponse:
+    return UserResponse(
+        id=row.id,
+        name=row.name,
+        budget_usd=row.budget_usd,
+        current_spend_usd=row.current_spend_usd,
+        org_role=row.org_role.value if row.org_role is not None else None,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        team_memberships=[
+            TeamMembershipSummary(
+                team_id=m.team_id,
+                team_name=m.team_name,
+                budget_usd=m.budget_usd,
+                current_spend_usd=m.current_spend_usd,
+            )
+            for m in memberships
+        ],
+    )
 
 
 @router.post("", response_model=UserResponse, status_code=201)
@@ -32,12 +61,14 @@ async def create_user_endpoint(
     payload: UserCreateRequest, session: AsyncSession = Depends(get_db_session)
 ) -> UserResponse:
     row = await create_user(session, name=payload.name, budget_usd=payload.budget_usd)
-    return UserResponse.model_validate(row)
+    return _to_user_response(row, [])  # freshly created - cannot have a membership yet
 
 
 @router.get("", response_model=list[UserResponse])
 async def list_users_endpoint(session: AsyncSession = Depends(get_db_session)) -> list[UserResponse]:
-    return [UserResponse.model_validate(r) for r in await list_users(session)]
+    rows = await list_users(session)
+    memberships_by_user = await get_active_team_memberships(session, [r.id for r in rows])
+    return [_to_user_response(r, memberships_by_user.get(r.id, [])) for r in rows]
 
 
 @router.get("/{user_id}", response_model=UserResponse)
@@ -47,7 +78,8 @@ async def get_user_endpoint(
     row = await get_user(session, user_id)
     if row is None:
         raise NotFoundError(f"No user found with id '{user_id}'.")
-    return UserResponse.model_validate(row)
+    memberships_by_user = await get_active_team_memberships(session, [user_id])
+    return _to_user_response(row, memberships_by_user.get(user_id, []))
 
 
 @router.patch("/{user_id}", response_model=UserResponse)
@@ -59,7 +91,8 @@ async def update_user_endpoint(
     row = await update_user(session, user_id, payload.model_dump(exclude_unset=True))
     if row is None:
         raise NotFoundError(f"No user found with id '{user_id}'.")
-    return UserResponse.model_validate(row)
+    memberships_by_user = await get_active_team_memberships(session, [user_id])
+    return _to_user_response(row, memberships_by_user.get(user_id, []))
 
 
 class OrgRoleUpdateRequest(BaseModel):
