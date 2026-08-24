@@ -18,7 +18,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install "ruff>=0.5,<1.0"
+      # Pinned exact, not a floating range: ruff 0.16 resolves a much
+      # broader default rule set for this project's config than 0.15.x
+      # does (confirmed by reproducing both in a clean environment) -
+      # an unpinned range silently breaks this job on ruff's next release
+      # with zero code changes involved. Keep in lockstep with
+      # backend/pyproject.toml's `dev` extra.
+      - run: pip install "ruff==0.15.21"
       - run: ruff check src
         working-directory: backend
 
