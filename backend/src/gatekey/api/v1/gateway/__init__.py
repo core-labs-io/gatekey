@@ -13,10 +13,14 @@ from fastapi import APIRouter
 from gatekey.api.v1.gateway.chat import router as _chat_router
 from gatekey.api.v1.gateway.completions import router as _completions_router
 from gatekey.api.v1.gateway.embeddings import router as _embeddings_router
+from gatekey.api.v1.gateway.models import router as _models_router
 
 router = APIRouter()
 router.include_router(_chat_router)
 router.include_router(_completions_router)
 router.include_router(_embeddings_router)
+# Tier 4 (ops/DX polish): OpenAI-compatible model discovery for the same
+# gateway credentials the inference routes accept.
+router.include_router(_models_router)
 
 __all__ = ["router"]

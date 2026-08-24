@@ -556,8 +556,13 @@ async def get_shadow_ai_report(
     range_days = max((resolved_until - resolved_since).total_seconds() / 86400.0, 1.0)
 
     def _team_scope_filter():
+        # `removed_at IS NULL` (added by `0049`) - scope to CURRENT members
+        # of these teams, matching a team lead's live "my team" view, not
+        # anyone who has ever belonged to it.
         return ShadowAiIngestEvent.matched_user_id.in_(
-            select(TeamMembership.user_id).where(TeamMembership.team_id.in_(team_ids))
+            select(TeamMembership.user_id).where(
+                TeamMembership.team_id.in_(team_ids), TeamMembership.removed_at.is_(None)
+            )
         )
 
     filters = [
@@ -585,9 +590,12 @@ async def get_shadow_ai_report(
     )
     agg_rows = (await session.execute(agg_stmt)).all()
 
-    hostname_labels = dict(
-        (await session.execute(select(KnownAiToolHostname.hostname, KnownAiToolHostname.tool_label))).all()
-    )
+    hostname_labels: dict[str, str] = {
+        hostname: tool_label
+        for hostname, tool_label in (
+            await session.execute(select(KnownAiToolHostname.hostname, KnownAiToolHostname.tool_label))
+        ).all()
+    }
 
     violator_cutoff = datetime.now(timezone.utc) - timedelta(days=_REPEAT_VIOLATOR_WINDOW_DAYS)
     violator_filters = [
@@ -708,6 +716,11 @@ class ShadowAiEmailNotifier:
             from email.message import EmailMessage
 
             settings = self._settings
+            # Guaranteed by the `smtp_enabled()` check above (`self.
+            # GATEKEY_SMTP_HOST is not None`) - mypy can't narrow across
+            # the `asyncio.to_thread` closure boundary into this nested
+            # function.
+            assert settings.GATEKEY_SMTP_HOST is not None
             message = EmailMessage()
             message["Subject"] = "Gatekey Shadow AI Discovery: unsanctioned AI tool usage detected"
             message["From"] = settings.GATEKEY_SMTP_FROM_ADDRESS
@@ -734,13 +747,20 @@ async def _load_shadow_ai_recipients(
     user = (await session.execute(select(User).where(User.id == matched_user_id))).scalar_one_or_none()
     user_email = user.sso_email if user is not None else None
 
+    # `removed_at IS NULL` (added by `0049`) on both sides - the recipient
+    # must be a CURRENT team_lead, of a team the flagged user is CURRENTLY
+    # on (same "live, not historical" scoping as `_load_recipients`).
     leads_stmt = (
         select(User.sso_email)
         .join(TeamMembership, TeamMembership.user_id == User.id)
         .where(
             TeamMembership.role == TeamRole.TEAM_LEAD,
+            TeamMembership.removed_at.is_(None),
             TeamMembership.team_id.in_(
-                select(TeamMembership.team_id).where(TeamMembership.user_id == matched_user_id)
+                select(TeamMembership.team_id).where(
+                    TeamMembership.user_id == matched_user_id,
+                    TeamMembership.removed_at.is_(None),
+                )
             ),
         )
         .distinct()
@@ -788,13 +808,14 @@ async def deliver_shadow_ai_enforcement(app: "FastAPI", *, event_ids: list[uuid.
             if not events:
                 return
 
-            hostname_labels = dict(
-                (
+            hostname_labels: dict[str, str] = {
+                hostname: tool_label
+                for hostname, tool_label in (
                     await session.execute(
                         select(KnownAiToolHostname.hostname, KnownAiToolHostname.tool_label)
                     )
                 ).all()
-            )
+            }
 
             # Decrypted once per delivery batch (the URL is constant across
             # every event in this batch) - mirrors `services.notifiers.
@@ -804,6 +825,12 @@ async def deliver_shadow_ai_enforcement(app: "FastAPI", *, event_ids: list[uuid.
             # docstring).
             decrypted_webhook_url: str | None = None
             if config.enforcement_mode == "webhook" and config.webhook_ciphertext is not None:
+                # `webhook_ciphertext`/`webhook_nonce`/`webhook_auth_tag` are
+                # written together as one envelope (never independently) -
+                # see `db/models/shadow_ai_ingest_config.py`'s module
+                # docstring - so ciphertext non-NULL guarantees these are too.
+                assert config.webhook_nonce is not None
+                assert config.webhook_auth_tag is not None
                 try:
                     decrypted_webhook_url = decrypt_secret(
                         config.webhook_ciphertext,

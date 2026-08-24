@@ -39,6 +39,7 @@ from gatekey.api.deps import (
     get_dlp_analyzer_engine,
     get_key_provider,
     get_model_policy_cache,
+    get_member_model_policy_cache,
     get_provider_http_client,
     get_rate_limit_cache,
     get_residency_rule_cache,
@@ -53,8 +54,8 @@ from gatekey.api.v1.gateway.common import (
     LatencyTimer,
     build_cache_headers,
     build_failover_headers,
+    build_model_fallback_headers,
     build_rate_limit_headers,
-    call_provider_with_failover,
     check_access_schedule,
     check_budget_available,
     check_content_classification,
@@ -62,6 +63,7 @@ from gatekey.api.v1.gateway.common import (
     check_rate_limit,
     check_residency,
     check_response_cache,
+    dispatch_with_model_fallback,
     log_gateway_request,
     new_request_id,
     record_usage_charge,
@@ -70,19 +72,24 @@ from gatekey.api.v1.gateway.common import (
     validate_idempotency_key,
     write_response_cache,
 )
-from gatekey.errors import GatekeyError, ProviderUpstreamError
+from gatekey.errors import GATEWAY_ERROR_RESPONSES, GatekeyError, ProviderUpstreamError
 from gatekey.errors import UnsupportedRequestError as HttpUnsupportedRequestError
 from gatekey.providers import openai as openai_provider
 from gatekey.providers import vertex_ai as vertex_provider
 from gatekey.providers.base import ProviderCallError
-from gatekey.providers.model_registry import ModelCapability
+from gatekey.providers.model_registry import ModelCapability, ModelRoute
 from gatekey.providers.pricing import PricingEntryMissingError
 from gatekey.providers.vertex_ai import VertexAITokenCache
 from gatekey.schemas.chat import EmbeddingsRequest, EmbeddingsResponse
 from gatekey.services.access_schedules import AccessScheduleCache
 from gatekey.services.custom_models import CustomModelRouteCache, compute_custom_model_cost
 from gatekey.services.encryption import KeyProvider
-from gatekey.services.model_policy import ContentAwareRuleCache, ModelPolicyCache, TeamModelPolicyCache
+from gatekey.services.model_policy import (
+    ContentAwareRuleCache,
+    MemberModelPolicyCache,
+    ModelPolicyCache,
+    TeamModelPolicyCache,
+)
 from gatekey.services.provider_key_health import TeamFailoverOverrideCache
 from gatekey.services.proxy_keys import ApiKeyCredential, ServiceAccountCredential
 from gatekey.services.rate_limit import RateLimitCache
@@ -91,7 +98,7 @@ from gatekey.services.response_cache import CachingSettingsCache, ResponseCache
 from gatekey.services.shared_state import SharedStateStore
 from gatekey.services.usage_logs import record_usage_log
 
-router = APIRouter(tags=["gateway"])
+router = APIRouter(tags=["gateway"], responses=GATEWAY_ERROR_RESPONSES)
 
 _ENDPOINT = "/v1/embeddings"
 
@@ -109,6 +116,7 @@ async def create_embeddings(
     token_cache: VertexAITokenCache = Depends(get_vertex_token_cache),
     cache: ModelPolicyCache = Depends(get_model_policy_cache),
     team_cache: TeamModelPolicyCache = Depends(get_team_model_policy_cache),
+    member_cache: MemberModelPolicyCache = Depends(get_member_model_policy_cache),
     residency_cache: ResidencyRuleCache = Depends(get_residency_rule_cache),
     content_aware_cache: ContentAwareRuleCache = Depends(get_content_aware_rule_cache),
     dlp_engine: AnalyzerEngine = Depends(get_dlp_analyzer_engine),
@@ -128,7 +136,10 @@ async def create_embeddings(
     )
     personal_api_key_id = ctx.credential_id if ctx.credential_type == "personal" else None
     timer = LatencyTimer()
-    request_id = new_request_id()
+    # Prefer the middleware-assigned correlation id (also returned to the
+    # caller as the X-Request-ID header) so the header, usage_logs row, and
+    # every log line share ONE id; fall back for bare-app unit fixtures.
+    request_id = getattr(request.state, "request_id", None) or new_request_id()
     idempotency_key = validate_idempotency_key(idempotency_key)
     provider_for_log: str | None = None
     response_cache = ResponseCache(shared_state_store)
@@ -140,6 +151,9 @@ async def create_embeddings(
         # resolved once here and threaded into every synchronous audit
         # write below.
         source_ip = get_source_ip(request, request.app.state.settings)
+        # Request provenance for usage_logs (migration `0047`) - see
+        # chat.py's identical note.
+        client_user_agent = request.headers.get("user-agent")
         await check_access_schedule(
             session, ctx, cache=access_schedule_cache, source_ip=source_ip
         )
@@ -158,13 +172,7 @@ async def create_embeddings(
         # positional-argument hazard this avoids.
         route = resolve_route(body.model, custom_model_cache=custom_model_cache)
         provider_for_log = route.provider
-        # CMR-4: captured ONCE here - the sole discriminator is `route.
-        # custom_model_id is not None` (never `route.provider`, per the
-        # technical design doc section 2.2/8.1 flag 4).
-        custom_model_route_entry = (
-            custom_model_cache.get(body.model) if route.custom_model_id is not None else None
-        )
-        check_model_policy(body.model, cache, team_cache, ctx.team_id)
+        check_model_policy(body.model, cache, team_cache, ctx.team_id, member_cache, ctx.user_id)
         if route.capability != ModelCapability.EMBEDDINGS:
             raise HttpUnsupportedRequestError(
                 f"Model '{body.model}' does not support embeddings "
@@ -219,6 +227,8 @@ async def create_embeddings(
                 status="ok",
                 success=True,
                 cache_hit=True,
+                source_ip=source_ip,
+                client_user_agent=client_user_agent,
             )
             for key, value in response_headers.items():
                 response.headers[key] = value
@@ -264,48 +274,77 @@ async def create_embeddings(
         await check_budget_available(session, ctx.user_id, team_id=ctx.team_id)
         timer.mark("pre_dispatch")
 
-        async def _call(credential: Any) -> EmbeddingsResponse:
-            if route.provider == "openai":
-                openai_credential = cast(ApiKeyCredential, credential)
-                return await openai_provider.create_embeddings(
-                    http_client, route.native_model_id, body, openai_credential
+        def _build_call(candidate_route: ModelRoute) -> Any:
+            async def _call(credential: Any) -> EmbeddingsResponse:
+                if candidate_route.provider == "openai":
+                    openai_credential = cast(ApiKeyCredential, credential)
+                    return await openai_provider.create_embeddings(
+                        http_client, candidate_route.native_model_id, body, openai_credential
+                    )
+                if candidate_route.provider == "vertex_ai":
+                    vertex_credential = cast(ServiceAccountCredential, credential)
+                    return await vertex_provider.create_embeddings(
+                        http_client, candidate_route.native_model_id, body, vertex_credential, token_cache
+                    )
+                # Unreachable in practice - see module docstring: no
+                # Anthropic model is ever registered with EMBEDDINGS
+                # capability, and the registry only knows these three
+                # providers. Fail loudly rather than silently if that ever
+                # changes without updating this dispatch table.
+                raise HttpUnsupportedRequestError(
+                    f"Provider '{candidate_route.provider}' does not support embeddings in this phase."
                 )
-            if route.provider == "vertex_ai":
-                vertex_credential = cast(ServiceAccountCredential, credential)
-                return await vertex_provider.create_embeddings(
-                    http_client, route.native_model_id, body, vertex_credential, token_cache
-                )
-            # Unreachable in practice - see module docstring: no Anthropic
-            # model is ever registered with EMBEDDINGS capability, and the
-            # registry only knows these three providers. Fail loudly rather
-            # than silently if that ever changes without updating this
-            # dispatch table.
-            raise HttpUnsupportedRequestError(
-                f"Provider '{route.provider}' does not support embeddings in this phase."
-            )
 
+            return _call
+
+        # Model Catalog + Cross-Provider Fallback Chains (Part B): wraps the
+        # existing `call_provider_with_failover()` dispatch - see `common.
+        # dispatch_with_model_fallback()`'s docstring. `self_hosted_cache=
+        # None` mirrors this route's existing `resolve_route()` call above
+        # (self-hosted is chat-completions only, AC5.5.4 - unaffected by
+        # this feature).
         try:
-            failover = await call_provider_with_failover(
+            fallback_result = await dispatch_with_model_fallback(
                 session,
                 request.app,
-                route=route,
-                org_id=ctx.org_id,
-                team_id=ctx.team_id,
+                ctx,
+                original_route=route,
+                original_model=body.model,
+                custom_model_cache=custom_model_cache,
+                self_hosted_cache=None,
+                model_policy_cache=cache,
+                team_model_policy_cache=team_cache,
+                member_model_policy_cache=member_cache,
+                content_aware_cache=content_aware_cache,
+                residency_cache=residency_cache,
+                category_findings=dlp_result.category_findings,
+                source_ip=source_ip,
                 request_id=request_id,
                 key_provider=key_provider,
                 health_store=shared_state_store,
                 team_override_cache=team_override_cache,
-                call_fn=_call,
+                build_call_fn=_build_call,
             )
         except ProviderCallError as exc:
             raise ProviderUpstreamError(str(exc), upstream_status_code=exc.status_code) from None
+        failover = fallback_result.failover
+        effective_route: ModelRoute = fallback_result.served_route
+        effective_model = fallback_result.served_model
+        # CMR-4: re-derived against the WINNING hop (`effective_route`/
+        # `effective_model`), never the originally-requested model - see
+        # `ModelFallbackResult`'s docstring ("to be used for every
+        # downstream step ... from this point on").
+        custom_model_route_entry = (
+            custom_model_cache.get(effective_model) if effective_route.custom_model_id is not None else None
+        )
         response_obj = failover.result
         timer.mark("provider_response_received")
         response_headers.update(build_failover_headers(failover))
+        response_headers.update(build_model_fallback_headers(fallback_result))
 
         cost_usd: Decimal | None = None
         precomputed_cost_usd: Decimal | None = None
-        if route.custom_model_id is not None and custom_model_route_entry is not None:
+        if effective_route.custom_model_id is not None and custom_model_route_entry is not None:
             # CMR-4 (Custom Model Registry): real per-token pricing from the
             # admin-entered rates - `completion_tokens=None` selects the
             # embeddings formula (no output-token term), mirroring `record_
@@ -320,7 +359,7 @@ async def create_embeddings(
                 session,
                 user_id=ctx.user_id,
                 team_id=ctx.team_id,
-                model=body.model,
+                model=effective_model,
                 prompt_tokens=response_obj.usage.prompt_tokens,
                 completion_tokens=None,
                 precomputed_cost_usd=precomputed_cost_usd,
@@ -337,8 +376,8 @@ async def create_embeddings(
                 session,
                 request_id=request_id,
                 endpoint=_ENDPOINT,
-                provider=route.provider,
-                model=body.model,
+                provider=effective_route.provider,
+                model=effective_model,
                 user_id=ctx.user_id,
                 service_account_key_id=service_account_key_id,
                 team_id=ctx.team_id,
@@ -352,10 +391,18 @@ async def create_embeddings(
                 success=False,
                 failover_attempt=failover.attempt,
                 failover_key_id=failover.used_key_id,
+                model_fallback_attempt=fallback_result.fallback_attempt,
+                model_fallback_from_model=fallback_result.fallback_from_model,
+                source_ip=source_ip,
+                client_user_agent=client_user_agent,
             )
             raise
 
-        # Phase 4 (AC4.3.7): write-through cache population.
+        # Phase 4 (AC4.3.7): write-through cache population. Model Catalog
+        # (Part B): NEVER caches a fallback-served response under the
+        # ORIGINALLY REQUESTED model's cache key - see `route`'s use here
+        # (unchanged, always the original route/cache key) plus the added
+        # `or fallback_result.fallback_attempt > 0` skip-write condition.
         await write_response_cache(
             ctx,
             route,
@@ -364,15 +411,15 @@ async def create_embeddings(
             response_body=response_obj.model_dump(mode="json"),
             input_tokens=response_obj.usage.prompt_tokens,
             output_tokens=0,
-            skip_write=dlp_result.redacted_texts is not None,
+            skip_write=dlp_result.redacted_texts is not None or fallback_result.fallback_attempt > 0,
         )
 
         timer.mark("flush_complete")
         log_gateway_request(
             request_id=request_id,
             endpoint=_ENDPOINT,
-            provider=route.provider,
-            model=body.model,
+            provider=effective_route.provider,
+            model=effective_model,
             stream=False,
             status="ok",
             timer=timer,
@@ -382,8 +429,8 @@ async def create_embeddings(
             session,
             request_id=request_id,
             endpoint=_ENDPOINT,
-            provider=route.provider,
-            model=body.model,
+            provider=effective_route.provider,
+            model=effective_model,
             user_id=ctx.user_id,
             service_account_key_id=service_account_key_id,
             team_id=ctx.team_id,
@@ -398,6 +445,10 @@ async def create_embeddings(
             success=True,
             failover_attempt=failover.attempt,
             failover_key_id=failover.used_key_id,
+            model_fallback_attempt=fallback_result.fallback_attempt,
+            model_fallback_from_model=fallback_result.fallback_from_model,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
         )
         for key, value in response_headers.items():
             response.headers[key] = value
@@ -421,5 +472,7 @@ async def create_embeddings(
             stream=False,
             status=exc.code,
             success=False,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
         )
         raise

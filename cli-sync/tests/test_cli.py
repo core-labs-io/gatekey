@@ -124,3 +124,39 @@ def test_exec_does_not_retry_a_freshly_fetched_key_that_fails(monkeypatch: pytes
 
     assert exc_info.value.code == 1
     assert len(fetch_calls) == 1  # never retried a freshly-fetched failure
+
+
+# --- base-url resolution order (flag > env var > config > default) --------
+
+
+def _ns(base_url: str | None = None):
+    import argparse
+
+    return argparse.Namespace(base_url=base_url)
+
+
+def test_resolve_base_url_flag_wins_over_env_and_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(cli.BASE_URL_ENV_VAR, "https://env.example.com")
+    cli._save_config({"base_url": "https://config.example.com"})
+    assert cli._resolve_base_url(_ns("https://flag.example.com")) == "https://flag.example.com"
+
+
+def test_resolve_base_url_env_var_wins_over_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(cli.BASE_URL_ENV_VAR, "https://env.example.com")
+    cli._save_config({"base_url": "https://config.example.com"})
+    assert cli._resolve_base_url(_ns()) == "https://env.example.com"
+
+
+def test_resolve_base_url_config_then_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(cli.BASE_URL_ENV_VAR, raising=False)
+    cli._save_config({"base_url": "https://config.example.com"})
+    assert cli._resolve_base_url(_ns()) == "https://config.example.com"
+    cli.CONFIG_FILE.unlink()
+    assert cli._resolve_base_url(_ns()) == cli.DEFAULT_BASE_URL
+
+
+def test_resolve_base_url_ignores_empty_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(cli.BASE_URL_ENV_VAR, "")
+    assert cli._resolve_base_url(_ns()) == cli.DEFAULT_BASE_URL

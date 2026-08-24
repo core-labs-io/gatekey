@@ -5,8 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gatekey-sync"
 version = "0.1.0"
-description = "Local credential-sync helper for Gatekey personal keys (Phase 3, spec section 3.7a) - a thin device-code-authorized CLI wrapper that keeps a rotated personal key on disk/in-env for your AI CLI, without a persistent background process."
+description = "Local credential-sync helper for Gatekey personal API keys - a thin device-code-authorized CLI wrapper that keeps a rotated personal key on disk/in-env for your AI CLI, without a persistent background process."
+readme = "README.md"
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
+keywords = ["gatekey", "ai-gateway", "credentials", "api-keys"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Utilities",
+]
+
 # Kept deliberately minimal (ladder rung 5/3): `keyring` is the one
 # non-negotiable dependency (cross-platform OS credential-store
 # abstraction - no hand-rolled per-OS integration, per the design's own
@@ -23,6 +40,10 @@ dependencies = [
     "keyring>=24",
     "httpx>=0.25",
 ]
+
+[project.urls]
+Homepage = "https://github.com/core-labs-io/gatekey"
+Changelog = "https://github.com/core-labs-io/gatekey/blob/main/CHANGELOG.md"
 
 [project.scripts]
 gatekey-sync = "gatekey_sync.cli:main"

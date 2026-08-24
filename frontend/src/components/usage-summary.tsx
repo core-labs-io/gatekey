@@ -7,6 +7,7 @@
  * Dashboard, with the config affordances stripped (read-only by design).
  */
 
+import { SpendOverTimePanel } from "@/components/charts";
 import { Badge, BudgetBar, DataTable, StatTile, StatTileSkeleton } from "@/components/ui";
 import type { UsageRange, UsageSummaryResponse } from "@/lib/api";
 
@@ -47,9 +48,6 @@ export function UsageSummaryPanels({
   loading: boolean;
   showUsers?: boolean;
 }) {
-  const maxDaySpend = summary
-    ? Math.max(1e-9, ...summary.spend_by_day.map((d) => Number(d.spend_usd)))
-    : 1;
   const maxModelSpend = summary
     ? Math.max(1e-9, ...summary.spend_by_model.map((m) => Number(m.spend_usd)))
     : 1;
@@ -82,21 +80,14 @@ export function UsageSummaryPanels({
           <div className="panel-title">Spend by day</div>
           {loading ? (
             <div className="skeleton skeleton-text" style={{ height: 120 }} />
-          ) : summary && summary.spend_by_day.length > 0 ? (
-            summary.spend_by_day.map((d) => (
-              <div className="bar-row" key={d.date}>
-                <span className="bar-label">{d.date}</span>
-                <span className="bar-track">
-                  <span
-                    className="bar-fill"
-                    style={{ width: `${(Number(d.spend_usd) / maxDaySpend) * 100}%` }}
-                  />
-                </span>
-                <span className="bar-value">${Number(d.spend_usd).toFixed(2)}</span>
-              </div>
-            ))
           ) : (
-            <p className="text-muted">No spend data for this range.</p>
+            <SpendOverTimePanel
+              label="Spend by day"
+              points={(summary?.spend_by_day ?? []).map((d) => ({
+                date: d.date,
+                value: Number(d.spend_usd),
+              }))}
+            />
           )}
         </div>
         <div className="panel">

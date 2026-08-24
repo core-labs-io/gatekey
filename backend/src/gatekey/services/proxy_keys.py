@@ -142,10 +142,21 @@ class ProviderCredential(ABC):
 
 @dataclass(frozen=True, repr=False)
 class ApiKeyCredential(ProviderCredential):
-    """Decrypted bearer-style API key credential (openai, anthropic, openrouter)."""
+    """Decrypted bearer-style API key credential (openai, anthropic, openrouter).
+
+    `trusted_provider_slugs` is openrouter-only (always `()` for
+    openai/anthropic) - the admin-configured, non-secret list from
+    `ProviderKey.key_metadata["trusted_provider_slugs"]` (see
+    `schemas.provider_key.OpenRouterKeyRequest`). Carried on the credential,
+    not fetched separately, so `providers.openrouter.py`'s outbound call
+    functions can apply it unconditionally without a second DB round trip -
+    same "non-secret routing data travels with the credential" precedent
+    `ServiceAccountCredential.project_id`/`.location` and `OllamaCredential.
+    base_url` already establish."""
 
     provider: str
     api_key: str
+    trusted_provider_slugs: tuple[str, ...] = ()
 
     def to_secret_payload(self) -> dict[str, Any]:
         return {"api_key": self.api_key}
@@ -224,7 +235,12 @@ def _credential_from_row(row: ProviderKey, provider: str, *, key_provider: KeyPr
             api_key = json.loads(plaintext)
             if not isinstance(api_key, str):
                 raise TypeError("decoded api_key credential was not a string")
-            return ApiKeyCredential(provider=provider, api_key=api_key)
+            trusted_provider_slugs: tuple[str, ...] = ()
+            if provider == "openrouter":
+                trusted_provider_slugs = tuple(row.key_metadata.get("trusted_provider_slugs", []))
+            return ApiKeyCredential(
+                provider=provider, api_key=api_key, trusted_provider_slugs=trusted_provider_slugs
+            )
 
         if provider in _SERVICE_ACCOUNT_PROVIDERS:
             service_account_json = json.loads(plaintext)

@@ -72,6 +72,18 @@ class UserUpdateRequest(BaseModel):
         return value
 
 
+class TeamMembershipSummary(BaseModel):
+    """One active `TeamMembership` a `UserResponse` belongs to - see that
+    field's docstring below for why this exists."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    team_id: UUID
+    team_name: str
+    budget_usd: Decimal | None
+    current_spend_usd: Decimal
+
+
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -82,3 +94,11 @@ class UserResponse(BaseModel):
     org_role: Literal["org_admin", "auditor"] | None = None
     created_at: datetime
     updated_at: datetime
+    # Not an ORM relationship - populated explicitly by the endpoint (see
+    # `services.users.get_active_team_memberships`). `budget_usd`/
+    # `current_spend_usd` above are dead once this list is non-empty (Phase
+    # 2, A6 - see `db/models/user.py`'s docstring): every team-attributed
+    # request resolves budget against the matching entry here instead. The
+    # admin console's "Edit user" form uses this to warn instead of quietly
+    # accepting an edit that will never take effect.
+    team_memberships: list[TeamMembershipSummary] = []

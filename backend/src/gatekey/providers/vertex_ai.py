@@ -140,8 +140,8 @@ from gatekey.schemas.chat import (
     ChatCompletionChunkDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatCompletionResponseMessage,
     ChatCompletionUsage,
-    ChatMessage,
     EmbeddingItem,
     EmbeddingsRequest,
     EmbeddingsResponse,
@@ -494,7 +494,7 @@ def _translate_chat_response(native_model_id: str, data: dict[str, Any]) -> Chat
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(role="assistant", content=text),
+                message=ChatCompletionResponseMessage(role="assistant", content=text),
                 finish_reason=finish_reason,
             )
         ],

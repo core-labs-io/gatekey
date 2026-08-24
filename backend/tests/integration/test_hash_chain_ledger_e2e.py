@@ -135,7 +135,7 @@ async def test_verify_reports_not_enabled_before_chain_is_ever_turned_on(
 async def test_enabling_chain_backfills_pre_existing_history_and_verify_is_intact(
     client, auth_headers: dict[str, str], sf: async_sessionmaker
 ) -> None:
-    pre_existing_ids = await _seed_unchained_audit_entries(sf, 5)
+    await _seed_unchained_audit_entries(sf, 5)
 
     await _enable_chain(client, auth_headers)
 

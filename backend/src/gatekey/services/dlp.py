@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 
 import presidio_analyzer.analyzer_engine as _presidio_analyzer_engine_module
 import presidio_analyzer.pattern_recognizer as _presidio_pattern_recognizer_module
+import tldextract
 from presidio_analyzer import AnalyzerEngine, EntityRecognizer, Pattern, PatternRecognizer, RecognizerRegistry
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_analyzer.predefined_recognizers import (
@@ -221,6 +222,38 @@ _ACTION_SEVERITY: dict[DlpAction, int] = {DlpAction.LOG: 0, DlpAction.REDACT: 1,
 # at call time, not at their own import time.
 _presidio_pattern_recognizer_module.REGEX_TIMEOUT_SECONDS = 2
 _presidio_analyzer_engine_module.REGEX_TIMEOUT_SECONDS = 2
+
+# Post-ship fix (found by live verification against a running deployment,
+# not caught by any unit/integration test): `EmailRecognizer.validate_result()`
+# (presidio_analyzer/predefined_recognizers/generic/email_recognizer.py) calls
+# the module-level `tldextract.extract(...)`, which - by tldextract's own
+# default `TLDExtract()` construction - tries to fetch a fresh public-suffix
+# list from `publicsuffix.org` (then a GitHub mirror) over HTTPS the first
+# time it runs in a process, before falling back to its bundled snapshot on
+# failure. That is a real outbound network call from inside the synchronous
+# DLP scan path, directly contradicting this module's own "in-process, no
+# external call" design invariant (module docstring; AC2.1) - confirmed by
+# reproducing it against a live container (a `publicsuffix.org` TLS-handshake
+# attempt, visible in logs, on the first DLP scan of a process's lifetime).
+# In a genuinely air-gapped self-hosted deployment (this product's actual
+# target market - see `00-overview.md`'s "self-hosted first, no phone-home"
+# non-negotiable), the failure mode may not be this environment's fast TLS
+# rejection - it could hang for the connection's full timeout instead.
+#
+# Fix: reconfigure tldextract's shared global default extractor
+# (`tldextract.tldextract.TLD_EXTRACTOR`, which the module-level `extract()`
+# free function looks up by name at call time - not a constructor default,
+# so reassigning it here, before any scan runs, redirects every subsequent
+# call including Presidio's internal one) to `suffix_list_urls=()` - this
+# skips the live-fetch code path entirely and goes straight to tldextract's
+# bundled offline snapshot (`fallback_to_snapshot` stays `True`, its
+# default), which is exactly as correct for TLD/domain validation purposes,
+# just never over the network. Must run before `build_analyzer_engine()` is
+# ever called (module load time, same as the two `REGEX_TIMEOUT_SECONDS`
+# patches above) - a `RecognizerRegistry`/`EmailRecognizer` constructed
+# before this line would already be fine too, since the lookup happens at
+# call time, but there is no reason to race it.
+tldextract.tldextract.TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=())
 
 
 @functools.lru_cache(maxsize=1)

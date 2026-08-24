@@ -34,6 +34,13 @@ never touches a real database or a real provider API:
     happens. Individual tests override these again via the same
     `monkeypatch` fixture where they need to exercise non-default budget
     behavior (e.g. an exhausted budget).
+  - Org-wide budget safeguard (added alongside migration `0045`):
+    `services.budget.get_org_budget_state`/`record_org_usage_charge` are
+    ALWAYS called now - `check_budget_available()`/`common.record_usage_
+    charge()`'s single shared choke point, unconditionally, regardless of
+    team/legacy path (see those functions' docstrings) - so they need the
+    identical DB-free-default treatment as the per-user pair above, or
+    every gateway unit test in this file would hit the exploding sentinel.
   - Phase 3 (DLP/residency): `services.dlp.load_dlp_policy`/`load_custom_
     patterns`/`get_team_dlp_override` are monkeypatched to DB-free
     "nothing configured" defaults (every detector off, no custom patterns,
@@ -46,30 +53,40 @@ never touches a real database or a real provider API:
   - Phase 4 (Reliability & Cost Efficiency): each gateway route handler
     (`api/v1/gateway/{chat,completions,embeddings}.py`) now calls
     `common.call_provider_with_failover()` instead of the old bare
-    `fetch_credential()` + provider call - and does so via a plain
-    `from ... import call_provider_with_failover`, so it holds its own
-    module-level binding rather than looking it up through `common.` at
-    call time (unlike `budget_service.get_budget_state`/etc above, which
-    genuinely are looked up via module-attribute access and so are
-    patchable at the `..._service` module itself). `call_provider_with_
-    failover()`'s first step, `provider_key_health.select_provider_key()`,
-    does a real `session.execute()` - which would hit the exploding
-    sentinel before a test's own credential fake ever gets a chance to
-    run. `build_authenticated_app` therefore monkeypatches
-    `call_provider_with_failover` directly on each of the three route
-    modules (not on `common`, which not one of them actually reads it
-    from at call time) to a DB-free fake that skips straight to `common.
-    fetch_credential()` (itself unpatched - a thin, zero-I/O wrapper
-    around the module-level `common.get_decrypted_provider_credential`
-    name, which per-test/per-file fakes already monkeypatch, same as
-    before Phase 4) and then invokes `call_fn` once - i.e. byte-for-byte
-    the pre-Phase-4 behavior (now wrapped in a `FailoverCallResult` with
-    `attempt=0`/`used_key_id=None`, matching `call_provider_with_failover`'s
-    real Phase-4 return shape - see `common.FailoverCallResult`). This
-    intentionally does not exercise failover retry/health-store
-    bookkeeping; no test in `test_gateway_{chat,completions,embeddings}.py`
-    asserts on that today - see `tests/integration/test_phase4_reliability_
-    cost.py` for that coverage instead.
+    `fetch_credential()` + provider call. `call_provider_with_failover()`'s
+    first step, `provider_key_health.select_provider_key()`, does a real
+    `session.execute()` - which would hit the exploding sentinel before a
+    test's own credential fake ever gets a chance to run. `build_
+    authenticated_app` therefore monkeypatches `call_provider_with_failover`
+    to a DB-free fake that skips straight to `common.fetch_credential()`
+    (itself unpatched - a thin, zero-I/O wrapper around the module-level
+    `common.get_decrypted_provider_credential` name, which per-test/per-file
+    fakes already monkeypatch, same as before Phase 4) and then invokes
+    `call_fn` once - i.e. byte-for-byte the pre-Phase-4 behavior (now
+    wrapped in a `FailoverCallResult` with `attempt=0`/`used_key_id=None`,
+    matching `call_provider_with_failover`'s real Phase-4 return shape - see
+    `common.FailoverCallResult`). This intentionally does not exercise
+    failover retry/health-store bookkeeping; no test in `test_gateway_
+    {chat,completions,embeddings}.py` asserts on that today - see `tests/
+    integration/test_phase4_reliability_cost.py` for that coverage instead.
+
+    Model Catalog + Cross-Provider Fallback Chains (Part B): `chat.py`/
+    `embeddings.py` no longer call `call_provider_with_failover`/`call_
+    self_hosted_provider` directly at all - both now go through `common.
+    dispatch_with_model_fallback()` (defined IN `common.py`, so it always
+    calls its sibling `call_provider_with_failover`/`call_self_hosted_
+    provider` via `common`'s own module-global lookup, never a per-route-
+    module binding). The old per-route-module monkeypatch target
+    (`gateway_chat.call_provider_with_failover`, etc.) therefore no longer
+    has any effect - `chat.py`/`embeddings.py` don't hold that name in their
+    own module namespace anymore. Patched on `gateway_common.
+    call_provider_with_failover` instead (a single patch point, not three) -
+    this is what `dispatch_with_model_fallback()`'s own `_dispatch()` helper
+    actually calls through at request time. `completions.py` is genuinely
+    unaffected (Part B never touches it - custom models, and therefore
+    fallback chains, were never routable there) and keeps its own real
+    `call_provider_with_failover` import, so it is left patched exactly as
+    before, at its own module.
   - Phase 4 gateway-pipeline wiring (rate limiting/caching/degradation):
     `check_rate_limit()`/`check_response_cache()`/`check_and_apply_
     degradation()` read `RateLimitCache`/`CachingSettingsCache`/
@@ -97,10 +114,8 @@ import pytest
 from fastapi import FastAPI
 
 from gatekey.api.deps import GatewayCallerContext, get_db_session, require_gateway_credential
-from gatekey.api.v1.gateway import chat as gateway_chat
 from gatekey.api.v1.gateway import common as gateway_common
 from gatekey.api.v1.gateway import completions as gateway_completions
-from gatekey.api.v1.gateway import embeddings as gateway_embeddings
 from gatekey.config import Settings
 from gatekey.db.session import get_db_session as db_session_get_db_session
 from gatekey.main import create_app
@@ -144,6 +159,10 @@ def _default_unmetered_state(user_id: uuid.UUID) -> budget_service.UserBudgetSta
     )
 
 
+def _default_unmetered_org_state() -> budget_service.OrgBudgetState:
+    return budget_service.OrgBudgetState(budget_usd=None, current_spend_usd=Decimal("0"))
+
+
 def build_authenticated_app(
     monkeypatch: pytest.MonkeyPatch, *, org_id: uuid.UUID | None = None, user_id: uuid.UUID | None = None
 ) -> FastAPI:
@@ -181,6 +200,21 @@ def build_authenticated_app(
     async def _fake_record_usage_charge(session, **kwargs):  # noqa: ANN001, ARG001
         return Decimal("0.000001")
 
+    async def _fake_get_org_budget_state(session):  # noqa: ANN001, ARG001
+        return _default_unmetered_org_state()
+
+    async def _fake_record_org_usage_charge(session, **kwargs):  # noqa: ANN001, ARG001
+        return budget_service.OrgChargeResult(
+            old_total=Decimal("0"),
+            new_total=Decimal("0.000001"),
+            ceiling_usd=None,
+            alert_50_enabled=False,
+            alert_75_enabled=False,
+            alert_100_enabled=False,
+            webhook_alert_enabled=False,
+            email_alert_enabled=False,
+        )
+
     async def _fake_record_usage_log(session, **kwargs):  # noqa: ANN001, ARG001
         return None
 
@@ -207,26 +241,39 @@ def build_authenticated_app(
         call_fn,
     ):
         """DB-free stand-in for Phase 4's `common.call_provider_with_
-        failover` - see module docstring's "Phase 4" paragraph for why
-        this must be patched per-route-module rather than on `common`,
-        and why delegating to `common.fetch_credential()` keeps every
+        failover` - delegating to `common.fetch_credential()` keeps every
         existing per-test-file `get_decrypted_provider_credential` fake
         working unmodified. Wraps the result in a `FailoverCallResult`
         (`attempt=0`, `used_key_id=None`) matching the real function's
-        Phase-4 return shape - see module docstring's "Phase 4" bullet."""
+        Phase-4 return shape - see module docstring's "Phase 4" bullet.
+
+        Patched on `gateway_common` itself (not per-route-module) - see
+        module docstring's "Model Catalog + Cross-Provider Fallback Chains"
+        paragraph for why `chat.py`/`embeddings.py` need this patched at
+        its actual call site (`common.dispatch_with_model_fallback()`) now,
+        while `completions.py` (own, separate monkeypatch below) still
+        needs its own per-module patch, unchanged."""
         credential = await gateway_common.fetch_credential(session, route.provider, key_provider=key_provider)
         result = await call_fn(credential)
         return gateway_common.FailoverCallResult(result=result, attempt=0, used_key_id=None)
 
     monkeypatch.setattr(budget_service, "get_budget_state", _fake_get_budget_state)
     monkeypatch.setattr(budget_service, "record_usage_charge", _fake_record_usage_charge)
+    monkeypatch.setattr(budget_service, "get_org_budget_state", _fake_get_org_budget_state)
+    monkeypatch.setattr(budget_service, "record_org_usage_charge", _fake_record_org_usage_charge)
     monkeypatch.setattr(usage_logs_service, "record_usage_log", _fake_record_usage_log)
     monkeypatch.setattr(dlp_service, "load_dlp_policy", _fake_load_dlp_policy)
     monkeypatch.setattr(dlp_service, "load_custom_patterns", _fake_load_custom_patterns)
     monkeypatch.setattr(dlp_service, "get_team_dlp_override", _fake_get_team_dlp_override)
-    monkeypatch.setattr(gateway_chat, "call_provider_with_failover", _fake_call_provider_with_failover)
+    # `chat.py`/`embeddings.py`: patched on `common` itself - both now reach
+    # `call_provider_with_failover` only indirectly, through `common.
+    # dispatch_with_model_fallback()`'s own module-global lookup (Model
+    # Catalog + Cross-Provider Fallback Chains, Part B).
+    monkeypatch.setattr(gateway_common, "call_provider_with_failover", _fake_call_provider_with_failover)
+    # `completions.py`: unaffected by Part B (custom models were never
+    # routable there) - still calls `call_provider_with_failover` directly
+    # via its own module-level binding, so it still needs its own patch.
     monkeypatch.setattr(gateway_completions, "call_provider_with_failover", _fake_call_provider_with_failover)
-    monkeypatch.setattr(gateway_embeddings, "call_provider_with_failover", _fake_call_provider_with_failover)
     # Fix 6 (NFR gap): rate limiting/caching/degradation no longer read
     # through `load_effective_rate_limit_rules`/`load_effective_caching_
     # config`/`load_effective_degradation_policy` on the hot path at all -

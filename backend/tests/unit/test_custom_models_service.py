@@ -48,6 +48,10 @@ from gatekey.services.custom_models import (
     CustomModelCacheEntry,
     CustomModelCapabilityPricingMismatchError,
     CustomModelEmbeddingsProviderUnsupportedError,
+    CustomModelFallbackChainTooLongError,
+    CustomModelFallbackDuplicateEntryError,
+    CustomModelFallbackSelfReferenceError,
+    CustomModelFallbackUnresolvableModelError,
     CustomModelNameRegistryCollisionError,
     CustomModelNameSelfHostedCollisionError,
     CustomModelOllamaProviderError,
@@ -149,6 +153,7 @@ def _make_row(
     input_price: Decimal = Decimal("1.00"),
     output_price: Decimal | None = Decimal("2.00"),
     verified: bool = False,
+    fallback_model_names: list[str] | None = None,
 ) -> CustomModel:
     return CustomModel(
         id=row_id if row_id is not None else uuid.uuid4(),
@@ -162,6 +167,7 @@ def _make_row(
         pricing_source=None,
         pricing_as_of=date.today(),
         verified=verified,
+        fallback_model_names=fallback_model_names if fallback_model_names is not None else [],
     )
 
 
@@ -776,3 +782,161 @@ async def test_edit_capability_resets_verified():
         output_price_per_million_usd_provided=True,
     )
     assert updated.verified is False
+
+
+# ---------------------------------------------------------------------------
+# _validate_fallback_model_names (via register_custom_model/edit_custom_
+# model) - Model Catalog + Cross-Provider Fallback Chains, Part B. Mirrors
+# this file's existing "pure guards reject without touching the DB, the one
+# DB-dependent branch uses a minimal fake session" split - see module
+# docstring. `_validate_fallback_model_names()` is now checked BEFORE the
+# CMR-14 org-settings-lock/self-hosted-collision guard (see `_validate_
+# custom_model_write`'s own comment), so its pure sub-checks (chain-too-
+# long/self-reference/duplicate-entry) reject via `_ExplodingSessionSentinel`
+# exactly like every other pure guard above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_fallback_model_names_is_a_zero_io_noop():
+    """The default (`[]`, "no fallback chain configured") never touches the
+    DB at all - proven by the exploding-session-sentinel combined with the
+    OTHER pure guards above already passing."""
+    session = _FakeSession(queued_results=[[], [], []])  # lock + self-hosted collision only
+    row = await _register(session, fallback_model_names=[])
+    assert row.fallback_model_names == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_chain_too_long_rejected_without_touching_db():
+    with pytest.raises(CustomModelFallbackChainTooLongError):
+        await _register(
+            _ExplodingSessionSentinel(),
+            fallback_model_names=[f"model-{i}" for i in range(6)],
+        )
+
+
+@pytest.mark.asyncio
+async def test_fallback_self_reference_rejected_without_touching_db():
+    with pytest.raises(CustomModelFallbackSelfReferenceError):
+        await _register(
+            _ExplodingSessionSentinel(),
+            name="my-custom-gpt",
+            fallback_model_names=["some-other-model", "my-custom-gpt"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_fallback_duplicate_entry_rejected_without_touching_db():
+    with pytest.raises(CustomModelFallbackDuplicateEntryError):
+        await _register(
+            _ExplodingSessionSentinel(),
+            fallback_model_names=["gpt-4o-mini", "gpt-4o-mini"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_fallback_unresolvable_name_rejected():
+    """Neither a `MODEL_REGISTRY` key, a verified custom model, nor a
+    verified self-hosted model id in this org - the two `queued_results`
+    entries are `_verified_custom_model_names_for_org`'s and `_verified_
+    self_hosted_model_ids_for_org`'s own queries, both returning no rows."""
+    session = _FakeSession(queued_results=[[], []])
+    with pytest.raises(CustomModelFallbackUnresolvableModelError) as exc_info:
+        await _register(session, fallback_model_names=["totally-unknown-model"])
+    assert "totally-unknown-model" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_fallback_name_resolves_via_static_registry_succeeds():
+    static_name = next(iter(MODEL_REGISTRY))
+    # verified-custom-names query, verified-self-hosted-ids query, then the
+    # CMR-14 lock (upsert+select) + self-hosted-collision query.
+    session = _FakeSession(queued_results=[[], [], [], [], []])
+    row = await _register(session, fallback_model_names=[static_name])
+    assert row.fallback_model_names == [static_name]
+
+
+@pytest.mark.asyncio
+async def test_fallback_name_resolves_via_verified_custom_model_succeeds():
+    """`_verified_custom_model_names_for_org()` selects `CustomModel.name`
+    directly (a plain string column) - the fake queue entry is therefore a
+    list of bare strings, not ORM rows."""
+    session = _FakeSession(queued_results=[["another-verified-custom-model"], [], [], [], []])
+    row = await _register(session, fallback_model_names=["another-verified-custom-model"])
+    assert row.fallback_model_names == ["another-verified-custom-model"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_name_resolves_via_verified_self_hosted_model_succeeds():
+    session = _FakeSession(
+        queued_results=[[], [_FakeSelfHostedRow(models=["vllm-internal-llama3"])], [], [], []]
+    )
+    row = await _register(session, fallback_model_names=["vllm-internal-llama3"])
+    assert row.fallback_model_names == ["vllm-internal-llama3"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_chain_at_exactly_five_entries_allowed():
+    static_names = list(MODEL_REGISTRY)[:5]
+    assert len(static_names) == 5
+    session = _FakeSession(queued_results=[[], [], [], [], []])
+    row = await _register(session, fallback_model_names=static_names)
+    assert row.fallback_model_names == static_names
+
+
+@pytest.mark.asyncio
+async def test_edit_fallback_model_names_does_not_reset_verified():
+    """Editing `fallback_model_names` alone must NOT reset `verified` -
+    unlike `native_model_id`/`provider`/`capability`, the row's own
+    routability is unaffected by what its fallback chain points at
+    (technical design doc section 2.4)."""
+    existing = _make_row(verified=True, fallback_model_names=[])
+    static_name = next(iter(MODEL_REGISTRY))
+    # fallback_model_names is changing -> revalidate=True -> verified-custom/
+    # verified-self-hosted queries, then the CMR-14 lock + self-hosted
+    # collision query.
+    session = _FakeSession(queued_results=[[existing], [], [], [], [], []])
+
+    updated = await edit_custom_model(
+        session,
+        existing.id,
+        fallback_model_names=[static_name],
+        fallback_model_names_provided=True,
+    )
+    assert updated.verified is True
+    assert updated.fallback_model_names == [static_name]
+
+
+@pytest.mark.asyncio
+async def test_edit_fallback_model_names_omitted_leaves_existing_chain_unchanged():
+    """`fallback_model_names_provided=False` (the default) - an edit that
+    touches a DIFFERENT field must not silently clear an existing chain."""
+    static_name = next(iter(MODEL_REGISTRY))
+    existing = _make_row(provider="openai", verified=True, fallback_model_names=[static_name])
+    # provider is changing -> revalidate=True; fallback_model_names_provided
+    # stays False, so `_validate_fallback_model_names` re-validates the
+    # EXISTING (unchanged) chain - verified-custom/verified-self-hosted
+    # queries, then the CMR-14 lock + self-hosted-collision query.
+    session = _FakeSession(queued_results=[[existing], [], [], [], [], []])
+
+    updated = await edit_custom_model(session, existing.id, provider="openrouter")
+    assert updated.fallback_model_names == [static_name]
+
+
+@pytest.mark.asyncio
+async def test_edit_can_explicitly_clear_fallback_model_names_back_to_empty():
+    static_name = next(iter(MODEL_REGISTRY))
+    existing = _make_row(verified=True, fallback_model_names=[static_name])
+    # Clearing to `[]` makes `_validate_fallback_model_names` itself a
+    # zero-I/O no-op, but `fallback_model_names_provided=True` still makes
+    # `revalidate=True` overall, so the CMR-14 lock (upsert+select) + the
+    # self-hosted-collision query still run, same as any other revalidating
+    # edit.
+    session = _FakeSession(queued_results=[[existing], [], [], []])
+
+    updated = await edit_custom_model(
+        session, existing.id, fallback_model_names=[], fallback_model_names_provided=True
+    )
+    assert updated.fallback_model_names == []
+    assert updated.verified is True

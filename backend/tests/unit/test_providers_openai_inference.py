@@ -18,9 +18,11 @@ from gatekey.providers.openai import (
     OPENAI_CHAT_COMPLETIONS_URL,
     OPENAI_COMPLETIONS_URL,
     OPENAI_EMBEDDINGS_URL,
+    OPENAI_MODELS_URL,
     create_chat_completion,
     create_completion,
     create_embeddings,
+    list_models,
     stream_chat_completion,
 )
 from gatekey.schemas.chat import ChatCompletionRequest, CompletionRequest, EmbeddingsRequest
@@ -81,6 +83,44 @@ async def test_create_chat_completion_passthrough_request_and_response():
     assert response.choices[0].message.content == "hi there"
     assert response.choices[0].finish_reason == "stop"
     assert response.usage.total_tokens == 7
+
+
+@pytest.mark.asyncio
+async def test_create_chat_completion_tolerates_null_content_from_provider():
+    """Post-ship crash fix: a real, live drift-canary run against a
+    reasoning model (OpenRouter's Meta Muse Spark 1.2) returned `content:
+    null` (the whole response budget spent on hidden reasoning tokens) and
+    crashed `ChatCompletionResponse.model_validate()` with an unhandled
+    pydantic ValidationError - `choices[].message` used to require a
+    non-null `str`, but that's a real, valid shape per OpenAI's own API
+    contract, not just a hypothetical edge case. Must parse cleanly now."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-null-content",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": None},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 674, "total_tokens": 679},
+            },
+        )
+
+    request = ChatCompletionRequest(model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
+    async with _client(handler) as client:
+        response = await create_chat_completion(client, "gpt-4o", request, CREDENTIAL)
+
+    assert response.choices[0].message.content is None
+    assert response.choices[0].finish_reason == "length"
+    assert response.usage.completion_tokens == 674
 
 
 @pytest.mark.asyncio
@@ -217,3 +257,49 @@ async def test_create_embeddings():
 
 def test_chat_completions_url_is_openai_native():
     assert OPENAI_CHAT_COMPLETIONS_URL == "https://api.openai.com/v1/chat/completions"
+
+
+# ---------------------------------------------------------------------------
+# list_models() - Model Catalog technical design doc section 1.5
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_models_maps_entries_with_no_pricing():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == OPENAI_MODELS_URL
+        assert request.headers["authorization"] == "Bearer sk-test-openai"
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "gpt-4o", "object": "model", "created": 1, "owned_by": "openai"},
+                    {"id": "gpt-4o-mini", "object": "model", "created": 1, "owned_by": "openai"},
+                ],
+            },
+        )
+
+    async with _client(handler) as client:
+        entries = await list_models(client, CREDENTIAL)
+
+    assert [e.native_model_id for e in entries] == ["gpt-4o", "gpt-4o-mini"]
+    # display_name mirrors native_model_id for OpenAI (no separate display
+    # name field in OpenAI's /v1/models response) and no pricing is filled
+    # in here - that's services/model_catalog.py's job.
+    assert entries[0].display_name == "gpt-4o"
+    assert entries[0].input_price_per_million_usd is None
+    assert entries[0].output_price_per_million_usd is None
+
+
+@pytest.mark.asyncio
+async def test_list_models_maps_error_status_to_provider_call_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": "invalid api key"}})
+
+    async with _client(handler) as client:
+        with pytest.raises(ProviderCallError) as exc_info:
+            await list_models(client, CREDENTIAL)
+
+    assert exc_info.value.status_code == 401
+    assert "invalid api key" not in exc_info.value.message

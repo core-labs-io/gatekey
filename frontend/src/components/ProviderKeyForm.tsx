@@ -85,6 +85,14 @@ export function ProviderKeyForm({
   const [baseUrl, setBaseUrl] = useState("");
   const [bearerToken, setBearerToken] = useState("");
   const [keyLabel, setKeyLabel] = useState("");
+  // openrouter only - data-residency enforcement (see module-level notes on
+  // `putProviderKey` in `lib/api.ts`). Deliberately NOT pre-filled from any
+  // existing row on edit (this form's whole convention is "always starts
+  // blank, only overwrites what's actually typed" - see file docstring) -
+  // the field-hint below says so explicitly rather than leaving it a silent
+  // trap.
+  const [trustedProviderSlugsText, setTrustedProviderSlugsText] = useState("");
+  const [trustedProviderRegion, setTrustedProviderRegion] = useState("");
   const [validating, setValidating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -98,6 +106,14 @@ export function ProviderKeyForm({
     if (showLabelField && !keyLabel.trim()) {
       setError("Label is required when adding another key to a provider that already has one.");
       return;
+    }
+    if (provider === "openrouter" && mode === "save") {
+      const hasSlugs = trustedProviderSlugsText.trim().length > 0;
+      const hasRegion = trustedProviderRegion.trim().length > 0;
+      if (hasSlugs !== hasRegion) {
+        setError("Set both a trusted-provider list and a region, or leave both blank.");
+        return;
+      }
     }
     setValidating(true);
     let parsedServiceAccountJson: Record<string, unknown> | null = null;
@@ -135,6 +151,23 @@ export function ProviderKeyForm({
           bearer_token: bearerToken,
           ...(labelToSend !== undefined ? { label: labelToSend } : {}),
         });
+      } else if (provider === "openrouter") {
+        const trustedProviderSlugs = trustedProviderSlugsText
+          .split(",")
+          .map((slug) => slug.trim())
+          .filter(Boolean);
+        await putProviderKey(provider, {
+          api_key: apiKey,
+          // Both omitted (never sent) when the admin hasn't set a region -
+          // the backend's own schema requires them together or not at all
+          // (`OpenRouterKeyRequest`), so an empty text field and an unset
+          // region select must round-trip to "not configured", not to two
+          // empty/blank values that would fail that validation.
+          ...(trustedProviderSlugs.length > 0 && trustedProviderRegion
+            ? { trusted_provider_slugs: trustedProviderSlugs, trusted_provider_region: trustedProviderRegion }
+            : {}),
+          ...(labelToSend !== undefined ? { label: labelToSend } : {}),
+        });
       } else {
         await putProviderKey(provider, {
           api_key: apiKey,
@@ -153,8 +186,8 @@ export function ProviderKeyForm({
     <div>
       {editingLabel ? (
         <div className="field">
-          <label>Label</label>
-          <input type="text" value={editingLabel} disabled />
+          <label htmlFor="pkf-label-locked">Label</label>
+          <input id="pkf-label-locked" type="text" value={editingLabel} disabled />
           <div className="field-hint">
             Saving overwrites this specific key - to add a separate key instead, use "Add key"
             rather than editing this one.
@@ -162,8 +195,9 @@ export function ProviderKeyForm({
         </div>
       ) : showLabelField ? (
         <div className="field">
-          <label>Label</label>
+          <label htmlFor="pkf-label">Label</label>
           <input
+            id="pkf-label"
             type="text"
             value={keyLabel}
             onChange={(e) => setKeyLabel(e.target.value)}
@@ -178,8 +212,9 @@ export function ProviderKeyForm({
       {provider === "vertex_ai" ? (
         <>
           <div className="field">
-            <label>Service account JSON</label>
+            <label htmlFor="pkf-sa-json">Service account JSON</label>
             <textarea
+              id="pkf-sa-json"
               rows={5}
               value={serviceAccountJson}
               onChange={(e) => setServiceAccountJson(e.target.value)}
@@ -187,19 +222,20 @@ export function ProviderKeyForm({
             />
           </div>
           <div className="field">
-            <label>Project ID</label>
-            <input type="text" value={projectId} onChange={(e) => setProjectId(e.target.value)} />
+            <label htmlFor="pkf-project">Project ID</label>
+            <input id="pkf-project" type="text" value={projectId} onChange={(e) => setProjectId(e.target.value)} />
           </div>
           <div className="field">
-            <label>Location</label>
-            <input type="text" value={location} onChange={(e) => setLocation(e.target.value)} />
+            <label htmlFor="pkf-location">Location</label>
+            <input id="pkf-location" type="text" value={location} onChange={(e) => setLocation(e.target.value)} />
           </div>
         </>
       ) : provider === "ollama" ? (
         <>
           <div className="field">
-            <label>Base URL</label>
+            <label htmlFor="pkf-base-url">Base URL</label>
             <input
+              id="pkf-base-url"
               type="text"
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
@@ -207,8 +243,9 @@ export function ProviderKeyForm({
             />
           </div>
           <div className="field">
-            <label>Bearer token (optional)</label>
+            <label htmlFor="pkf-bearer">Bearer token (optional)</label>
             <input
+              id="pkf-bearer"
               type="password"
               value={bearerToken}
               onChange={(e) => setBearerToken(e.target.value)}
@@ -219,15 +256,69 @@ export function ProviderKeyForm({
           </div>
         </>
       ) : (
-        <div className="field">
-          <label>API key</label>
-          <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder={apiKeyPlaceholder(provider)}
-          />
-        </div>
+        <>
+          <div className="field">
+            <label htmlFor="pkf-api-key">API key</label>
+            <input
+              id="pkf-api-key"
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={apiKeyPlaceholder(provider)}
+            />
+          </div>
+          {provider === "openrouter" && mode === "save" ? (
+            <>
+              <div className="field">
+                <label htmlFor="pkf-openrouter-region">
+                  Restrict to trusted providers (optional - for data residency)
+                </label>
+                <select
+                  id="pkf-openrouter-region"
+                  value={trustedProviderRegion}
+                  onChange={(e) => setTrustedProviderRegion(e.target.value)}
+                >
+                  <option value="">No restriction (region unknown to residency rules)</option>
+                  <option value="us">US</option>
+                  <option value="eu">EU</option>
+                  <option value="apac">APAC</option>
+                  <option value="ca">Canada</option>
+                </select>
+              </div>
+              {trustedProviderRegion ? (
+                <div className="field">
+                  <label htmlFor="pkf-openrouter-slugs">
+                    Trusted provider slugs for {trustedProviderRegion.toUpperCase()} (comma-separated)
+                  </label>
+                  <input
+                    id="pkf-openrouter-slugs"
+                    type="text"
+                    value={trustedProviderSlugsText}
+                    onChange={(e) => setTrustedProviderSlugsText(e.target.value)}
+                    placeholder="openai, anthropic, fireworks"
+                  />
+                  <div className="field-hint">
+                    OpenRouter&apos;s own provider slugs (its documentation lists the current set) that
+                    you personally vouch for as hosted in {trustedProviderRegion.toUpperCase()}. Every
+                    request is restricted to only these providers via OpenRouter&apos;s own routing
+                    controls - that&apos;s what makes it safe for Gatekey to treat this key&apos;s
+                    traffic as {trustedProviderRegion.toUpperCase()} under an active residency rule,
+                    rather than the default &quot;unknown region&quot; every OpenRouter request gets
+                    otherwise (OpenRouter aggregates many providers with no single fixed region).{" "}
+                    {editingLabel ? (
+                      <strong>Editing clears any previously configured restriction unless you
+                      re-enter it here.</strong>
+                    ) : null}
+                  </div>
+                </div>
+              ) : editingLabel ? (
+                <div className="field-hint">
+                  Leaving this unset clears any trusted-provider restriction this key previously had.
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </>
       )}
       {mode === "rotate" ? (
         <p className="field-hint">

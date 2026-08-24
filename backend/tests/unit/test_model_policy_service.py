@@ -20,6 +20,7 @@ from gatekey.errors import ModelDeniedError
 from gatekey.services.model_policy import (
     ContentAwareRuleCache,
     ContentAwareRuleSnapshot,
+    MemberModelPolicyCache,
     ModelAccessDecision,
     ModelPolicyCache,
     ModelPolicySnapshot,
@@ -303,6 +304,211 @@ def test_check_model_policy_org_denial_message_names_org_policy() -> None:
         check_model_policy("gpt-4o", cache)
     assert exc_info.value.blocking_layer == "org"
     assert "org policy" in exc_info.value.message
+
+
+# --- Per-team-member narrowing overlay (third layer) -------------------------
+
+
+def test_member_cache_get_returns_none_for_unknown_member() -> None:
+    assert MemberModelPolicyCache().get(uuid.uuid4(), uuid.uuid4()) is None
+
+
+def test_member_cache_set_all_replaces_whole_snapshot() -> None:
+    cache = MemberModelPolicyCache()
+    team_a, user_a = uuid.uuid4(), uuid.uuid4()
+    team_b, user_b = uuid.uuid4(), uuid.uuid4()
+    cache.set_all({(team_a, user_a): frozenset({"gpt-4o"})})
+    cache.set_all({(team_b, user_b): frozenset({"claude-sonnet-5"})})
+    assert cache.get(team_a, user_a) is None  # full replace, not merge
+    assert cache.get(team_b, user_b) == frozenset({"claude-sonnet-5"})
+
+
+def test_member_cache_set_member_updates_one_entry_keeping_others() -> None:
+    cache = MemberModelPolicyCache()
+    team_id, user_a, user_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    cache.set_all({(team_id, user_a): frozenset({"gpt-4o"})})
+    cache.set_member(team_id, user_b, frozenset({"gpt-4o-mini"}))
+    assert cache.get(team_id, user_a) == frozenset({"gpt-4o"})
+    assert cache.get(team_id, user_b) == frozenset({"gpt-4o-mini"})
+
+
+def test_resolve_model_access_member_overlay_narrows_team_baseline() -> None:
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    team_cache = TeamModelPolicyCache({team_id: frozenset({"gpt-4o", "gpt-4o-mini"})})
+    member_cache = MemberModelPolicyCache({(team_id, user_id): frozenset({"gpt-4o-mini"})})
+    denied = resolve_model_access(
+        "gpt-4o",
+        org_cache=_permissive_org_cache(),
+        team_cache=team_cache,
+        team_id=team_id,
+        member_cache=member_cache,
+        user_id=user_id,
+    )
+    assert denied == ModelAccessDecision(allowed=False, blocking_layer="member")
+    allowed = resolve_model_access(
+        "gpt-4o-mini",
+        org_cache=_permissive_org_cache(),
+        team_cache=team_cache,
+        team_id=team_id,
+        member_cache=member_cache,
+        user_id=user_id,
+    )
+    assert allowed == ModelAccessDecision(allowed=True, blocking_layer=None)
+
+
+def test_resolve_model_access_team_denial_wins_over_member_overlay() -> None:
+    """Layering one level further: a member overlay that would allow the
+    model cannot re-enable a team-denied one - the team layer is checked
+    first and short-circuits before the member layer is ever consulted."""
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    team_cache = TeamModelPolicyCache({team_id: frozenset({"gpt-4o-mini"})})
+    member_cache = MemberModelPolicyCache({(team_id, user_id): frozenset({"gpt-4o"})})
+    decision = resolve_model_access(
+        "gpt-4o",
+        org_cache=_permissive_org_cache(),
+        team_cache=team_cache,
+        team_id=team_id,
+        member_cache=member_cache,
+        user_id=user_id,
+    )
+    assert decision == ModelAccessDecision(allowed=False, blocking_layer="team")
+
+
+def test_resolve_model_access_no_member_restriction_row_means_team_baseline_only() -> None:
+    """Absence of a member entry = no further restriction beyond the team's
+    own effective set."""
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    team_cache = TeamModelPolicyCache({team_id: frozenset({"gpt-4o"})})
+    decision = resolve_model_access(
+        "gpt-4o",
+        org_cache=_permissive_org_cache(),
+        team_cache=team_cache,
+        team_id=team_id,
+        member_cache=MemberModelPolicyCache(),
+        user_id=user_id,
+    )
+    assert decision.allowed is True
+
+
+def test_resolve_model_access_member_layer_skipped_when_cache_or_user_id_missing() -> None:
+    """`member_cache=None`/`user_id=None` (a caller not yet updated to pass
+    them) preserves byte-for-byte pre-member-layer behavior - never denies
+    on a layer it wasn't given enough to evaluate."""
+    team_id = uuid.uuid4()
+    team_cache = TeamModelPolicyCache({team_id: frozenset({"gpt-4o"})})
+    decision = resolve_model_access(
+        "gpt-4o", org_cache=_permissive_org_cache(), team_cache=team_cache, team_id=team_id
+    )
+    assert decision.allowed is True
+
+
+def test_resolve_model_access_legacy_none_team_id_skips_member_layer_too() -> None:
+    """`team_id=None` skips the team AND member layers - a member overlay is
+    meaningless outside a team context, same as the team layer itself."""
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    member_cache = MemberModelPolicyCache({(team_id, user_id): frozenset()})
+    decision = resolve_model_access(
+        "gpt-4o",
+        org_cache=_permissive_org_cache(),
+        team_cache=TeamModelPolicyCache(),
+        team_id=None,
+        member_cache=member_cache,
+        user_id=user_id,
+    )
+    assert decision.allowed is True
+
+
+def test_check_model_policy_member_denial_is_403_model_denied_with_member_layer() -> None:
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    team_cache = TeamModelPolicyCache({team_id: frozenset({"gpt-4o", "gpt-4o-mini"})})
+    member_cache = MemberModelPolicyCache({(team_id, user_id): frozenset({"gpt-4o-mini"})})
+    with pytest.raises(ModelDeniedError) as exc_info:
+        check_model_policy(
+            "gpt-4o", _permissive_org_cache(), team_cache, team_id, member_cache, user_id
+        )
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.code == "model_denied"
+    assert exc_info.value.blocking_layer == "member"
+    assert "team lead" in exc_info.value.message
+
+
+def test_resolve_model_access_member_empty_list_blocks_every_team_model() -> None:
+    """QA gap (Member Model Assignment review, item 3b): an EMPTY `models`
+    list for a `(team_id, user_id)` entry is a real, intentional lockout -
+    "this member can use NOTHING" - and must be distinguished from the
+    ABSENCE of an entry (`None`, "no further restriction beyond the team's
+    own effective set"). Both are exercised side-by-side here so a
+    regression that ever conflated `frozenset()` with "no restriction"
+    (e.g. an `is not None` check accidentally becoming truthiness) fails
+    loudly."""
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    team_cache = TeamModelPolicyCache({team_id: frozenset({"gpt-4o", "gpt-4o-mini"})})
+
+    locked_out_cache = MemberModelPolicyCache({(team_id, user_id): frozenset()})
+    for model in ("gpt-4o", "gpt-4o-mini"):
+        decision = resolve_model_access(
+            model,
+            org_cache=_permissive_org_cache(),
+            team_cache=team_cache,
+            team_id=team_id,
+            member_cache=locked_out_cache,
+            user_id=user_id,
+        )
+        assert decision == ModelAccessDecision(allowed=False, blocking_layer="member")
+
+    # Contrast: no row at all for this (team_id, user_id) -> team baseline
+    # applies unchanged, both models allowed.
+    no_row_cache = MemberModelPolicyCache()
+    for model in ("gpt-4o", "gpt-4o-mini"):
+        decision = resolve_model_access(
+            model,
+            org_cache=_permissive_org_cache(),
+            team_cache=team_cache,
+            team_id=team_id,
+            member_cache=no_row_cache,
+            user_id=user_id,
+        )
+        assert decision == ModelAccessDecision(allowed=True, blocking_layer=None)
+
+
+def test_resolve_model_access_stale_wider_member_restriction_cannot_over_permit_past_a_tightened_team() -> None:
+    """QA gap (item 3a): if a member's cached restriction is WIDER than the
+    team's CURRENT (already-tightened) restriction - e.g. the member row was
+    written before the team was narrowed, and hasn't itself been re-written
+    since - the team layer (checked first, unconditionally, at read time)
+    still independently blocks any model the team no longer allows. The
+    member layer can only ever narrow further, never widen past whatever the
+    team layer already decided - so a stale, over-broad member entry cannot
+    silently over-permit. This is the read-time counterpart to
+    `test_resolve_model_access_team_denial_wins_over_member_overlay` above,
+    phrased explicitly for the "team was tightened after the member row was
+    written" scenario called out in the QA review."""
+    team_id, user_id = uuid.uuid4(), uuid.uuid4()
+    # Team was narrowed AFTER the member restriction below was written -
+    # the member row still lists "gpt-4o", which the team no longer allows.
+    team_cache = TeamModelPolicyCache({team_id: frozenset({"gpt-4o-mini"})})
+    stale_member_cache = MemberModelPolicyCache(
+        {(team_id, user_id): frozenset({"gpt-4o", "gpt-4o-mini"})}
+    )
+    decision = resolve_model_access(
+        "gpt-4o",
+        org_cache=_permissive_org_cache(),
+        team_cache=team_cache,
+        team_id=team_id,
+        member_cache=stale_member_cache,
+        user_id=user_id,
+    )
+    assert decision == ModelAccessDecision(allowed=False, blocking_layer="team")
+    # The still-permitted model keeps working normally.
+    decision_ok = resolve_model_access(
+        "gpt-4o-mini",
+        org_cache=_permissive_org_cache(),
+        team_cache=team_cache,
+        team_id=team_id,
+        member_cache=stale_member_cache,
+        user_id=user_id,
+    )
+    assert decision_ok == ModelAccessDecision(allowed=True, blocking_layer=None)
 
 
 # --- Phase 3 (BD-5): ContentAwareRuleCache / resolve_content_classification --

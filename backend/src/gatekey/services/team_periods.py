@@ -155,6 +155,14 @@ async def ensure_current_period(
     new_start = advance_period_start(
         locked.period_type, locked.current_period_started_at, now
     )
+    # Deliberately NOT filtered to `removed_at IS NULL` (added by `0049`) -
+    # a removed member's spend during this period still really happened
+    # and must count toward zeroing/adjusting the TEAM aggregate below
+    # (ADR-7), the same as an active member's. Only the per-membership
+    # mutation loop right after this excludes removed rows - their
+    # `budget_usd`/`current_spend_usd` stay frozen as a historical record
+    # (untouched by rollover/reset math) rather than silently changing
+    # budget on a membership nobody can currently use.
     memberships = (
         (
             await session.execute(
@@ -169,6 +177,8 @@ async def ensure_current_period(
     total_prior_spend = Decimal(0)
     for membership in memberships:
         total_prior_spend += membership.current_spend_usd
+        if membership.removed_at is not None:
+            continue
         membership.budget_usd = apply_period_end(
             budget_usd=membership.budget_usd,
             current_spend_usd=membership.current_spend_usd,

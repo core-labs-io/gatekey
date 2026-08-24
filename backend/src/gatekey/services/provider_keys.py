@@ -112,6 +112,16 @@ def _build_key_metadata(provider: str, secret_payload: dict[str, Any]) -> dict[s
         if region is not None:
             metadata["region"] = region
         return metadata
+    if provider == "openrouter":
+        # See `schemas.provider_key.OpenRouterKeyRequest`'s docstring - both
+        # fields are already schema-validated as set-together-or-not-at-all;
+        # this `and` is a redundant, cheap re-check (defense in depth,
+        # matching this module's existing convention), not the real guard.
+        slugs = secret_payload.get("trusted_provider_slugs") or []
+        region = secret_payload.get("trusted_provider_region")
+        if slugs and region:
+            return {"trusted_provider_slugs": slugs, "trusted_provider_region": region}
+        return {}
     return {}
 
 

@@ -10,8 +10,9 @@ every static-registry model" on this exact screen, not just in Model
 Policy's admin checklist; both `known_model_ids()` calls only ever return
 verified rows, matching the org-wide policy check's own verified-only
 discipline) through `resolve_model_access` - the exact same layered
-org-then-team resolution the gateway hot path enforces, so what this screen
-shows is by construction what the gateway will do.
+org-then-team-then-member resolution the gateway hot path enforces, so what
+this screen shows is by construction what the gateway will do (including a
+member-level narrowing a team lead assigned this caller specifically).
 
 Team resolution rules (`select_team_id`, pure/unit-tested):
 - explicit `team_id`: must be one of the caller's own memberships unless the
@@ -35,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekey.api.deps import (
     get_custom_model_route_cache,
+    get_member_model_policy_cache,
     get_model_policy_cache,
     get_self_hosted_model_route_cache,
     get_team_model_policy_cache,
@@ -45,6 +47,7 @@ from gatekey.errors import ForbiddenError, GatekeyError
 from gatekey.providers.model_registry import MODEL_REGISTRY
 from gatekey.services.custom_models import CustomModelRouteCache
 from gatekey.services.model_policy import (
+    MemberModelPolicyCache,
     ModelPolicyCache,
     TeamModelPolicyCache,
     resolve_model_access,
@@ -99,13 +102,19 @@ async def get_model_access_endpoint(
     session: AsyncSession = Depends(get_db_session),
     org_cache: ModelPolicyCache = Depends(get_model_policy_cache),
     team_cache: TeamModelPolicyCache = Depends(get_team_model_policy_cache),
+    member_cache: MemberModelPolicyCache = Depends(get_member_model_policy_cache),
     custom_model_cache: CustomModelRouteCache = Depends(get_custom_model_route_cache),
     self_hosted_cache: SelfHostedModelRouteCache = Depends(get_self_hosted_model_route_cache),
 ) -> ModelAccessResponse:
+    # `removed_at IS NULL` (added by `0049`) - a removed member's old team
+    # must not appear here.
     membership_team_ids = list(
         (
             await session.execute(
-                select(TeamMembership.team_id).where(TeamMembership.user_id == ctx.user_id)
+                select(TeamMembership.team_id).where(
+                    TeamMembership.user_id == ctx.user_id,
+                    TeamMembership.removed_at.is_(None),
+                )
             )
         )
         .scalars()
@@ -130,7 +139,12 @@ async def get_model_access_endpoint(
     entries = []
     for model in sorted(all_models):
         decision = resolve_model_access(
-            model, org_cache=org_cache, team_cache=team_cache, team_id=resolved_team_id
+            model,
+            org_cache=org_cache,
+            team_cache=team_cache,
+            team_id=resolved_team_id,
+            member_cache=member_cache,
+            user_id=ctx.user_id,
         )
         entries.append(
             ModelAccessEntry(

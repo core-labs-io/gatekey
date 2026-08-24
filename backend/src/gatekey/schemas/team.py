@@ -105,6 +105,13 @@ class TeamMemberResponse(BaseModel):
     created_at: datetime
 
 
+class RemovedTeamMemberResponse(TeamMemberResponse):
+    """`GET /v1/teams/{team_id}/members/removed` - the restore-UI
+    counterpart to `TeamMemberResponse` (added by `0049`)."""
+
+    removed_at: datetime
+
+
 class TeamMemberAddRequest(BaseModel):
     """`POST /v1/teams/{team_id}/members` body. `budget_usd` is a required
     key (explicit `null` = unmetered - a deliberate choice, never a
@@ -153,15 +160,36 @@ class ReassignBudgetResponse(BaseModel):
 
 
 class TeamModelRestrictionsResponse(BaseModel):
-    """`org_baseline` = every registry model the org policy currently
-    allows; `team_restriction` = the team's narrowing allowlist, or null =
-    no restriction row (org baseline applies unchanged)."""
+    """`org_baseline` = every model (static registry, plus any verified
+    self-hosted/custom model) the org policy currently allows;
+    `team_restriction` = the team's narrowing allowlist, or null = no
+    restriction row (org baseline applies unchanged)."""
 
     org_baseline: list[str]
     team_restriction: list[str] | None
 
 
 class TeamModelRestrictionsPutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[str]
+
+
+class TeamMemberModelRestrictionsResponse(BaseModel):
+    """`team_baseline` = every model this member's TEAM can currently use
+    (org baseline intersected with the team's own restriction, if any) -
+    the effective set a member overlay is allowed to narrow further, never
+    widen beyond. `member_restriction` = this member's own narrowing
+    allowlist, or null = no restriction row (the team baseline applies to
+    them unchanged) - same "null = no further restriction" convention
+    `TeamModelRestrictionsResponse.team_restriction` already establishes one
+    layer up."""
+
+    team_baseline: list[str]
+    member_restriction: list[str] | None
+
+
+class TeamMemberModelRestrictionsPutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     models: list[str]

@@ -57,6 +57,7 @@ from gatekey.api.deps import (
     get_db_session,
     get_dlp_analyzer_engine,
     get_key_provider,
+    get_member_model_policy_cache,
     get_model_policy_cache,
     get_provider_http_client,
     get_rate_limit_cache,
@@ -88,7 +89,7 @@ from gatekey.api.v1.gateway.common import (
     validate_idempotency_key,
     write_response_cache,
 )
-from gatekey.errors import GatekeyError, ProviderUpstreamError
+from gatekey.errors import GATEWAY_ERROR_RESPONSES, GatekeyError, ProviderUpstreamError
 from gatekey.errors import UnsupportedRequestError as HttpUnsupportedRequestError
 from gatekey.providers import openai as openai_provider
 from gatekey.providers.base import ProviderCallError
@@ -97,7 +98,12 @@ from gatekey.providers.pricing import PricingEntryMissingError
 from gatekey.schemas.chat import CompletionRequest, CompletionResponse
 from gatekey.services.access_schedules import AccessScheduleCache
 from gatekey.services.encryption import KeyProvider
-from gatekey.services.model_policy import ContentAwareRuleCache, ModelPolicyCache, TeamModelPolicyCache
+from gatekey.services.model_policy import (
+    ContentAwareRuleCache,
+    MemberModelPolicyCache,
+    ModelPolicyCache,
+    TeamModelPolicyCache,
+)
 from gatekey.services.provider_key_health import TeamFailoverOverrideCache
 from gatekey.services.proxy_keys import ApiKeyCredential
 from gatekey.services.rate_limit import RateLimitCache
@@ -106,7 +112,7 @@ from gatekey.services.response_cache import CachingSettingsCache, ResponseCache
 from gatekey.services.shared_state import SharedStateStore
 from gatekey.services.usage_logs import record_usage_log
 
-router = APIRouter(tags=["gateway"])
+router = APIRouter(tags=["gateway"], responses=GATEWAY_ERROR_RESPONSES)
 
 _ENDPOINT = "/v1/completions"
 
@@ -123,6 +129,7 @@ async def create_completion(
     http_client: httpx.AsyncClient = Depends(get_provider_http_client),
     cache: ModelPolicyCache = Depends(get_model_policy_cache),
     team_cache: TeamModelPolicyCache = Depends(get_team_model_policy_cache),
+    member_cache: MemberModelPolicyCache = Depends(get_member_model_policy_cache),
     residency_cache: ResidencyRuleCache = Depends(get_residency_rule_cache),
     content_aware_cache: ContentAwareRuleCache = Depends(get_content_aware_rule_cache),
     dlp_engine: AnalyzerEngine = Depends(get_dlp_analyzer_engine),
@@ -141,7 +148,10 @@ async def create_completion(
     )
     personal_api_key_id = ctx.credential_id if ctx.credential_type == "personal" else None
     timer = LatencyTimer()
-    request_id = new_request_id()
+    # Prefer the middleware-assigned correlation id (also returned to the
+    # caller as the X-Request-ID header) so the header, usage_logs row, and
+    # every log line share ONE id; fall back for bare-app unit fixtures.
+    request_id = getattr(request.state, "request_id", None) or new_request_id()
     idempotency_key = validate_idempotency_key(idempotency_key)
     provider_for_log: str | None = None
     response_cache = ResponseCache(shared_state_store)
@@ -153,6 +163,9 @@ async def create_completion(
         # identical note. source_ip resolved once here and threaded into
         # every synchronous audit write below.
         source_ip = get_source_ip(request, request.app.state.settings)
+        # Request provenance for usage_logs (migration `0047`) - see
+        # chat.py's identical note.
+        client_user_agent = request.headers.get("user-agent")
         await check_access_schedule(
             session, ctx, cache=access_schedule_cache, source_ip=source_ip
         )
@@ -171,7 +184,7 @@ async def create_completion(
 
         route = resolve_route(body.model)
         provider_for_log = route.provider
-        check_model_policy(body.model, cache, team_cache, ctx.team_id)
+        check_model_policy(body.model, cache, team_cache, ctx.team_id, member_cache, ctx.user_id)
         if route.provider != "openai":
             raise HttpUnsupportedRequestError(
                 f"POST /v1/completions only supports OpenAI models in this phase "
@@ -232,6 +245,8 @@ async def create_completion(
                 status="ok",
                 success=True,
                 cache_hit=True,
+                source_ip=source_ip,
+                client_user_agent=client_user_agent,
             )
             for key, value in response_headers.items():
                 response.headers[key] = value
@@ -339,6 +354,8 @@ async def create_completion(
                 success=False,
                 failover_attempt=failover.attempt,
                 failover_key_id=failover.used_key_id,
+                source_ip=source_ip,
+                client_user_agent=client_user_agent,
             )
             raise
 
@@ -385,6 +402,8 @@ async def create_completion(
             success=True,
             failover_attempt=failover.attempt,
             failover_key_id=failover.used_key_id,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
         )
         for key, value in response_headers.items():
             response.headers[key] = value
@@ -408,5 +427,7 @@ async def create_completion(
             stream=False,
             status=exc.code,
             success=False,
+            source_ip=source_ip,
+            client_user_agent=client_user_agent,
         )
         raise

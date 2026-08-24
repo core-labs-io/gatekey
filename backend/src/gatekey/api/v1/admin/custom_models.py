@@ -59,12 +59,15 @@ from gatekey.api.deps import (
 from gatekey.db.models.custom_model import CustomModel
 from gatekey.db.session import get_db_session
 from gatekey.errors import ProviderUpstreamError
-from gatekey.providers.model_registry import ModelCapability
+from gatekey.providers.model_registry import MODEL_REGISTRY, ModelCapability
 from gatekey.providers.vertex_ai import VertexAITokenCache
 from gatekey.schemas.custom_model import (
+    AvailableModelEntry,
     CustomModelCreateRequest,
+    CustomModelProvider,
     CustomModelResponse,
     CustomModelUpdateRequest,
+    RegistryModelEntry,
     is_shadowed_by_registry,
 )
 from gatekey.services.audit import write_audit_entry
@@ -80,6 +83,7 @@ from gatekey.services.custom_models import (
     verify_custom_model,
 )
 from gatekey.services.encryption import KeyProvider
+from gatekey.services.model_catalog import list_available_models
 from gatekey.services.sessions import SessionContext
 
 router = APIRouter(prefix="/v1/admin/custom-models", tags=["admin", "custom-models"])
@@ -108,6 +112,7 @@ def _to_response(row: CustomModel) -> CustomModelResponse:
         pricing_as_of=row.pricing_as_of,
         verified=row.verified,
         shadowed_by_registry=is_shadowed_by_registry(row.name),
+        fallback_model_names=list(row.fallback_model_names) if row.fallback_model_names else [],
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -120,6 +125,75 @@ async def list_custom_models_endpoint(
 ) -> list[CustomModelResponse]:
     rows = await list_custom_models(session)
     return [_to_response(row) for row in rows]
+
+
+@router.get("/registry-model-names", response_model=list[str])
+async def list_registry_model_names_endpoint(
+    ctx: AdminContext = Depends(require_admin_or_auditor),
+) -> list[str]:
+    """Every static `MODEL_REGISTRY` key, sorted - zero I/O.
+
+    Exists solely so the admin console's fallback-chain picker (Model
+    Catalog technical design doc section 6, task 14) can offer the built-in
+    registry models as fallback TARGETS alongside the org's own custom
+    models (`GET /v1/admin/custom-models`) and self-hosted model ids (`GET
+    /v1/admin/self-hosted-providers`) - both of those already have list
+    endpoints; this was the one missing source, since `MODEL_REGISTRY` is a
+    code-only dict with no existing admin-facing enumeration. Deliberately
+    NOT `GET /v1/models` (`api/v1/gateway/models.py`) - that endpoint
+    requires a gateway credential (`gk_sk_`/`gk_pk_`), not an admin session,
+    and filters to only the caller's OWN policy-allowed models; an admin
+    configuring a fallback chain needs to see every registry model that
+    EXISTS, regardless of any one team's policy narrowing. Path placed
+    before `/{custom_model_id}` for the same readability reason `available/
+    {provider}` above is."""
+    return sorted(MODEL_REGISTRY.keys())
+
+
+@router.get("/registry-models", response_model=list[RegistryModelEntry])
+async def list_registry_models_endpoint(
+    ctx: AdminContext = Depends(require_admin_or_auditor),
+) -> list[RegistryModelEntry]:
+    """Every static `MODEL_REGISTRY` entry, `name` paired with `provider`,
+    sorted by name - zero I/O. See `RegistryModelEntry`'s docstring: exists
+    for Model Policy's provider-scoped checklist to source `vertex_ai`
+    (no live-listing support) from something other than a hand-typed
+    frontend list. Path placed alongside `registry-model-names` above for
+    the same before-`/{custom_model_id}` readability reason."""
+    return sorted(
+        (RegistryModelEntry(name=name, provider=route.provider) for name, route in MODEL_REGISTRY.items()),
+        key=lambda entry: entry.name,
+    )
+
+
+@router.get("/available/{provider}", response_model=list[AvailableModelEntry])
+async def list_available_models_endpoint(
+    provider: CustomModelProvider,
+    ctx: AdminContext = Depends(require_admin_or_auditor),
+    session: AsyncSession = Depends(get_db_session),
+    key_provider: KeyProvider = Depends(get_key_provider),
+    http_client: httpx.AsyncClient = Depends(get_provider_http_client),
+) -> list[AvailableModelEntry]:
+    """Live per-provider model catalog lookup (Model Catalog technical
+    design doc section 1.3/1.5) - `services.model_catalog.
+    list_available_models()` does all the real work (credential fetch,
+    dispatch, pricing reverse-index join); this handler is a thin wire-up,
+    identical in spirit to `verify_custom_model_endpoint`'s own
+    `key_provider`/`http_client` dependency wiring above.
+
+    Purely informational, no side effect of any kind - no DB write, no
+    audit entry (unlike `verify_custom_model_endpoint`, which DOES write
+    one because it performs a real, billable-adjacent provider probe; this
+    endpoint never calls `verify_custom_model()` or anything that mutates a
+    `custom_models` row). Path placed BEFORE `/{custom_model_id}` below only
+    for readability (both routes are unambiguous regardless of declaration
+    order - two path segments here vs. one there - but grouping the static
+    `available/...` route near the top mirrors this router's own top-to-
+    bottom "list, then read-by-id, then write" narrative).
+    """
+    return await list_available_models(
+        session, provider, key_provider=key_provider, http_client=http_client
+    )
 
 
 @router.get("/{custom_model_id}", response_model=CustomModelResponse)
@@ -169,6 +243,7 @@ async def register_custom_model_endpoint(
             "input_price_per_million_usd": payload.input_price_per_million_usd,
             "output_price_per_million_usd": payload.output_price_per_million_usd,
             "pricing_source": payload.pricing_source,
+            "fallback_model_names": payload.fallback_model_names,
         },
         source_ip=source_ip,
     )
@@ -182,6 +257,7 @@ async def register_custom_model_endpoint(
         input_price_per_million_usd=payload.input_price_per_million_usd,
         output_price_per_million_usd=payload.output_price_per_million_usd,
         pricing_source=payload.pricing_source,
+        fallback_model_names=payload.fallback_model_names,
     )
     await _refresh_cache(session, cache)
     return _to_response(row)
@@ -208,6 +284,11 @@ async def edit_custom_model_endpoint(
     # `services.custom_models.edit_custom_model`'s
     # `output_price_per_million_usd_provided` parameter.
     output_price_provided = "output_price_per_million_usd" in payload.model_fields_set
+    # Model Catalog + Cross-Provider Fallback Chains (Part B) - identical
+    # `model_fields_set`-based disambiguation, see `schemas.custom_model.
+    # CustomModelUpdateRequest`'s docstring / `services.custom_models.
+    # edit_custom_model`'s `fallback_model_names_provided` parameter.
+    fallback_model_names_provided = "fallback_model_names" in payload.model_fields_set
 
     await write_audit_entry(
         session,
@@ -224,6 +305,9 @@ async def edit_custom_model_endpoint(
             "output_price_per_million_usd": existing.output_price_per_million_usd,
             "pricing_source": existing.pricing_source,
             "verified": existing.verified,
+            "fallback_model_names": list(existing.fallback_model_names)
+            if existing.fallback_model_names
+            else [],
         },
         new_value=payload.model_dump(exclude_unset=True),
         source_ip=source_ip,
@@ -239,6 +323,8 @@ async def edit_custom_model_endpoint(
         output_price_per_million_usd=payload.output_price_per_million_usd,
         output_price_per_million_usd_provided=output_price_provided,
         pricing_source=payload.pricing_source,
+        fallback_model_names=payload.fallback_model_names,
+        fallback_model_names_provided=fallback_model_names_provided,
     )
     await _refresh_cache(session, cache)
     return _to_response(row)

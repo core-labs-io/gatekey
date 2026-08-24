@@ -105,29 +105,32 @@ async def get_drift_status_endpoint(
         row.model: row.enabled
         for row in (await session.execute(select(CanaryModelSetting))).scalars().all()
     }
-    last_run_by_model = dict(
-        (
+    last_run_by_model: dict[str, datetime] = {
+        model: run_at
+        for model, run_at in (
             await session.execute(
                 select(CanaryRun.model, func.max(CanaryRun.run_at)).group_by(CanaryRun.model)
             )
         ).all()
-    )
-    baseline_counts_by_model = dict(
-        (
+    }
+    baseline_counts_by_model: dict[str, int] = {
+        model: count
+        for model, count in (
             await session.execute(
                 select(CanaryBaseline.model, func.count()).group_by(CanaryBaseline.model)
             )
         ).all()
-    )
-    open_alert_counts_by_model = dict(
-        (
+    }
+    open_alert_counts_by_model: dict[str, int] = {
+        model: count
+        for model, count in (
             await session.execute(
                 select(DriftAlert.model, func.count())
                 .where(DriftAlert.status == "open")
                 .group_by(DriftAlert.model)
             )
         ).all()
-    )
+    }
 
     return [
         DriftModelStatusResponse(

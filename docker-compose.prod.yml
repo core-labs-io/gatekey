@@ -1,0 +1,155 @@
+# Gatekey - production deployment behind Caddy with automatic TLS.
+#
+#   cp .env.prod.example .env    # fill in the four required values
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Full guide (DNS/TLS, backups, upgrade/rollback, SSO): docs/production.md
+#
+# Differences from the local docker-compose.yml, deliberately:
+#   - Caddy terminates TLS on one public domain and routes /v1/* + /healthz
+#     to the backend and everything else to the console - same-origin, so
+#     no CORS config and no cross-origin cookie pitfalls.
+#   - Postgres password is parametrized (GATEKEY_DB_PASSWORD, required).
+#   - Postgres/Redis/backend/frontend ports are NOT published to the host -
+#     Caddy is the only ingress.
+#   - GATEKEY_TRUST_PROXY_HEADERS=true (Caddy overwrites X-Forwarded-For,
+#     so audit source IPs record the real client, not the proxy).
+#   - Session cookies keep their Secure default - correct behind TLS.
+#   - Memory limits on every service.
+#   - Images default to the published GHCR tags; `--build` builds the same
+#     names from the local checkout instead (see docs/production.md).
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      GATEKEY_DOMAIN: ${GATEKEY_DOMAIN:?Set GATEKEY_DOMAIN in .env - see .env.prod.example}
+    volumes:
+      - ./devops/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - gatekey_caddy_data:/data
+      - gatekey_caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gatekey
+      POSTGRES_PASSWORD: ${GATEKEY_DB_PASSWORD:?Set GATEKEY_DB_PASSWORD in .env - see .env.prod.example}
+      POSTGRES_DB: gatekey
+    volumes:
+      - gatekey_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatekey -d gatekey"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    profiles: ["cache"]
+    volumes:
+      - gatekey_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  backend:
+    image: ${GATEKEY_BACKEND_IMAGE:-ghcr.io/core-labs-io/gatekey-backend:latest}
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://gatekey:${GATEKEY_DB_PASSWORD}@postgres:5432/gatekey
+      GATEKEY_ADMIN_TOKEN: ${GATEKEY_ADMIN_TOKEN:?Set GATEKEY_ADMIN_TOKEN in .env - see .env.prod.example}
+      GATEKEY_MASTER_KEY: ${GATEKEY_MASTER_KEY:?Set GATEKEY_MASTER_KEY in .env - see .env.prod.example}
+      # Console and API share https://<domain> via Caddy's routing.
+      GATEKEY_FRONTEND_ORIGIN: https://${GATEKEY_DOMAIN}
+      # Caddy overwrites X-Forwarded-For on the way in, so trusting it is
+      # correct here (and records real client IPs in the audit trail).
+      GATEKEY_TRUST_PROXY_HEADERS: "true"
+      GATEKEY_REDIS_URL: ${GATEKEY_REDIS_URL:-}
+      GATEKEY_PROVIDER_VALIDATION_TIMEOUT_SECONDS: ${GATEKEY_PROVIDER_VALIDATION_TIMEOUT_SECONDS:-8}
+      # Optional pass-throughs (unset stays unset inside the container).
+      GATEKEY_SESSION_COOKIE_SECURE:
+      GATEKEY_SESSION_TTL_HOURS:
+      GATEKEY_OIDC_ISSUER_URL:
+      GATEKEY_OIDC_CLIENT_ID:
+      GATEKEY_OIDC_CLIENT_SECRET:
+      GATEKEY_OIDC_REDIRECT_URI:
+      GATEKEY_SMTP_HOST:
+      GATEKEY_SMTP_PORT:
+      GATEKEY_SMTP_USERNAME:
+      GATEKEY_SMTP_PASSWORD:
+      GATEKEY_SMTP_FROM_ADDRESS:
+      GATEKEY_SMTP_USE_TLS:
+    healthcheck:
+      # /readyz (not /healthz): fails when the database - or Redis, when
+      # configured - is actually unreachable, so a container with a dead
+      # dependency never reports healthy.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  frontend:
+    image: ${GATEKEY_FRONTEND_IMAGE:-ghcr.io/core-labs-io/gatekey-frontend:latest}
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # Browser-facing API base URL - same origin as the console, courtesy
+      # of Caddy's path routing. Applied at container start (the image is
+      # host-agnostic - see frontend/docker-entrypoint.sh).
+      GATEKEY_PUBLIC_API_BASE_URL: https://${GATEKEY_DOMAIN}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/login').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  gatekey_postgres_data:
+  gatekey_redis_data:
+  gatekey_caddy_data:
+  gatekey_caddy_config:

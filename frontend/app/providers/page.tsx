@@ -39,51 +39,42 @@
  * by any GET, so the edit form always starts blank and only overwrites the
  * stored credential if a new value is actually typed.
  *
- * Custom Model Registry (CMR): a "Custom Models" card, sibling to and
- * placed directly adjacent to "Self-Hosted Models" (technical design doc
- * section 5, row 24) - admin-registered BYOK model mappings
- * (openai/anthropic/vertex_ai/openrouter; NOT ollama, which stays on the
- * Self-Hosted Models card above) with real per-token pricing, gated behind
- * a one-time live "Test model" verification call before becoming routable.
- * RBAC is enforced in this component, not just trusted to the backend:
- * `useCallerRole()` (already established by the Phase 5 Differentiators
- * screens) hides the whole card for a Team Lead/Member session
- * (`role === "other"`), and hides every register/edit/remove/verify control
- * - never just disables them - for an Auditor session, which still sees the
- * identical read-only list (`require_admin_or_auditor` on the backend GET).
+ * Custom Model Registry (CMR): registration/edit/remove/verify + the Model
+ * Catalog + Cross-Provider Fallback Chains feature (live per-provider
+ * listing, ordered fallback chains) now live on their own dedicated
+ * `/model-catalog` screen, not a card on this page - that page's own module
+ * docstring explains why (the fallback-chain picker and live-listing flow
+ * need materially more screen space than a Providers-page card can offer,
+ * and a single canonical place to manage custom models avoids two
+ * independently-maintained, potentially-diverging CRUD surfaces for the
+ * same backend resource). This page keeps only a thin pointer link, mirroring
+ * the inverse of the "Self-Hosted Governance" read-only-elsewhere/CRUD-here
+ * split already established below for Self-Hosted Models.
  */
 
 import { useEffect, useState } from "react";
 import { ConsoleShell } from "@/components/ConsoleShell";
 import { Badge, ConfirmDialog, DataTable, FieldError, Modal, useToast, type BadgeTone } from "@/components/ui";
-import { useCallerRole } from "@/components/differentiators";
 import Link from "next/link";
 import { ProviderKeyForm } from "@/components/ProviderKeyForm";
+import { ModelEnablePicker, type ModelEnablePickerProvider } from "@/components/model-enable-picker";
 import { RotationPolicyForm } from "@/components/rotation";
 import {
   ApiError,
   checkProviderKeyHealth,
   deleteProviderKey,
   deleteProviderKeyById,
-  editCustomModel,
   editSelfHostedProvider,
   getProviderKeyRotationPolicy,
-  listCustomModels,
   listProviderKeys,
   listProviders,
   listSelfHostedProviders,
   putProviderKeyRotationPolicy,
-  registerCustomModel,
   registerSelfHostedProvider,
-  removeCustomModel,
   removeSelfHostedProvider,
   reverifySelfHostedProvider,
   updateProviderKeyFailoverConfig,
-  verifyCustomModel,
   PROVIDER_LABELS,
-  type CustomModelCapability,
-  type CustomModelProvider,
-  type CustomModelResponse,
   type ProviderKeyFailoverConfigResponse,
   type ProviderKeyListItem,
   type ProviderKeyResponse,
@@ -93,6 +84,15 @@ import {
 } from "@/lib/api";
 
 const PROVIDERS: ProviderName[] = ["openai", "anthropic", "vertex_ai", "ollama", "openrouter"];
+
+/** The guided "select models to enable" flow only ever makes sense for a
+ * BYOK provider with a live catalog: vertex_ai has no live listing
+ * (`custom_model_live_listing_unsupported`, handled defensively inside
+ * `ModelEnablePicker` regardless) and ollama has its own separate
+ * Self-Hosted Models flow. */
+function isModelEnablePickerEligible(provider: ProviderName): provider is ModelEnablePickerProvider {
+  return provider === "openai" || provider === "anthropic" || provider === "openrouter";
+}
 
 function healthTone(status: string): BadgeTone {
   switch (status) {
@@ -680,334 +680,28 @@ function SelfHostedModelsCard() {
   );
 }
 
-// --- Custom Models (Custom Model Registry, CMR) -------------------------------
+// --- Custom Models (Custom Model Registry, CMR) pointer ------------------------
+//
+// Actual registration/edit/remove/verify - plus the Model Catalog +
+// Cross-Provider Fallback Chains feature (live per-provider listing,
+// ordered fallback chains) - lives on the dedicated `/model-catalog`
+// screen. See this component's module docstring for why that CRUD surface
+// was consolidated there instead of staying as a card on this page.
 
-const CUSTOM_MODEL_PROVIDERS: CustomModelProvider[] = ["openai", "anthropic", "vertex_ai", "openrouter"];
-
-function CustomModelForm({
-  initial,
-  onClose,
-  onSaved,
-}: {
-  initial: CustomModelResponse | null;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const [name, setName] = useState(initial?.name ?? "");
-  const [provider, setProvider] = useState<CustomModelProvider>(
-    (initial?.provider as CustomModelProvider) ?? "openai"
-  );
-  const [nativeModelId, setNativeModelId] = useState(initial?.native_model_id ?? "");
-  const [capability, setCapability] = useState<CustomModelCapability>(
-    (initial?.capability as CustomModelCapability) ?? "chat"
-  );
-  const [inputPrice, setInputPrice] = useState(initial?.input_price_per_million_usd ?? "");
-  const [outputPrice, setOutputPrice] = useState(initial?.output_price_per_million_usd ?? "");
-  const [pricingSource, setPricingSource] = useState(initial?.pricing_source ?? "");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function handleSave() {
-    setError(null);
-    if (!name.trim() || !nativeModelId.trim() || !inputPrice.trim()) {
-      setError("Name, native model id, and input price are required.");
-      return;
-    }
-    if (capability === "chat" && !outputPrice.trim()) {
-      setError("Output price is required for chat-capability models.");
-      return;
-    }
-    setBusy(true);
-    try {
-      if (initial) {
-        await editCustomModel(initial.id, {
-          name: name.trim(),
-          provider,
-          native_model_id: nativeModelId.trim(),
-          capability,
-          input_price_per_million_usd: inputPrice.trim(),
-          // Explicit null (not omitted) clears a previously-required price
-          // when editing capability from "chat" to "embeddings" - the
-          // backend distinguishes "omitted" from "explicit null".
-          output_price_per_million_usd: capability === "chat" ? outputPrice.trim() : null,
-          pricing_source: pricingSource.trim() || null,
-        });
-      } else {
-        await registerCustomModel({
-          name: name.trim(),
-          provider,
-          native_model_id: nativeModelId.trim(),
-          capability,
-          input_price_per_million_usd: inputPrice.trim(),
-          // Must be omitted entirely (never sent, not even null) for
-          // "embeddings" on create - the backend's write-time guard/DB
-          // CHECK rejects a mismatch either way.
-          ...(capability === "chat" ? { output_price_per_million_usd: outputPrice.trim() } : {}),
-          pricing_source: pricingSource.trim() || null,
-        });
-      }
-      onSaved();
-    } catch (err) {
-      // 422 (static-registry collision, self-hosted collision, embeddings/
-      // provider mismatch, ollama rejection) and 409 (name conflict) all
-      // carry a specific backend message - surfaced verbatim, never
-      // collapsed into a generic failure.
-      setError(err instanceof ApiError ? err.message : "Failed to save custom model.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <Modal title={initial ? `Edit "${initial.name}"` : "Register custom model"} onClose={onClose}>
-      <div className="field">
-        <label>Name</label>
-        <input
-          type="text"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. gpt-5.5-preview"
-        />
-        <div className="field-hint">
-          The gateway-facing model name your requests will use. Must not collide with an existing
-          Gatekey model id or one already claimed by a self-hosted endpoint.
-        </div>
-      </div>
-      <div className="field">
-        <label>Provider</label>
-        <select value={provider} onChange={(e) => setProvider(e.target.value as CustomModelProvider)}>
-          {CUSTOM_MODEL_PROVIDERS.map((p) => (
-            <option key={p} value={p}>
-              {PROVIDER_LABELS[p]}
-            </option>
-          ))}
-        </select>
-        <div className="field-hint">
-          Routes through the BYOK key already on file for this provider - no new credential is
-          entered here. Ollama models are registered under Self-Hosted Models above instead.
-        </div>
-      </div>
-      <div className="field">
-        <label>Native model id</label>
-        <input
-          type="text"
-          value={nativeModelId}
-          onChange={(e) => setNativeModelId(e.target.value)}
-          placeholder="the literal id sent to the provider's own API"
-        />
-      </div>
-      <div className="field">
-        <label>Capability</label>
-        <select
-          value={capability}
-          onChange={(e) => {
-            const next = e.target.value as CustomModelCapability;
-            setCapability(next);
-            if (next === "embeddings") setOutputPrice("");
-          }}
-        >
-          <option value="chat">Chat</option>
-          <option value="embeddings">Embeddings</option>
-        </select>
-        {capability === "embeddings" ? (
-          <div className="field-hint">Embeddings capability is only supported for OpenAI and Vertex AI.</div>
-        ) : null}
-      </div>
-      <div className="field">
-        <label>Input price (USD per million tokens)</label>
-        <input
-          type="text"
-          value={inputPrice}
-          onChange={(e) => setInputPrice(e.target.value)}
-          placeholder="e.g. 2.50"
-        />
-      </div>
-      {capability === "chat" ? (
-        <div className="field">
-          <label>Output price (USD per million tokens)</label>
-          <input
-            type="text"
-            value={outputPrice}
-            onChange={(e) => setOutputPrice(e.target.value)}
-            placeholder="e.g. 10.00"
-          />
-          <div className="field-hint">Required for chat-capability models.</div>
-        </div>
-      ) : null}
-      <div className="field">
-        <label>Pricing source (optional)</label>
-        <input
-          type="text"
-          value={pricingSource}
-          onChange={(e) => setPricingSource(e.target.value)}
-          placeholder="e.g. a link to the provider's pricing page"
-        />
-      </div>
-      <FieldError message={error} />
-      <div className="modal-actions">
-        <button className="btn btn-secondary" onClick={onClose} disabled={busy}>
-          Cancel
-        </button>
-        <button className="btn btn-primary" onClick={handleSave} disabled={busy}>
-          {busy ? "Saving..." : "Save"}
-        </button>
-      </div>
-    </Modal>
-  );
-}
-
-function CustomModelsCard() {
-  // RBAC in the UI itself (not just trusting the backend to 403): Org Admin
-  // gets full CRUD + verify; Auditor gets the identical list, read-only, no
-  // mutating control rendered at all; Team Lead/Member never see this card
-  // exist (role === "other") - mirrors the Phase 5 Differentiators screens'
-  // `useCallerRole()` convention exactly.
-  const role = useCallerRole();
-  const toast = useToast();
-  const [rows, setRows] = useState<CustomModelResponse[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState<null | "new" | CustomModelResponse>(null);
-  const [removing, setRemoving] = useState<CustomModelResponse | null>(null);
-  const [removeBusy, setRemoveBusy] = useState(false);
-  const [verifyingId, setVerifyingId] = useState<string | null>(null);
-
-  function refresh() {
-    setLoading(true);
-    listCustomModels()
-      .then(setRows)
-      .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load custom models."))
-      .finally(() => setLoading(false));
-  }
-
-  // Hooks must run unconditionally - the role-based early return happens
-  // below, after every hook has already been declared.
-  useEffect(refresh, []);
-
-  if (role === "other") return null;
-  const canWrite = role === "org_admin";
-
-  async function handleRemove(row: CustomModelResponse) {
-    setRemoveBusy(true);
-    try {
-      await removeCustomModel(row.id);
-      toast.push("success", `"${row.name}" removed.`);
-      setRemoving(null);
-      refresh();
-    } catch (err) {
-      toast.push("error", err instanceof ApiError ? err.message : "Failed to remove custom model.");
-    } finally {
-      setRemoveBusy(false);
-    }
-  }
-
-  async function handleVerify(row: CustomModelResponse) {
-    setVerifyingId(row.id);
-    try {
-      const result = await verifyCustomModel(row.id);
-      toast.push(
-        result.verified ? "success" : "error",
-        result.verified
-          ? `"${row.name}" verified.`
-          : `"${row.name}" could not be verified - check the native model id.`
-      );
-      refresh();
-    } catch (err) {
-      // Never swallowed: a real provider failure (typo'd native id, no
-      // provider_keys row configured yet) and the 30s per-row cooldown's 429
-      // both carry a specific backend message, surfaced verbatim.
-      toast.push("error", err instanceof ApiError ? err.message : "Verification failed.");
-    } finally {
-      setVerifyingId(null);
-    }
-  }
-
+function CustomModelsPointerCard() {
   return (
     <div className="provider-card" style={{ flexDirection: "column", alignItems: "stretch" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div>
-          <div className="provider-card-name">Custom Models</div>
-          <div className="provider-card-meta">
-            Admin-registered BYOK model mappings (OpenAI, Anthropic, Vertex AI, OpenRouter) with
-            real per-token pricing, gated behind a one-time live "Test model" call.
-          </div>
+      <div>
+        <div className="provider-card-name">Custom Models</div>
+        <div className="provider-card-meta">
+          Admin-registered BYOK model mappings (OpenAI, Anthropic, Vertex AI, OpenRouter) with
+          real per-token pricing, live per-provider catalog lookup, and automatic cross-provider
+          fallback chains now live on their own screen.
         </div>
-        {canWrite ? (
-          <button className="btn" onClick={() => setEditing("new")}>
-            + Register
-          </button>
-        ) : null}
       </div>
-      {error ? <div className="banner banner-error" style={{ marginTop: 12 }}>{error}</div> : null}
-      {loading ? (
-        <div className="skeleton skeleton-text" style={{ marginTop: 12 }} />
-      ) : rows.length === 0 ? (
-        <div className="text-muted" style={{ marginTop: 12 }}>
-          No custom models registered yet.
-        </div>
-      ) : (
-        <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
-          {rows.map((row) => (
-            <div key={row.id} style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 12 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-                <span style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                  <span className={`status-dot ${row.verified ? "status-dot-on" : "status-dot-off"}`} />
-                  <span className="mono">{row.name}</span>
-                  <Badge tone={row.verified ? "green" : "gray"}>{row.verified ? "Verified" : "Not verified"}</Badge>
-                  {row.shadowed_by_registry ? (
-                    <Badge
-                      tone="red"
-                      title="A newer Gatekey release now defines this same model name - live requests route to that static entry, not this custom mapping. Rename or remove this row."
-                    >
-                      Shadowed by registry update
-                    </Badge>
-                  ) : null}
-                </span>
-                {canWrite ? (
-                  <span style={{ display: "flex", gap: 8 }}>
-                    <button className="btn-link" onClick={() => handleVerify(row)} disabled={verifyingId === row.id}>
-                      {verifyingId === row.id ? "Testing..." : "Test model"}
-                    </button>
-                    <button className="btn-link" onClick={() => setEditing(row)}>
-                      Edit
-                    </button>
-                    <button className="btn-link" style={{ color: "var(--red)" }} onClick={() => setRemoving(row)}>
-                      Remove
-                    </button>
-                  </span>
-                ) : null}
-              </div>
-              <div className="text-muted" style={{ fontSize: 12, marginTop: 4 }}>
-                {PROVIDER_LABELS[row.provider as ProviderName] ?? row.provider} · {row.native_model_id} ·{" "}
-                {row.capability} · ${row.input_price_per_million_usd}/M in
-                {row.output_price_per_million_usd ? <> · ${row.output_price_per_million_usd}/M out</> : null}
-                {row.pricing_source ? <> · Source: {row.pricing_source}</> : null}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-      {canWrite && editing ? (
-        <CustomModelForm
-          initial={editing === "new" ? null : editing}
-          onClose={() => setEditing(null)}
-          onSaved={() => {
-            toast.push("success", editing === "new" ? "Custom model registered." : "Custom model updated.");
-            setEditing(null);
-            refresh();
-          }}
-        />
-      ) : null}
-      {canWrite && removing ? (
-        <ConfirmDialog
-          title={`Remove "${removing.name}"?`}
-          consequence="Any request referencing this model name starts failing (404) immediately. Historical usage records referencing it are unaffected."
-          confirmLabel="Remove"
-          busy={removeBusy}
-          onCancel={() => setRemoving(null)}
-          onConfirm={() => handleRemove(removing)}
-        />
-      ) : null}
+      <Link href="/model-catalog" className="btn" style={{ marginTop: 12, alignSelf: "flex-start" }}>
+        Open Model Catalog &rarr;
+      </Link>
     </div>
   );
 }
@@ -1027,6 +721,11 @@ export default function ProvidersPage() {
   const [rotating, setRotating] = useState<ProviderName | null>(null);
   const [checkingKeyId, setCheckingKeyId] = useState<string | null>(null);
   const [configuringFailover, setConfiguringFailover] = useState<ProviderKeyListItem | null>(null);
+  // Guided "select models to enable" flow (see `ModelEnablePicker`'s module
+  // doc comment) - opened right after a successful "save" (add or edit; NOT
+  // rotate, which uses its own separate `ProviderRotationModal`) for an
+  // eligible provider.
+  const [modelPickerProvider, setModelPickerProvider] = useState<ModelEnablePickerProvider | null>(null);
   // Hardening pass item 3: session-scoped OPTIMISTIC-UPDATE overlay only,
   // holding whatever `updateProviderKeyFailoverConfig()` most recently
   // returned - applied immediately so the UI updates before the next
@@ -1129,7 +828,7 @@ export default function ProvidersPage() {
         {error ? <div className="banner banner-error">{error}</div> : null}
 
         <div className="panel" style={{ marginBottom: 16 }}>
-          <div className="panel-title">Reliability (Phase 4)</div>
+          <div className="panel-title">Reliability</div>
           <p className="text-muted">
             A provider can hold more than one labeled key - health, availability, and backup-group
             membership for each are shown per key below. Multi-key failover groups and their
@@ -1200,7 +899,7 @@ export default function ProvidersPage() {
 
         <SelfHostedModelsCard />
 
-        <CustomModelsCard />
+        <CustomModelsPointerCard />
 
         {formState ? (
           <Modal
@@ -1217,9 +916,16 @@ export default function ProvidersPage() {
               hasExistingKeys={(keysByProvider.get(formState.provider)?.length ?? 0) > 0}
               onCancel={() => setFormState(null)}
               onSaved={() => {
-                toast.push("success", `${PROVIDER_LABELS[formState.provider]} key saved.`);
+                const savedProvider = formState.provider;
+                toast.push("success", `${PROVIDER_LABELS[savedProvider]} key saved.`);
                 setFormState(null);
                 refresh();
+                // "save" mode only (both "Add key" and "Edit key" use this
+                // modal - "rotate" lives entirely in `ProviderRotationModal`
+                // below and never reaches this callback).
+                if (isModelEnablePickerEligible(savedProvider)) {
+                  setModelPickerProvider(savedProvider);
+                }
               }}
             />
           </Modal>
@@ -1276,6 +982,10 @@ export default function ProvidersPage() {
               refresh();
             }}
           />
+        ) : null}
+
+        {modelPickerProvider ? (
+          <ModelEnablePicker provider={modelPickerProvider} onClose={() => setModelPickerProvider(null)} />
         ) : null}
       </div>
     </ConsoleShell>

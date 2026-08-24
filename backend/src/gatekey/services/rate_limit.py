@@ -31,7 +31,6 @@ and loaded into a cache at startup (see `load_rate_limit_cache`).
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
 import uuid
@@ -547,13 +546,26 @@ class RateLimiter:
         user_id: uuid.UUID,
         provider: str,
         model: str,
+        key_id: str,
     ) -> list[dict[str, Any]]:
         """Process the rate limit queue and return items that can be retried.
 
         This is called by the queue processor background worker to retry
         queued requests when the limit has cleared.
+
+        Post-ship fix: `key_id` was missing from this signature entirely
+        (a mypy-flagged incomplete refactor - `_queue_key` and `enqueue()`
+        both already require it, matching the queue key format
+        `rate_limit_queue:v1:{team_id}:{user_id}:{provider}:{model}:
+        {key_id}`; this function tried to build that same key with one
+        fewer component). Separately, and NOT fixed here: grepping the
+        whole codebase finds zero callers of `process_queue`/`clear_queue`
+        anywhere - the "queue and retry" behavior enqueues requests
+        (`enqueue()` above) but nothing ever actually retries or clears
+        that queue. Flagged as a real, separate functional gap - fixing
+        the type signature doesn't make the feature wired up.
         """
-        queue_key = _queue_key(team_id, user_id, provider, model)
+        queue_key = _queue_key(team_id, user_id, provider, model, key_id)
         now = time.time()
 
         try:
@@ -579,12 +591,17 @@ class RateLimiter:
         user_id: uuid.UUID,
         provider: str,
         model: str,
+        key_id: str,
     ) -> bool:
         """Clear the rate limit queue for a user.
 
         Called after a queued request is successfully processed or times out.
+
+        Post-ship fix: same missing-`key_id` gap as `process_queue()` above
+        - see that docstring for the fuller note (also dead: zero callers
+        of this method anywhere in the codebase either).
         """
-        queue_key = _queue_key(team_id, user_id, provider, model)
+        queue_key = _queue_key(team_id, user_id, provider, model, key_id)
 
         try:
             await self._store.set_json(queue_key, [], ttl_seconds=0)

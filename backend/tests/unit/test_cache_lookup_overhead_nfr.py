@@ -82,7 +82,7 @@ from gatekey.schemas.chat import (
     ChatCompletionChoice,
     ChatCompletionResponse,
     ChatCompletionUsage,
-    ChatMessage,
+    ChatCompletionResponseMessage,
 )
 from gatekey.services import budget as budget_service
 from gatekey.services.proxy_keys import ApiKeyCredential
@@ -114,7 +114,7 @@ def _fake_response(native_model_id: str) -> ChatCompletionResponse:
         model=native_model_id,
         choices=[
             ChatCompletionChoice(
-                index=0, message=ChatMessage(role="assistant", content="hi"), finish_reason="stop"
+                index=0, message=ChatCompletionResponseMessage(role="assistant", content="hi"), finish_reason="stop"
             )
         ],
         usage=ChatCompletionUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),

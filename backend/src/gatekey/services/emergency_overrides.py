@@ -91,13 +91,24 @@ async def grant_emergency_override(
 
 
 async def revoke_emergency_override(
-    session: AsyncSession, override_id: uuid.UUID, *, revoked_by_user_id: uuid.UUID
+    session: AsyncSession, override_id: uuid.UUID, *, revoked_by_user_id: uuid.UUID | None
 ) -> EmergencyOverride | None:
     """Returns `None` if the id doesn't exist OR was already revoked
     (idempotent no-op in both cases, same disambiguation-by-caller
     convention as `services.service_accounts.revoke_service_account`).
     Commits internally - same second-commit deviation as `grant_emergency_
-    override` above."""
+    override` above.
+
+    `revoked_by_user_id` is nullable (unlike `grant_emergency_override`'s
+    required `granted_by_user_id`, `ON DELETE RESTRICT`) - deliberately:
+    `require_team_role`'s org-admin/break-glass bypass lets the break-glass
+    bearer revoke an override for any team (revoking reduces risk, unlike
+    granting), and a break-glass caller has no real `user_id` to record
+    (see the audit trail's identical `actor_user_id=None` /
+    `actor_label="system:admin_token"` treatment elsewhere). This parameter
+    was previously typed non-nullable, mismatching the DB column
+    (`db/models/emergency_override.py`), which was the real gap - not the
+    call site passing `UUID | None`."""
     row = (
         await session.execute(select(EmergencyOverride).where(EmergencyOverride.id == override_id))
     ).scalar_one_or_none()

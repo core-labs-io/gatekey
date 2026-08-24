@@ -73,10 +73,14 @@ async def _authorize_org_admin_or_team_lead(
         return
     if team_id is None:
         raise ForbiddenError(f"Only an Org Admin may {action} the cache org-wide.")
+    # `removed_at IS NULL` (added by `0049`) - same RBAC-must-cut-off-
+    # immediately reasoning as `api.deps._get_team_membership`.
     membership = (
         await session.execute(
             select(TeamMembership).where(
-                TeamMembership.team_id == team_id, TeamMembership.user_id == ctx.user_id
+                TeamMembership.team_id == team_id,
+                TeamMembership.user_id == ctx.user_id,
+                TeamMembership.removed_at.is_(None),
             )
         )
     ).scalar_one_or_none()

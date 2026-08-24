@@ -47,6 +47,9 @@ dependencies = [
     # GATEKEY_REDIS_URL is set; redis-py ships native asyncio support
     # (`redis.asyncio`) since 4.2, no separate aioredis package needed.
     "redis>=5.0,<6.0",
+    # Tier 4 (ops polish): /metrics endpoint - the standard Prometheus
+    # client, counters/histograms recorded by the observability middleware.
+    "prometheus-client>=0.20,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -54,7 +57,7 @@ dev = [
     "pytest>=8.0,<9.0",
     "pytest-asyncio>=0.23,<1.0",
     "pytest-cov>=5.0,<6.0",
-    "ruff>=0.5,<1.0",
+    "ruff==0.15.21",
     "mypy>=1.10,<2.0",
 ]
 
@@ -79,6 +82,30 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint.per-file-ignores]
+# `sf` (a session-factory fixture defined in tests/integration/phase2_helpers.py,
+# not conftest.py) must be imported into each test file that uses it - pytest
+# only discovers a non-conftest fixture in files that import the decorated
+# function into their own module namespace. Every test function that then
+# takes `sf` as a parameter is consuming that imported fixture by design (the
+# normal pytest pattern), not accidentally shadowing it - ruff's F811 doesn't
+# know about pytest's fixture-injection semantics and flags every one of
+# those parameters as a "redefinition" of the import. Removing the import
+# breaks fixture discovery (`fixture 'sf' not found`) - verified by actually
+# doing it and running the suite, not assumed. Scoped to exactly the files
+# that import `sf` from phase2_helpers, not the whole test suite, so a real
+# F811 elsewhere still gets caught.
+"tests/integration/test_access_schedule_gateway.py" = ["F811"]
+"tests/integration/test_custom_model_end_user_visibility_gap.py" = ["F811"]
+"tests/integration/test_custom_models_api.py" = ["F811"]
+"tests/integration/test_member_model_restrictions_api.py" = ["F811"]
+"tests/integration/test_org_budget_safeguard.py" = ["F811"]
+"tests/integration/test_phase2_budget_concurrency.py" = ["F811"]
+"tests/integration/test_phase2_governance_api.py" = ["F811"]
+"tests/integration/test_phase4_team_rbac.py" = ["F811"]
+"tests/integration/test_scim_e2e.py" = ["F811"]
+"tests/integration/test_shadow_ai_e2e.py" = ["F811"]
 
 [tool.mypy]
 python_version = "3.11"

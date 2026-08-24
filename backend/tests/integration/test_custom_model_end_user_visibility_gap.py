@@ -57,8 +57,7 @@ from fastapi import FastAPI
 
 import asyncpg
 
-from gatekey.api.deps import get_custom_model_route_cache, get_provider_http_client
-from gatekey.db.models.user import UserOrgRole
+from gatekey.api.deps import get_custom_model_route_cache
 from gatekey.services.custom_models import (
     CustomModelCacheEntry,
     CustomModelRouteCache,

@@ -19,7 +19,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Reasonable sanity bounds only - see module docstring. Not provider-format-specific.
 _MIN_API_KEY_LENGTH = 1
@@ -112,14 +112,46 @@ class VertexAIKeyRequest(BaseModel):
         return value
 
 
+_MAX_TRUSTED_PROVIDER_SLUGS = 20
+_MAX_PROVIDER_SLUG_LENGTH = 128
+
+
 class OpenRouterKeyRequest(BaseModel):
-    """Request body for `PUT /v1/admin/providers/openrouter/key`. Identical
-    shape to `OpenAIKeyRequest` (AC-D1-1)."""
+    """Request body for `PUT /v1/admin/providers/openrouter/key`. Same
+    `api_key`/`label` shape as `OpenAIKeyRequest` (AC-D1-1), plus two
+    optional residency fields.
+
+    `trusted_provider_slugs`/`trusted_provider_region`: OpenRouter is a
+    multi-provider aggregator with no single knowable hosting region (see
+    `services.residency.resolve_model_region`'s module-level rationale) - by
+    default a request through it always resolves to an unknown region, which
+    an active residency rule blocks. These two fields let an admin make an
+    ENFORCED (not merely claimed) exception: OpenRouter's own `provider:
+    {"only": [...]}` request field (confirmed live, see `providers/
+    openrouter.py::create_chat_completion`) restricts which underlying
+    provider(s) OpenRouter is allowed to route to - if the admin names a set
+    of provider slugs they personally vouch for as being hosted in
+    `trusted_provider_region`, every outbound OpenRouter call is
+    UNCONDITIONALLY constrained to only that set (never just on the calls
+    where a residency rule happens to be active - see `providers/
+    openrouter.py`), which is what makes the resulting region claim true by
+    construction rather than an assumption. Both fields are optional and
+    mutually required (set together or not at all) - a region with no
+    provider restriction, or a restriction with no declared region, would
+    not actually mean anything."""
 
     model_config = ConfigDict(extra="forbid")
 
     api_key: str = Field(min_length=_MIN_API_KEY_LENGTH, max_length=_MAX_API_KEY_LENGTH)
     label: str = Field(default=_DEFAULT_KEY_LABEL, max_length=_MAX_LABEL_LENGTH)
+    # Underlying-provider slugs (OpenRouter's own vocabulary, e.g. "openai",
+    # "anthropic", "fireworks") the admin vouches for as hosted in
+    # `trusted_provider_region` - see class docstring. Not validated against
+    # a known-slugs list (OpenRouter's own catalog is the only source of
+    # truth for what's real, and it changes over time - same "minimal sanity
+    # bounds only" philosophy this whole module already follows).
+    trusted_provider_slugs: list[str] = Field(default_factory=list, max_length=_MAX_TRUSTED_PROVIDER_SLUGS)
+    trusted_provider_region: str | None = Field(default=None)
 
     @field_validator("api_key")
     @classmethod
@@ -134,6 +166,38 @@ class OpenRouterKeyRequest(BaseModel):
         if not value.strip():
             raise ValueError("label must not be blank.")
         return value
+
+    @field_validator("trusted_provider_slugs")
+    @classmethod
+    def _non_blank_slugs(cls, value: list[str]) -> list[str]:
+        cleaned = [slug.strip() for slug in value]
+        if any(not slug for slug in cleaned):
+            raise ValueError("trusted_provider_slugs entries must not be blank.")
+        if any(len(slug) > _MAX_PROVIDER_SLUG_LENGTH for slug in cleaned):
+            raise ValueError(f"trusted_provider_slugs entries must be at most {_MAX_PROVIDER_SLUG_LENGTH} characters.")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("trusted_provider_slugs must not contain duplicates.")
+        return cleaned
+
+    @field_validator("trusted_provider_region")
+    @classmethod
+    def _valid_region(cls, value: str | None) -> str | None:
+        # Local import - see `OllamaKeyRequest._valid_region`'s identical
+        # rationale for why this one field imports `services.residency`
+        # locally rather than at module level.
+        from gatekey.services.residency import SUPPORTED_REGIONS
+
+        if value is not None and value not in SUPPORTED_REGIONS:
+            raise ValueError(f"trusted_provider_region must be one of: {', '.join(sorted(SUPPORTED_REGIONS))}.")
+        return value
+
+    @model_validator(mode="after")
+    def _slugs_and_region_together(self) -> "OpenRouterKeyRequest":
+        if bool(self.trusted_provider_slugs) != bool(self.trusted_provider_region):
+            raise ValueError(
+                "trusted_provider_slugs and trusted_provider_region must be set together, or not at all."
+            )
+        return self
 
 
 class OllamaKeyRequest(BaseModel):

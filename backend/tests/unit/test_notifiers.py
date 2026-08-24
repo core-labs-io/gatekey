@@ -12,7 +12,10 @@ import pytest
 from gatekey.services.notifiers import (
     NotifierDispatcher,
     NotifyRecipient,
+    OrgNotifierDispatcher,
+    OrgThresholdAlertEvent,
     ThresholdAlertEvent,
+    build_org_webhook_payload,
     build_webhook_payload,
     crossed_thresholds,
     is_slack_webhook,
@@ -25,6 +28,22 @@ def _cross(old: str, new: str, ceiling: str | None, *, e80: bool = True, e100: b
         new_total=Decimal(new),
         ceiling=Decimal(ceiling) if ceiling is not None else None,
         alert_80_enabled=e80,
+        alert_100_enabled=e100,
+    )
+
+
+def _org_cross(
+    old: str, new: str, ceiling: str | None, *, e50: bool = True, e75: bool = True, e100: bool = True
+):
+    """Org-level equivalent (added alongside `0046`): 50/75/100%, not
+    team's 80/100 - a separate `thresholds` set passed explicitly."""
+    return crossed_thresholds(
+        old_total=Decimal(old),
+        new_total=Decimal(new),
+        ceiling=Decimal(ceiling) if ceiling is not None else None,
+        thresholds=(50, 75, 100),
+        alert_50_enabled=e50,
+        alert_75_enabled=e75,
         alert_100_enabled=e100,
     )
 
@@ -129,4 +148,77 @@ async def test_one_channel_failing_never_blocks_the_next():
 
     dispatcher = NotifierDispatcher([_Exploding(), _Recording()])
     await dispatcher.dispatch(_event())  # must not raise
+    assert delivered == [80]
+
+
+# --- org-level crossed_thresholds: 50/75/100%, not team's 80/100 (`0046`) ----
+
+
+def test_org_crossing_50_fires_once():
+    assert _org_cross("49", "51", "100") == [50]
+
+
+def test_org_crossing_all_three_in_one_charge_fires_all():
+    assert _org_cross("10", "150", "100") == [50, 75, 100]
+
+
+def test_org_80_is_not_a_recognized_threshold():
+    """80% crossing a $100 ceiling fires NOTHING at the org level - 80 isn't
+    in the org threshold set at all (unlike team level)."""
+    assert _org_cross("79", "85", "100") == []
+
+
+def test_org_disabled_thresholds_are_skipped():
+    assert _org_cross("10", "150", "100", e50=False) == [75, 100]
+    assert _org_cross("10", "150", "100", e75=False) == [50, 100]
+    assert _org_cross("10", "150", "100", e50=False, e75=False, e100=False) == []
+
+
+# --- org-level payload shape (added alongside migration `0045`) --------------
+
+
+def _org_event(pct: int = 80) -> OrgThresholdAlertEvent:
+    return OrgThresholdAlertEvent(
+        threshold_pct=pct,  # type: ignore[arg-type]
+        current_spend_usd=Decimal("8150.00"),
+        budget_ceiling_usd=Decimal("10000"),
+        currency="USD",
+        recipients=[NotifyRecipient(name="Admin", email="admin@example.com")],
+    )
+
+
+def test_org_slack_payload_is_text_only():
+    payload = build_org_webhook_payload(
+        _org_event(), "https://hooks.slack.com/services/T00/B00/x"
+    )
+    assert set(payload) == {"text"}
+    assert "organization" in payload["text"]
+    assert "80%" in payload["text"]
+
+
+def test_org_generic_payload_shape():
+    payload = build_org_webhook_payload(_org_event(100), "https://example.com/webhook")
+    assert payload["event"] == "org_budget_threshold_crossed"
+    assert "team_id" not in payload
+    assert payload["threshold_pct"] == 100
+    assert payload["current_spend_usd"] == "8150.00"
+    assert payload["budget_ceiling_usd"] == "10000"
+    assert payload["currency"] == "USD"
+    assert "recipients" not in payload
+
+
+@pytest.mark.asyncio
+async def test_org_dispatcher_one_channel_failing_never_blocks_the_next():
+    delivered = []
+
+    class _Exploding:
+        async def send(self, event):
+            raise RuntimeError("boom")
+
+    class _Recording:
+        async def send(self, event):
+            delivered.append(event.threshold_pct)
+
+    dispatcher = OrgNotifierDispatcher([_Exploding(), _Recording()])
+    await dispatcher.dispatch(_org_event())  # must not raise
     assert delivered == [80]

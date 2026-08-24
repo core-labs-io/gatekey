@@ -187,6 +187,13 @@ MODEL_REGISTRY: dict[str, ModelRoute] = {
         capability=ModelCapability.CHAT,
         native_model_id="openai/gpt-4o-mini",
     ),
+    # Meta's reasoning/agentic model, 1M-token context - verified live on
+    # openrouter.ai/meta/muse-spark-1.2 (real, not a typo) before adding.
+    "openrouter/meta/muse-spark-1.2": ModelRoute(
+        provider="openrouter",
+        capability=ModelCapability.CHAT,
+        native_model_id="meta/muse-spark-1.2",
+    ),
 }
 
 

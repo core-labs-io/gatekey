@@ -87,6 +87,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from gatekey.db.base import Base
 
 if TYPE_CHECKING:
+    from gatekey.db.models.backup_group import BackupGroup
     from gatekey.db.models.org import Org
     from gatekey.db.models.usage_log import UsageLog
 

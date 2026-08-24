@@ -16,6 +16,7 @@ import { getMe, getStoredToken, type MeResponse } from "@/lib/api";
 function landingPathFor(me: MeResponse): string {
   if (me.onboarding_status === "pending_profile") return "/onboarding/profile";
   if (me.onboarding_status === "pending_approval") return "/onboarding/pending";
+  if (me.onboarding_status === "pending_alert_email") return "/onboarding/alert-email";
   if (me.org_role === "org_admin") return "/dashboard";
   if (me.org_role === "auditor") return "/org-usage";
   return "/my-usage";

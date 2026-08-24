@@ -17,7 +17,9 @@ import pytest
 from gatekey.providers.anthropic import (
     ANTHROPIC_API_VERSION,
     ANTHROPIC_MESSAGES_URL,
+    ANTHROPIC_MODELS_URL,
     create_chat_completion,
+    list_models,
     stream_chat_completion,
 )
 from gatekey.providers.base import ProviderCallError, UnsupportedRequestError
@@ -339,3 +341,56 @@ async def test_streaming_chunk_sequence_role_then_deltas_then_finish():
     # All chunks share the same id/model (one logical response).
     assert len({c.id for c in chunks}) == 1
     assert all(c.model == "claude-sonnet-5" for c in chunks)
+
+
+# ---------------------------------------------------------------------------
+# list_models() - Model Catalog technical design doc section 1.5
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_models_maps_entries_with_no_pricing():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith(ANTHROPIC_MODELS_URL)
+        assert request.url.params["limit"] == "1000"
+        assert request.headers["x-api-key"] == "sk-ant-test"
+        assert request.headers["anthropic-version"] == ANTHROPIC_API_VERSION
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "claude-sonnet-5",
+                        "display_name": "Claude Sonnet 5",
+                        "type": "model",
+                    },
+                    {
+                        "id": "claude-opus-5",
+                        "display_name": "Claude Opus 5",
+                        "type": "model",
+                    },
+                ],
+                "has_more": False,
+            },
+        )
+
+    async with _client(handler) as client:
+        entries = await list_models(client, CREDENTIAL)
+
+    assert [e.native_model_id for e in entries] == ["claude-sonnet-5", "claude-opus-5"]
+    assert entries[0].display_name == "Claude Sonnet 5"
+    assert entries[0].input_price_per_million_usd is None
+    assert entries[0].output_price_per_million_usd is None
+
+
+@pytest.mark.asyncio
+async def test_list_models_maps_error_status_to_provider_call_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": "authentication_error"}})
+
+    async with _client(handler) as client:
+        with pytest.raises(ProviderCallError) as exc_info:
+            await list_models(client, CREDENTIAL)
+
+    assert exc_info.value.status_code == 401
+    assert "authentication_error" not in exc_info.value.message

@@ -83,10 +83,12 @@ from gatekey.errors import (
     DlpBlockedError,
     ModelDeniedError,
     ModelNotFoundError,
+    OrgBudgetExhaustedError,
     OutsideAllowedScheduleError,
     ProviderNotConfiguredError,
     RateLimitExceededError,
     ResidencyViolationError,
+    TeamMembershipRemovedError,
 )
 from gatekey.errors import UnsupportedRequestError as HttpUnsupportedRequestError
 from gatekey.providers.base import ProviderCallError
@@ -115,6 +117,7 @@ from gatekey.services.custom_models import CustomModelRouteCache
 from gatekey.services.emergency_overrides import get_active_override
 from gatekey.services.model_policy import (
     ContentAwareRuleCache,
+    MemberModelPolicyCache,
     ModelPolicyCache,
     TeamModelPolicyCache,
     resolve_content_classification,
@@ -306,11 +309,16 @@ async def check_access_schedule(
 _EMPTY_TEAM_CACHE = TeamModelPolicyCache()
 
 
+_EMPTY_MEMBER_CACHE = MemberModelPolicyCache()
+
+
 def check_model_policy(
     model: str,
     cache: ModelPolicyCache,
     team_cache: TeamModelPolicyCache | None = None,
     team_id: uuid.UUID | None = None,
+    member_cache: MemberModelPolicyCache | None = None,
+    user_id: uuid.UUID | None = None,
 ) -> None:
     """Enforce the org's model access policy for `model` (Phase 1.3).
 
@@ -327,22 +335,29 @@ def check_model_policy(
     alias table belongs anywhere near this function.
 
     Raises `errors.ModelDeniedError` (403) if denied. Pure, synchronous,
-    zero I/O - reads only `cache.get()` plus one in-process dict lookup for
-    the team overlay (AC-3a / Phase 2 AC1.7); never touches the database.
-    Call this only *after* `resolve_route()` has already succeeded, and
-    *before* any capability/provider check or credential fetch - see module
-    docstring for the full ordering.
+    zero I/O - reads only `cache.get()` plus in-process dict lookups for the
+    team/member overlays (AC-3a / Phase 2 AC1.7); never touches the
+    database. Call this only *after* `resolve_route()` has already
+    succeeded, and *before* any capability/provider check or credential
+    fetch - see module docstring for the full ordering.
 
     Phase 2 (BD-13): delegates to `resolve_model_access` - org baseline
-    first, then the team's narrowing overlay when `team_id` is not None.
-    The raised error's message names the blocking layer; its
-    `code`/`status_code` are unchanged.
+    first, then the team's narrowing overlay when `team_id` is not None,
+    then (one layer further) one specific member's own narrowing within
+    that team when BOTH `member_cache` and `user_id` are given. The raised
+    error's message names the blocking layer; its `code`/`status_code` are
+    unchanged. `member_cache=None`/`user_id=None` (any call site not yet
+    updated to pass them) preserves byte-for-byte pre-member-layer behavior,
+    same as `team_cache=None`/`team_id=None` already does for the team
+    layer.
     """
     decision = resolve_model_access(
         model,
         org_cache=cache,
         team_cache=team_cache if team_cache is not None else _EMPTY_TEAM_CACHE,
         team_id=team_id,
+        member_cache=member_cache if member_cache is not None else _EMPTY_MEMBER_CACHE,
+        user_id=user_id,
     )
     if not decision.allowed:
         assert decision.blocking_layer is not None  # None only when allowed
@@ -359,15 +374,17 @@ async def _resolve_provider_key_metadata(
     session: AsyncSession, route: ModelRoute
 ) -> dict[str, Any] | None:
     """The target provider's non-secret `key_metadata` - `None` for every
-    provider except vertex_ai/ollama (the only two `services.residency.
-    resolve_model_region()`/`services.response_cache.
+    provider except vertex_ai/ollama/openrouter (the only three `services.
+    residency.resolve_model_region()`/`services.response_cache.
     resolve_cache_residency_zone()` actually read region data out of; see
-    those functions' own docstrings), and `None` there too if no key is
+    those functions' own docstrings - openrouter added alongside its
+    admin-configurable `trusted_provider_region`, see `schemas.
+    provider_key.OpenRouterKeyRequest`), and `None` there too if no key is
     configured yet. Shared by `check_residency()` and `check_response_
     cache()` below (Fix 4, security review finding) so both perform the
     SAME real lookup rather than one doing the real thing and the other
     hardcoding `None`."""
-    if route.provider not in ("vertex_ai", "ollama"):
+    if route.provider not in ("vertex_ai", "ollama", "openrouter"):
         return None
     key_row = await provider_keys_service.get_key(session, route.provider)
     return key_row.key_metadata if key_row is not None else None
@@ -387,11 +404,10 @@ async def check_residency(
     """Enforce data-residency (Phase 3, design doc section 3.2/3.3).
 
     Region resolution needs the target provider's non-secret `key_metadata`
-    for vertex_ai/ollama only (openai/anthropic are a static in-process
-    lookup, openrouter is always unknown - see `services.residency.
-    resolve_model_region`), so unlike `check_model_policy()` this is NOT
-    zero-I/O - but it is a single non-secret metadata read, no decryption,
-    cheaper than `fetch_credential()`.
+    for vertex_ai/ollama/openrouter only (openai/anthropic are a static
+    in-process lookup - see `services.residency.resolve_model_region`), so
+    unlike `check_model_policy()` this is NOT zero-I/O - but it is a single
+    non-secret metadata read, no decryption, cheaper than `fetch_credential()`.
 
     Raises `errors.ResidencyViolationError` (403) on a hard-block violation
     - never a silent reroute (AC3.6). On EITHER outcome (hard_block or warn,
@@ -834,6 +850,10 @@ async def call_provider_with_failover(
         can_retry = selected.is_primary and failover_applies and selected.failover_target_id is not None
         if not can_retry:
             raise
+        # `can_retry` proves `failover_target_id is not None`, but mypy
+        # can't narrow through the intermediate bool - it's a real
+        # invariant, just re-asserted directly for the type checker.
+        assert selected.failover_target_id is not None
         detected_at = datetime.now(timezone.utc)
         backup = await provider_keys_service.get_key_by_id(session, selected.failover_target_id)
         if backup is None:
@@ -923,6 +943,214 @@ async def call_self_hosted_provider(
     return FailoverCallResult(result=result, attempt=0, used_key_id=None)
 
 
+# ---------------------------------------------------------------------------
+# Model Catalog + Cross-Provider Fallback Chains (Part B) - see
+# `gatekey/model-catalog-fallback-chains-technical-design.md` section 2.5.
+# `dispatch_with_model_fallback()` wraps `call_provider_with_failover`/
+# `call_self_hosted_provider` above - a fourth sibling in that "wraps the
+# credential-fetch/provider-call step" family, not a rewrite of either.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelFallbackResult:
+    """Outcome of `dispatch_with_model_fallback()`. `fallback_attempt=0`
+    (the overwhelming majority of requests, including every request on a
+    model with no configured chain) means the originally-dispatched model's
+    own call succeeded - byte-for-byte pre-this-feature behavior.
+    `fallback_attempt=N>0` means the Nth entry in that model's own
+    `fallback_model_names` (1-indexed) is what actually served the request;
+    `served_route`/`served_model` are THAT candidate's resolved route/name,
+    to be used for every downstream step (cost computation, response-cache
+    key, usage-log `model` column) from this point on - mirrors `effective_
+    route`/`effective_model`'s existing role for graceful degradation."""
+
+    failover: FailoverCallResult
+    served_route: ModelRoute
+    served_model: str
+    fallback_attempt: int
+    fallback_from_model: str | None  # the model whose chain was walked, iff fallback_attempt > 0
+
+
+async def dispatch_with_model_fallback(
+    session: AsyncSession,
+    app: FastAPI,
+    ctx: GatewayCallerContext,
+    *,
+    original_route: ModelRoute,
+    original_model: str,
+    custom_model_cache: CustomModelRouteCache,
+    self_hosted_cache: SelfHostedModelRouteCache | None,
+    model_policy_cache: ModelPolicyCache,
+    team_model_policy_cache: TeamModelPolicyCache,
+    member_model_policy_cache: MemberModelPolicyCache,
+    content_aware_cache: ContentAwareRuleCache,
+    residency_cache: ResidencyRuleCache,
+    category_findings: frozenset[str],
+    source_ip: str | None,
+    request_id: str,
+    key_provider: KeyProvider,
+    health_store: SharedStateStore,
+    team_override_cache: TeamFailoverOverrideCache,
+    build_call_fn: Callable[[ModelRoute], Callable[[ProviderCredential], Awaitable[T]]],
+) -> ModelFallbackResult:
+    """Dispatch `original_route`, and - only on a `ProviderCallError` that
+    escapes same-provider key-level failover - walk `original_model`'s own
+    (single-level, admin-configured) `fallback_model_names` chain, serving
+    the first candidate whose full pipeline pass succeeds (Model Catalog
+    technical design doc section 2.5).
+
+    Mechanic:
+      1. Dispatch the ORIGINAL hop exactly as today: `call_self_hosted_
+         provider` or `call_provider_with_failover` (whichever `original_
+         route.provider` selects), `call_fn=build_call_fn(original_route)`.
+         Success -> return immediately with `fallback_attempt=0` - this is
+         the only code path every existing request without a configured
+         chain ever takes, and it is byte-for-byte today's call site, just
+         relocated one level of indirection inward.
+      2. `ProviderCallError` from step 1 (same-provider key failover, if
+         any applied, has ALREADY been exhausted for the original model -
+         this function never touches `call_provider_with_failover`'s own
+         internals, it only reacts to what escapes it): capture the
+         exception as `primary_exc`. Look up `custom_model_cache.get(
+         original_model)`'s `.fallback_model_names` if `original_route.
+         custom_model_id is not None`, else `()` - bound ONCE, here, before
+         the loop below; NEVER re-read inside it (the single-level
+         enforcement point - see `services.custom_models.
+         CustomModelCacheEntry`'s docstring).
+      3. For each `candidate_name` in that (already write-time-capped-at-5)
+         list, in order: `resolve_route()` it (on `ModelNotFoundError` -
+         routability can change after write time, see `CustomModelFallback
+         UnresolvableModelError`'s docstring - skip to the next candidate),
+         then re-run the FULL per-model pipeline against it - `check_model_
+         policy()`, `check_content_classification()` (reusing `category_
+         findings`, never re-scanned - see below), `check_residency()`,
+         `check_budget_available()` - then dispatch
+         (`call_self_hosted_provider`/`call_provider_with_failover` again).
+         Any of `ModelNotFoundError`, `ModelDeniedError`, `Residency
+         ViolationError`, `BudgetExhaustedError`, `OrgBudgetExhaustedError`,
+         `TeamMembershipRemovedError`, `ProviderNotConfiguredError`,
+         `ProviderCallError` raised by that candidate's own pass -> skip to
+         the next candidate. This is deliberate and uniform: ANY real reason
+         a specific candidate can't serve this request is "skip and try the
+         next one," not "abort the whole chain" - each of these checks still
+         performs and commits its OWN synchronous audit entry as part of its
+         normal contract, unaffected by this function swallowing the
+         exception afterward (mirrors `revalidate_degraded_model()`'s
+         existing, narrower version of the identical tolerance).
+      4. Every candidate exhausted (or the chain was empty to begin with):
+         re-raise `primary_exc` UNCHANGED - the ORIGINAL model's own
+         `ProviderCallError`, propagating out of this function exactly as it
+         does today with no chain configured at all.
+
+    DLP scan is never re-run per hop: `category_findings` (computed once,
+    before this function is ever called, from the ORIGINAL prompt text) does
+    not change across hops (only the destination changes, not the content
+    being sent) - generalizes `revalidate_degraded_model()`'s identical
+    reuse of `category_findings` for degradation's single substitution.
+
+    Budget check DOES re-run per hop, even though it is not model-specific
+    (it's per-user/per-team/per-org) - it re-validates that the caller
+    hasn't crossed a hard budget boundary SINCE the original dispatch
+    attempt (a concurrent request from the same user/team could have pushed
+    them over budget in the intervening round trip). A trip mid-chain is
+    treated as skip-and-continue like everything else in step 3, not a
+    chain-level abort - total exhaustion still surfaces the primary's
+    original error, never a budget error the client never asked about.
+    """
+
+    async def _dispatch(route: ModelRoute) -> FailoverCallResult:
+        call_fn = build_call_fn(route)
+        if route.provider == "self_hosted":
+            return await call_self_hosted_provider(
+                session, route=route, key_provider=key_provider, call_fn=call_fn
+            )
+        return await call_provider_with_failover(
+            session,
+            app,
+            route=route,
+            org_id=ctx.org_id,
+            team_id=ctx.team_id,
+            request_id=request_id,
+            key_provider=key_provider,
+            health_store=health_store,
+            team_override_cache=team_override_cache,
+            call_fn=call_fn,
+        )
+
+    try:
+        failover = await _dispatch(original_route)
+    except ProviderCallError as primary_exc:
+        # Step 2: bound EXACTLY ONCE, here, before the loop - see this
+        # function's docstring / `CustomModelCacheEntry`'s docstring for why
+        # this is what structurally enforces single-level-only fallback.
+        candidates: tuple[str, ...] = ()
+        if original_route.custom_model_id is not None:
+            original_entry = custom_model_cache.get(original_model)
+            if original_entry is not None:
+                candidates = original_entry.fallback_model_names
+
+        for position, candidate_name in enumerate(candidates, start=1):
+            try:
+                candidate_route = resolve_route(
+                    candidate_name,
+                    self_hosted_cache=self_hosted_cache,
+                    custom_model_cache=custom_model_cache,
+                )
+                check_model_policy(
+                    candidate_name,
+                    model_policy_cache,
+                    team_model_policy_cache,
+                    ctx.team_id,
+                    member_model_policy_cache,
+                    ctx.user_id,
+                )
+                check_content_classification(
+                    candidate_name, content_aware_cache, category_findings=category_findings
+                )
+                await check_residency(
+                    session,
+                    candidate_route,
+                    cache=residency_cache,
+                    team_id=ctx.team_id,
+                    org_id=ctx.org_id,
+                    actor_user_id=ctx.user_id,
+                    actor_label=ctx.name,
+                    source_ip=source_ip,
+                )
+                await check_budget_available(session, ctx.user_id, team_id=ctx.team_id)
+                candidate_failover = await _dispatch(candidate_route)
+            except (
+                ModelNotFoundError,
+                ModelDeniedError,
+                ResidencyViolationError,
+                BudgetExhaustedError,
+                OrgBudgetExhaustedError,
+                TeamMembershipRemovedError,
+                ProviderNotConfiguredError,
+                ProviderCallError,
+            ):
+                continue
+            return ModelFallbackResult(
+                failover=candidate_failover,
+                served_route=candidate_route,
+                served_model=candidate_name,
+                fallback_attempt=position,
+                fallback_from_model=original_model,
+            )
+        # Step 4: every candidate exhausted (or the chain was empty) -
+        # re-raise the ORIGINAL model's own error, completely unchanged.
+        raise primary_exc
+
+    return ModelFallbackResult(
+        failover=failover,
+        served_route=original_route,
+        served_model=original_model,
+        fallback_attempt=0,
+        fallback_from_model=None,
+    )
+
+
 async def check_budget_available(
     session: AsyncSession, user_id: uuid.UUID, team_id: uuid.UUID | None = None
 ) -> None:
@@ -955,24 +1183,40 @@ async def check_budget_available(
     (a single indexed point lookup vs. decrypt), so the existing ordering
     still saves work on the reject path.
 
+    Org-wide safeguard (added alongside migration `0045`): checked FIRST,
+    below, before the per-user/per-team-membership check above it in this
+    docstring's ordering - cheapest possible early-exit for the worst case
+    (the whole org is out of budget), and it's the outermost boundary
+    conceptually. Same "not cacheable, one more indexed point lookup"
+    cost acceptance as the per-user/per-team-membership check - a
+    permanent added round trip on EVERY gateway request, accepted
+    deliberately in exchange for a real circuit breaker instead of only an
+    alert (unlike `Team.budget_ceiling_usd`, which only ever alerts, never
+    blocks - see `services.budget.get_org_budget_state`'s docstring).
+
     Call this only *after* `resolve_route()`, `check_model_policy()`, and
     the endpoint's own capability/provider check have already succeeded,
     and *before* `fetch_credential()` - see module docstring.
     """
+    org_state = await budget_service.get_org_budget_state(session)
+    if budget_service.is_budget_exhausted(org_state):
+        assert org_state.budget_usd is not None
+        raise OrgBudgetExhaustedError(
+            budget_usd=org_state.budget_usd, current_spend_usd=org_state.current_spend_usd
+        )
+
     state: budget_service.UserBudgetState | budget_service.TeamMembershipBudgetState | None
     if team_id is not None:
         state = await budget_service.get_team_membership_budget_state(
             session, team_id=team_id, user_id=user_id
         )
         if state is None:
-            # Guaranteed by construction (design doc section 3.1): a
-            # personal/team-attributed key can only be created while its
-            # owner holds this membership, and membership removal is
-            # blocked while such a key exists (ADR-4).
-            raise AssertionError(
-                f"authenticated caller's (team_id={team_id}, user_id={user_id}) "
-                "does not reference an existing team membership"
-            )
+            # Added by `0049` (soft-delete): a REAL, reachable case now -
+            # removing a member takes effect immediately, no longer gated
+            # on revoking their keys first (ADR-4 dropped) - the key
+            # itself still authenticates, this is what actually cuts
+            # access. Never an assertion/crash.
+            raise TeamMembershipRemovedError()
         if await team_periods.ensure_current_period(session, state.period):
             # A boundary crossing was just applied - the spend counters were
             # reset; re-read so the exhaustion check sees post-reset state.
@@ -980,10 +1224,8 @@ async def check_budget_available(
                 session, team_id=team_id, user_id=user_id
             )
             if state is None:
-                raise AssertionError(
-                    f"team membership (team_id={team_id}, user_id={user_id}) "
-                    "vanished during period rollover"
-                )
+                # Same real case as above - removed between the two reads.
+                raise TeamMembershipRemovedError()
     else:
         state = await budget_service.get_budget_state(session, user_id)
         if state is None:
@@ -1044,6 +1286,12 @@ async def record_usage_charge(
     == "self_hosted"` - `None` (every other request) preserves byte-for-byte
     pre-Phase-5 behavior (`compute_cost()` still runs against `model`).
 
+    Org-wide safeguard (added alongside migration `0045`): this being the
+    single shared choke point is ALSO why `record_org_usage_charge` is
+    called unconditionally here (not inside either branch above) - every
+    charge, legacy-flat-user or team-scoped, counts against the org total.
+    See `check_budget_available`'s matching org-level check above.
+
     BD-18 (threshold alerts): this is the single shared choke point every
     gateway charge - all three routes, streaming and non-streaming - flows
     through, so the threshold-crossing check is wired exactly ONCE here.
@@ -1100,6 +1348,14 @@ async def record_usage_charge(
             notifiers.schedule_threshold_alerts(
                 background_tasks, app, team_id=team_id, charge=result
             )
+
+    # Org-wide safeguard (added alongside migration `0045`): ALWAYS charged,
+    # regardless of the branch above - the org total must catch spend from
+    # every path, not just team-scoped ones. Its own commit (see
+    # `record_org_usage_charge`'s docstring for why that's safe/accepted).
+    org_charge = await budget_service.record_org_usage_charge(session, cost=result.cost)
+    if background_tasks is not None and app is not None:
+        notifiers.schedule_org_threshold_alerts(background_tasks, app, charge=org_charge)
 
     if org_id is not None and rate_limit_store is not None and rate_limit_cache is not None:
         await rate_limit_service.record_token_usage(
@@ -1258,6 +1514,18 @@ def build_failover_headers(failover: FailoverCallResult) -> dict[str, str]:
     headers = {"X-Failover-Attempt": str(failover.attempt)}
     if failover.used_key_id is not None:
         headers["X-Failover-Used-Key"] = str(failover.used_key_id)
+    return headers
+
+
+def build_model_fallback_headers(result: ModelFallbackResult) -> dict[str, str]:
+    """Model Catalog technical design doc section 2.6, mirroring `build_
+    failover_headers()`'s always-present-attempt/present-only-if-used shape:
+    `X-Gatekey-Model-Fallback-Attempt` is always present (`"0"` on the
+    overwhelming majority of requests); `X-Gatekey-Model-Fallback-From` is
+    present only when a fallback candidate actually served the request."""
+    headers = {"X-Gatekey-Model-Fallback-Attempt": str(result.fallback_attempt)}
+    if result.fallback_from_model is not None:
+        headers["X-Gatekey-Model-Fallback-From"] = result.fallback_from_model
     return headers
 
 
@@ -1566,6 +1834,7 @@ async def revalidate_degraded_model(
     degraded_route: ModelRoute,
     model_policy_cache: ModelPolicyCache,
     team_model_policy_cache: TeamModelPolicyCache,
+    member_model_policy_cache: MemberModelPolicyCache,
     content_aware_cache: ContentAwareRuleCache,
     residency_cache: ResidencyRuleCache,
     category_findings: frozenset[str],
@@ -1591,7 +1860,14 @@ async def revalidate_degraded_model(
     that does not depend on which model is targeted.
     """
     try:
-        check_model_policy(degraded_model, model_policy_cache, team_model_policy_cache, ctx.team_id)
+        check_model_policy(
+            degraded_model,
+            model_policy_cache,
+            team_model_policy_cache,
+            ctx.team_id,
+            member_model_policy_cache,
+            ctx.user_id,
+        )
         check_content_classification(degraded_model, content_aware_cache, category_findings=category_findings)
         await check_residency(
             session,
@@ -1637,10 +1913,11 @@ async def raise_hard_budget_block_after_degradation_skip(
             session, team_id=team_id, user_id=user_id
         )
         if state is None:
-            raise AssertionError(
-                f"authenticated caller's (team_id={team_id}, user_id={user_id}) "
-                "does not reference an existing team membership"
-            )
+            # Added by `0049` (soft-delete) - narrow race (removed between
+            # `check_budget_available()`'s own check earlier this request
+            # and here), but a real one now - see that function's identical
+            # handling.
+            raise TeamMembershipRemovedError()
     else:
         state = await budget_service.get_budget_state(session, user_id=user_id)
     # Guaranteed by `check_and_apply_degradation()` only ever triggering on

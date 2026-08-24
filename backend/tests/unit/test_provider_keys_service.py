@@ -152,6 +152,28 @@ def test_build_key_metadata_openai_anthropic_openrouter_is_empty():
     assert _build_key_metadata("openrouter", {"api_key": "sk-abc"}) == {}
 
 
+def test_build_key_metadata_openrouter_carries_trusted_providers_when_configured():
+    metadata = _build_key_metadata(
+        "openrouter",
+        {
+            "api_key": "sk-abc-should-not-appear",
+            "trusted_provider_slugs": ["openai", "anthropic"],
+            "trusted_provider_region": "us",
+        },
+    )
+    assert metadata == {"trusted_provider_slugs": ["openai", "anthropic"], "trusted_provider_region": "us"}
+    assert "sk-abc-should-not-appear" not in json.dumps(metadata)
+
+
+def test_build_key_metadata_openrouter_ignores_region_without_slugs():
+    """Defense-in-depth re-check - should be unreachable via the schema's
+    own set-together-or-not-at-all validation."""
+    metadata = _build_key_metadata(
+        "openrouter", {"api_key": "sk-abc", "trusted_provider_region": "us", "trusted_provider_slugs": []}
+    )
+    assert metadata == {}
+
+
 def test_build_key_metadata_ollama_carries_base_url_not_bearer_token():
     metadata = _build_key_metadata(
         "ollama", {"base_url": "http://localhost:11434", "bearer_token": "should-not-appear"}
