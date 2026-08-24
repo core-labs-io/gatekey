@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-24
+
 ### Added
 - `GET /v1/models` (and `/v1/models/{model}`): OpenAI-compatible model
   discovery for gateway keys, filtered by the caller's effective org+team

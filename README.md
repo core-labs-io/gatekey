@@ -1,5 +1,9 @@
 # Gatekey
 
+[![CI](https://github.com/core-labs-io/gatekey/actions/workflows/ci.yml/badge.svg)](https://github.com/core-labs-io/gatekey/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/core-labs-io/gatekey)](https://github.com/core-labs-io/gatekey/releases)
+
 **A self-hostable enterprise AI gateway.** Bring your own provider API keys
 (OpenAI, Anthropic, Google Vertex AI, OpenRouter) or point it at self-hosted
 inference (vLLM, Ollama); Gatekey sits in the middle as a unified,
