@@ -419,6 +419,63 @@
         "title": "AuditVerifyResponse",
         "type": "object"
       },
+      "AvailableModelEntry": {
+        "additionalProperties": false,
+        "description": "One entry in a provider's live \"what models does it actually have\"\ncatalog - returned by `GET /v1/admin/custom-models/available/{provider}`\n(`services.model_catalog.list_available_models()`). See the Model\nCatalog technical design doc section 1.2 for the full \"known static\nprice\" rationale this shape exists to support.\n\n`input_price_per_million_usd`/`output_price_per_million_usd` are\nnon-`None` whenever the backend has ANY authoritative price for this\nentry (a live OpenRouter figure, or a `MODEL_REGISTRY`/`PRICING_TABLE`\nmatch for OpenAI/Anthropic) and `None` otherwise - deliberately not a\nseparate \"is this known\" boolean; see the design doc section 1.2 for why\nthat's a strictly worse contract for the frontend. This module must\nnever import `providers.pricing.PRICING_TABLE` (unlike `MODEL_REGISTRY`,\nalready imported above for `is_shadowed_by_registry`) - the\n`MODEL_REGISTRY`-to-`PRICING_TABLE` reverse-index join that fills these\ntwo fields in for OpenAI/Anthropic lives entirely in\n`services/model_catalog.py`, not here; this schema only describes the\nresponse shape.\n\n`routable_as` (Model Policy \"select models to enable\" picker): the\nGatekey-facing model NAME this entry is already routable under - a\n`MODEL_REGISTRY` key, or a verified Custom Model's `name` - or `None` if\nthis entry has never been registered/priced in Gatekey at all, so it\ncannot yet be added to org model policy (`PUT /v1/admin/model-policy`\nonly accepts already-routable names). `None` here means \"register this\nas a Custom Model first,\" not \"unavailable\" - the live provider itself\noffers it, Gatekey just doesn't have a price for it yet. Computed\nentirely in `services/model_catalog.py` (same \"no PRICING_TABLE/DB\nlogic in this schema module\" discipline as the two price fields above).",
+        "properties": {
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "input_price_per_million_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Price Per Million Usd"
+          },
+          "native_model_id": {
+            "title": "Native Model Id",
+            "type": "string"
+          },
+          "output_price_per_million_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Price Per Million Usd"
+          },
+          "routable_as": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Routable As"
+          }
+        },
+        "required": [
+          "native_model_id",
+          "display_name",
+          "input_price_per_million_usd",
+          "output_price_per_million_usd"
+        ],
+        "title": "AvailableModelEntry",
+        "type": "object"
+      },
       "BackupGroupCreate": {
         "properties": {
           "keys": {
@@ -1086,7 +1143,7 @@
         "type": "object"
       },
       "ChatMessage": {
-        "description": "A single chat message. Text-only in 1.2 - no tool calls, no\nmulti-part/vision content.",
+        "description": "A single chat message. Text-only in 1.2 - no tool calls, no\nvision content. `content` accepts either a bare string or the OpenAI\n\"content parts\" array shape (flattened to a string) - see module\ndocstring.",
         "properties": {
           "content": {
             "title": "Content",
@@ -1429,6 +1486,14 @@
             "title": "Capability",
             "type": "string"
           },
+          "fallback_model_names": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5,
+            "title": "Fallback Model Names",
+            "type": "array"
+          },
           "input_price_per_million_usd": {
             "anyOf": [
               {
@@ -1515,6 +1580,13 @@
             "title": "Created At",
             "type": "string"
           },
+          "fallback_model_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Fallback Model Names",
+            "type": "array"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
@@ -1591,6 +1663,7 @@
           "pricing_as_of",
           "verified",
           "shadowed_by_registry",
+          "fallback_model_names",
           "created_at",
           "updated_at"
         ],
@@ -1599,7 +1672,7 @@
       },
       "CustomModelUpdateRequest": {
         "additionalProperties": false,
-        "description": "Every field is optional - omitted means \"leave unchanged\", identical\ndiscipline to `SelfHostedProviderUpdateRequest`.\n\n`output_price_per_million_usd` is the one field with the same\nNone-vs-omitted ambiguity `SelfHostedProviderUpdateRequest.bearer_token`\nhas (a `capability` edit from `\"chat\"` to `\"embeddings\"` must be able to\nexplicitly clear a previously-required price to `null`) - callers must\ninspect `model_fields_set` (same as that field's `bearer_token_provided`\nprecedent) rather than a bare `is not None` check, and pass the result\nto `services.custom_models.edit_custom_model`'s\n`output_price_per_million_usd_provided` parameter.",
+        "description": "Every field is optional - omitted means \"leave unchanged\", identical\ndiscipline to `SelfHostedProviderUpdateRequest`.\n\n`output_price_per_million_usd` is the one field with the same\nNone-vs-omitted ambiguity `SelfHostedProviderUpdateRequest.bearer_token`\nhas (a `capability` edit from `\"chat\"` to `\"embeddings\"` must be able to\nexplicitly clear a previously-required price to `null`) - callers must\ninspect `model_fields_set` (same as that field's `bearer_token_provided`\nprecedent) rather than a bare `is not None` check, and pass the result\nto `services.custom_models.edit_custom_model`'s\n`output_price_per_million_usd_provided` parameter.\n\n`fallback_model_names` (Model Catalog + Cross-Provider Fallback Chains,\nPart B) has the identical `model_fields_set`-based provided-vs-omitted\ndisambiguation - an edit must be able to explicitly clear a chain back to\n`[]`, which a bare `is not None` check can't distinguish from \"omitted\".\nThreaded through to `services.custom_models.edit_custom_model`'s\n`fallback_model_names_provided` parameter.",
         "properties": {
           "capability": {
             "anyOf": [
@@ -1615,6 +1688,21 @@
               }
             ],
             "title": "Capability"
+          },
+          "fallback_model_names": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 5,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fallback Model Names"
           },
           "input_price_per_million_usd": {
             "anyOf": [
@@ -1973,6 +2061,26 @@
           "status"
         ],
         "title": "DevicePollResponse",
+        "type": "object"
+      },
+      "DeviceStartRequest": {
+        "additionalProperties": false,
+        "description": "`POST /v1/auth/device/start` optional body (added by `0047`) -\n`device_label` is self-reported by the CLI (the machine being paired\nknows its own hostname; the approving browser doesn't) and later\nstamped onto the minted `PersonalApiKey.device_label`. Every field\noptional / the body itself optional - existing CLI-sync clients that\nsend no body at all must keep working unchanged.",
+        "properties": {
+          "device_label": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Label"
+          }
+        },
+        "title": "DeviceStartRequest",
         "type": "object"
       },
       "DeviceStartResponse": {
@@ -2955,7 +3063,8 @@
             "enum": [
               "resolved",
               "pending_profile",
-              "pending_approval"
+              "pending_approval",
+              "pending_alert_email"
             ],
             "title": "Onboarding Status",
             "type": "string"
@@ -3208,6 +3317,134 @@
         "title": "OnboardingTeamResponse",
         "type": "object"
       },
+      "OrgAlertConfigPutRequest": {
+        "additionalProperties": false,
+        "description": "`PUT /v1/admin/org-settings/alert-config` body. `webhook_url`\nsemantics (via `model_fields_set`) mirror `TeamAlertConfigPutRequest`\nexactly: omitted = keep the stored URL; a string = replace (re-encrypted\nat rest); explicit `null` = clear.",
+        "properties": {
+          "email_enabled": {
+            "title": "Email Enabled",
+            "type": "boolean"
+          },
+          "threshold_100_enabled": {
+            "title": "Threshold 100 Enabled",
+            "type": "boolean"
+          },
+          "threshold_50_enabled": {
+            "title": "Threshold 50 Enabled",
+            "type": "boolean"
+          },
+          "threshold_75_enabled": {
+            "title": "Threshold 75 Enabled",
+            "type": "boolean"
+          },
+          "webhook_enabled": {
+            "title": "Webhook Enabled",
+            "type": "boolean"
+          },
+          "webhook_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Webhook Url"
+          }
+        },
+        "required": [
+          "threshold_50_enabled",
+          "threshold_75_enabled",
+          "threshold_100_enabled",
+          "webhook_enabled",
+          "email_enabled"
+        ],
+        "title": "OrgAlertConfigPutRequest",
+        "type": "object"
+      },
+      "OrgAlertConfigResponse": {
+        "description": "Never carries the webhook URL in any form - `webhook_configured` is\nthe only signal, same rationale as `TeamAlertConfigResponse`.\n\n50/75/100% (added by `0046`) - deliberately NOT the same threshold set\n`TeamAlertConfigResponse` uses (80/100) - see that migration's\ndocstring.",
+        "properties": {
+          "email_enabled": {
+            "title": "Email Enabled",
+            "type": "boolean"
+          },
+          "threshold_100_enabled": {
+            "title": "Threshold 100 Enabled",
+            "type": "boolean"
+          },
+          "threshold_50_enabled": {
+            "title": "Threshold 50 Enabled",
+            "type": "boolean"
+          },
+          "threshold_75_enabled": {
+            "title": "Threshold 75 Enabled",
+            "type": "boolean"
+          },
+          "webhook_configured": {
+            "title": "Webhook Configured",
+            "type": "boolean"
+          },
+          "webhook_enabled": {
+            "title": "Webhook Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "threshold_50_enabled",
+          "threshold_75_enabled",
+          "threshold_100_enabled",
+          "webhook_enabled",
+          "webhook_configured",
+          "email_enabled"
+        ],
+        "title": "OrgAlertConfigResponse",
+        "type": "object"
+      },
+      "OrgAlertEmailPutRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "email": {
+            "maxLength": 320,
+            "minLength": 3,
+            "title": "Email",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email"
+        ],
+        "title": "OrgAlertEmailPutRequest",
+        "type": "object"
+      },
+      "OrgAlertEmailResponse": {
+        "properties": {
+          "alert_recipient_email": {
+            "title": "Alert Recipient Email",
+            "type": "string"
+          }
+        },
+        "required": [
+          "alert_recipient_email"
+        ],
+        "title": "OrgAlertEmailResponse",
+        "type": "object"
+      },
+      "OrgResetSpendResponse": {
+        "properties": {
+          "current_spend_usd": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Current Spend Usd",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_spend_usd"
+        ],
+        "title": "OrgResetSpendResponse",
+        "type": "object"
+      },
       "OrgRoleResponse": {
         "properties": {
           "id": {
@@ -3324,6 +3561,17 @@
       },
       "OrgSettingsResponse": {
         "properties": {
+          "alert_recipient_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alert Recipient Email"
+          },
           "auto_provision_personal_key_on_approval": {
             "title": "Auto Provision Personal Key On Approval",
             "type": "boolean"
@@ -3342,6 +3590,11 @@
           },
           "currency": {
             "title": "Currency",
+            "type": "string"
+          },
+          "current_spend_usd": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Current Spend Usd",
             "type": "string"
           },
           "max_self_serve_key_expiration_days": {
@@ -3365,7 +3618,9 @@
           "currency",
           "max_self_serve_key_expiration_days",
           "personal_key_soft_cap",
-          "auto_provision_personal_key_on_approval"
+          "auto_provision_personal_key_on_approval",
+          "current_spend_usd",
+          "alert_recipient_email"
         ],
         "title": "OrgSettingsResponse",
         "type": "object"
@@ -4148,6 +4403,82 @@
           "to_new_budget_usd"
         ],
         "title": "ReassignBudgetResponse",
+        "type": "object"
+      },
+      "RegistryModelEntry": {
+        "additionalProperties": false,
+        "description": "One static `MODEL_REGISTRY` entry - `name` (Gatekey's own registry\nkey) paired with `provider`, so a caller can group/filter registry\nmodels by provider without hand-maintaining its own copy of that\nmapping. Distinct from the plain `list[str]` `registry-model-names`\nendpoint above: that one exists for the fallback-chain picker (which\nonly ever needs names, never provider grouping); this one exists for\nModel Policy's provider-scoped checklist, specifically for `vertex_ai`\n(the one BYOK provider with no live-listing support - `services.\nmodel_catalog.CustomModelLiveListingUnsupportedError` - so its Model\nPolicy checklist has no live alternative and must be sourced from this\nalways-current, zero-I/O registry dump instead of a hand-typed\nfrontend list).",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "provider"
+        ],
+        "title": "RegistryModelEntry",
+        "type": "object"
+      },
+      "RemovedTeamMemberResponse": {
+        "description": "`GET /v1/teams/{team_id}/members/removed` - the restore-UI\ncounterpart to `TeamMemberResponse` (added by `0049`).",
+        "properties": {
+          "budget_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Usd"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "current_spend_usd": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Current Spend Usd",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "removed_at": {
+            "format": "date-time",
+            "title": "Removed At",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "user_id": {
+            "format": "uuid",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "name",
+          "role",
+          "budget_usd",
+          "current_spend_usd",
+          "created_at",
+          "removed_at"
+        ],
+        "title": "RemovedTeamMemberResponse",
         "type": "object"
       },
       "ResidencyRulePutRequest": {
@@ -5702,6 +6033,55 @@
         "title": "TeamMemberAddRequest",
         "type": "object"
       },
+      "TeamMemberModelRestrictionsPutRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "models": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models"
+        ],
+        "title": "TeamMemberModelRestrictionsPutRequest",
+        "type": "object"
+      },
+      "TeamMemberModelRestrictionsResponse": {
+        "description": "`team_baseline` = every model this member's TEAM can currently use\n(org baseline intersected with the team's own restriction, if any) -\nthe effective set a member overlay is allowed to narrow further, never\nwiden beyond. `member_restriction` = this member's own narrowing\nallowlist, or null = no restriction row (the team baseline applies to\nthem unchanged) - same \"null = no further restriction\" convention\n`TeamModelRestrictionsResponse.team_restriction` already establishes one\nlayer up.",
+        "properties": {
+          "member_restriction": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Member Restriction"
+          },
+          "team_baseline": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Team Baseline",
+            "type": "array"
+          }
+        },
+        "required": [
+          "team_baseline",
+          "member_restriction"
+        ],
+        "title": "TeamMemberModelRestrictionsResponse",
+        "type": "object"
+      },
       "TeamMemberResponse": {
         "properties": {
           "budget_usd": {
@@ -5839,6 +6219,45 @@
         "title": "TeamMemberUsageResponse",
         "type": "object"
       },
+      "TeamMembershipSummary": {
+        "description": "One active `TeamMembership` a `UserResponse` belongs to - see that\nfield's docstring below for why this exists.",
+        "properties": {
+          "budget_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Usd"
+          },
+          "current_spend_usd": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Current Spend Usd",
+            "type": "string"
+          },
+          "team_id": {
+            "format": "uuid",
+            "title": "Team Id",
+            "type": "string"
+          },
+          "team_name": {
+            "title": "Team Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "team_id",
+          "team_name",
+          "budget_usd",
+          "current_spend_usd"
+        ],
+        "title": "TeamMembershipSummary",
+        "type": "object"
+      },
       "TeamModelRestrictionsPutRequest": {
         "additionalProperties": false,
         "properties": {
@@ -5857,7 +6276,7 @@
         "type": "object"
       },
       "TeamModelRestrictionsResponse": {
-        "description": "`org_baseline` = every registry model the org policy currently\nallows; `team_restriction` = the team's narrowing allowlist, or null =\nno restriction row (org baseline applies unchanged).",
+        "description": "`org_baseline` = every model (static registry, plus any verified\nself-hosted/custom model) the org policy currently allows;\n`team_restriction` = the team's narrowing allowlist, or null = no\nrestriction row (org baseline applies unchanged).",
         "properties": {
           "org_baseline": {
             "items": {
@@ -6148,6 +6567,188 @@
         "title": "TeamUsageResponse",
         "type": "object"
       },
+      "UsageLogItemResponse": {
+        "properties": {
+          "client_user_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client User Agent"
+          },
+          "cost_usd": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Usd"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "device_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Label"
+          },
+          "endpoint": {
+            "title": "Endpoint",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "source_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Ip"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "success": {
+            "title": "Success",
+            "type": "boolean"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "user_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Name"
+          }
+        },
+        "required": [
+          "id",
+          "request_id",
+          "created_at",
+          "user_id",
+          "user_name",
+          "team_id",
+          "endpoint",
+          "provider",
+          "model",
+          "status",
+          "success",
+          "cost_usd",
+          "source_ip",
+          "client_user_agent",
+          "device_label"
+        ],
+        "title": "UsageLogItemResponse",
+        "type": "object"
+      },
+      "UsageLogsPageResponse": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/UsageLogItemResponse"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "page_size": {
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "entries",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "title": "UsageLogsPageResponse",
+        "type": "object"
+      },
       "UsageSummaryResponse": {
         "properties": {
           "avg_latency_ms": {
@@ -6323,6 +6924,14 @@
               }
             ],
             "title": "Org Role"
+          },
+          "team_memberships": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/TeamMembershipSummary"
+            },
+            "title": "Team Memberships",
+            "type": "array"
           },
           "updated_at": {
             "format": "date-time",
@@ -8202,6 +8811,129 @@
           }
         ],
         "summary": "Register Custom Model Endpoint",
+        "tags": [
+          "admin",
+          "custom-models"
+        ]
+      }
+    },
+    "/v1/admin/custom-models/available/{provider}": {
+      "get": {
+        "description": "Live per-provider model catalog lookup (Model Catalog technical\ndesign doc section 1.3/1.5) - `services.model_catalog.\nlist_available_models()` does all the real work (credential fetch,\ndispatch, pricing reverse-index join); this handler is a thin wire-up,\nidentical in spirit to `verify_custom_model_endpoint`'s own\n`key_provider`/`http_client` dependency wiring above.\n\nPurely informational, no side effect of any kind - no DB write, no\naudit entry (unlike `verify_custom_model_endpoint`, which DOES write\none because it performs a real, billable-adjacent provider probe; this\nendpoint never calls `verify_custom_model()` or anything that mutates a\n`custom_models` row). Path placed BEFORE `/{custom_model_id}` below only\nfor readability (both routes are unambiguous regardless of declaration\norder - two path segments here vs. one there - but grouping the static\n`available/...` route near the top mirrors this router's own top-to-\nbottom \"list, then read-by-id, then write\" narrative).",
+        "operationId": "list_available_models_endpoint_v1_admin_custom_models_available__provider__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "enum": [
+                "openai",
+                "anthropic",
+                "vertex_ai",
+                "openrouter"
+              ],
+              "title": "Provider",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AvailableModelEntry"
+                  },
+                  "title": "Response List Available Models Endpoint V1 Admin Custom Models Available  Provider  Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Available Models Endpoint",
+        "tags": [
+          "admin",
+          "custom-models"
+        ]
+      }
+    },
+    "/v1/admin/custom-models/registry-model-names": {
+      "get": {
+        "description": "Every static `MODEL_REGISTRY` key, sorted - zero I/O.\n\nExists solely so the admin console's fallback-chain picker (Model\nCatalog technical design doc section 6, task 14) can offer the built-in\nregistry models as fallback TARGETS alongside the org's own custom\nmodels (`GET /v1/admin/custom-models`) and self-hosted model ids (`GET\n/v1/admin/self-hosted-providers`) - both of those already have list\nendpoints; this was the one missing source, since `MODEL_REGISTRY` is a\ncode-only dict with no existing admin-facing enumeration. Deliberately\nNOT `GET /v1/models` (`api/v1/gateway/models.py`) - that endpoint\nrequires a gateway credential (`gk_sk_`/`gk_pk_`), not an admin session,\nand filters to only the caller's OWN policy-allowed models; an admin\nconfiguring a fallback chain needs to see every registry model that\nEXISTS, regardless of any one team's policy narrowing. Path placed\nbefore `/{custom_model_id}` for the same readability reason `available/\n{provider}` above is.",
+        "operationId": "list_registry_model_names_endpoint_v1_admin_custom_models_registry_model_names_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Response List Registry Model Names Endpoint V1 Admin Custom Models Registry Model Names Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Registry Model Names Endpoint",
+        "tags": [
+          "admin",
+          "custom-models"
+        ]
+      }
+    },
+    "/v1/admin/custom-models/registry-models": {
+      "get": {
+        "description": "Every static `MODEL_REGISTRY` entry, `name` paired with `provider`,\nsorted by name - zero I/O. See `RegistryModelEntry`'s docstring: exists\nfor Model Policy's provider-scoped checklist to source `vertex_ai`\n(no live-listing support) from something other than a hand-typed\nfrontend list. Path placed alongside `registry-model-names` above for\nthe same before-`/{custom_model_id}` readability reason.",
+        "operationId": "list_registry_models_endpoint_v1_admin_custom_models_registry_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RegistryModelEntry"
+                  },
+                  "title": "Response List Registry Models Endpoint V1 Admin Custom Models Registry Models Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Registry Models Endpoint",
         "tags": [
           "admin",
           "custom-models"
@@ -10126,6 +10858,154 @@
           }
         ],
         "summary": "Put Org Settings Endpoint",
+        "tags": [
+          "admin",
+          "org-settings"
+        ]
+      }
+    },
+    "/v1/admin/org-settings/alert-config": {
+      "get": {
+        "operationId": "get_org_alert_config_endpoint_v1_admin_org_settings_alert_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgAlertConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Org Alert Config Endpoint",
+        "tags": [
+          "admin",
+          "org-settings"
+        ]
+      },
+      "put": {
+        "operationId": "put_org_alert_config_endpoint_v1_admin_org_settings_alert_config_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrgAlertConfigPutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgAlertConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Put Org Alert Config Endpoint",
+        "tags": [
+          "admin",
+          "org-settings"
+        ]
+      }
+    },
+    "/v1/admin/org-settings/alert-email": {
+      "post": {
+        "description": "The first-SSO-login org_admin onboarding action (`api/v1/auth.py`'s\n`_resolve_post_login_redirect` routes here until this is set) - also\nfreely re-editable afterward like any other org setting. No guidance\ntoward a group address is enforced server-side (there's no reliable\nway to tell a group inbox from a personal one) - the prompt's copy is\nwhere that steering lives, not validation here.",
+        "operationId": "set_org_alert_email_endpoint_v1_admin_org_settings_alert_email_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrgAlertEmailPutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgAlertEmailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Set Org Alert Email Endpoint",
+        "tags": [
+          "admin",
+          "org-settings"
+        ]
+      }
+    },
+    "/v1/admin/org-settings/reset-spend": {
+      "post": {
+        "description": "Explicit, audited clear of the org-wide spend counter - the only way\nit ever goes back to zero (migration `0045`'s docstring: deliberately\nnever automatic, so a still-ongoing leak can't quietly reset itself\naway). Typically used after raising the ceiling or resolving whatever\ntriggered the org-wide block.",
+        "operationId": "reset_org_spend_endpoint_v1_admin_org_settings_reset_spend_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrgResetSpendResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Reset Org Spend Endpoint",
         "tags": [
           "admin",
           "org-settings"
@@ -12838,6 +13718,142 @@
         ]
       }
     },
+    "/v1/admin/usage/requests": {
+      "get": {
+        "description": "Newest-first, filterable request-level detail - `source_ip`/\n`client_user_agent`/`device_label` are the point of this endpoint\n(off-network-usage/leaked-key monitoring); everything else mirrors\n`/summary`'s existing filter/window conventions so the two endpoints\nfeel like one surface.",
+        "operationId": "list_usage_requests_endpoint_v1_admin_usage_requests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "default": "7d",
+              "enum": [
+                "24h",
+                "7d",
+                "30d",
+                "90d",
+                "custom"
+              ],
+              "title": "Range",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End"
+            }
+          },
+          {
+            "in": "query",
+            "name": "user_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "team_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Team Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageLogsPageResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Usage Requests Endpoint",
+        "tags": [
+          "admin",
+          "usage"
+        ]
+      }
+    },
     "/v1/admin/usage/summary": {
       "get": {
         "description": "`range` selects a rolling window ending now (`24h`/`7d`/`30d`/`90d`,\nAC4.5.2 added `90d`), or `range=custom` with explicit `start`/`end`\n(ISO 8601) for an arbitrary window. Phase 2 (section 5.8): optional\n`team_id` narrows every aggregate to one team's usage-log rows. Phase 4\n(AC4.5.2): optional `provider` narrows every aggregate (existing and\nnew) the same way. Response shape is additive-only vs. the Phase 1/2\ncontract (AC4.5.1) - no existing field renamed/removed.",
@@ -13333,8 +14349,25 @@
     },
     "/v1/auth/device/start": {
       "post": {
-        "description": "No auth (AC8a.2) - the CLI has no identity yet at this point.",
+        "description": "No auth (AC8a.2) - the CLI has no identity yet at this point.\n`payload` (and its `device_label`) is entirely optional (added by\n`0047`) - an older CLI-sync client sending no body at all still\nworks unchanged.",
         "operationId": "start_device_auth_v1_auth_device_start_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/DeviceStartRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -13345,6 +14378,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Start Device Auth",
@@ -15375,8 +16418,62 @@
         ]
       }
     },
+    "/v1/teams/{team_id}/members/removed": {
+      "get": {
+        "description": "Restore-UI counterpart to `list_members_endpoint` (added by `0049`).\n`team_lead`-only (not plain `member`) - same gate as removing/restoring\nitself, not the read-only member-list gate.",
+        "operationId": "list_removed_members_endpoint_v1_teams__team_id__members_removed_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RemovedTeamMemberResponse"
+                  },
+                  "title": "Response List Removed Members Endpoint V1 Teams  Team Id  Members Removed Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Removed Members Endpoint",
+        "tags": [
+          "teams"
+        ]
+      }
+    },
     "/v1/teams/{team_id}/members/{user_id}": {
       "delete": {
+        "description": "Soft delete (added by `0049`) - takes effect immediately (every\nsubsequent gateway request on this member's keys 403s), reversible via\n`restore_member_endpoint` below. See `services.teams.remove_team_\nmember`'s docstring for why the old ADR-4 active-key guard is gone.",
         "operationId": "remove_member_endpoint_v1_teams__team_id__members__user_id__delete",
         "parameters": [
           {
@@ -15750,6 +16847,191 @@
         "summary": "Regenerate Member Key",
         "tags": [
           "keys",
+          "teams"
+        ]
+      }
+    },
+    "/v1/teams/{team_id}/members/{user_id}/model-restrictions": {
+      "get": {
+        "description": "A plain `member` session may only fetch their OWN restriction (self-\nview) - a `team_lead` (or the org_admin bypass, which resolves `role`\nto `\"org_admin\"`) may fetch any member's. Mirrors the RBAC posture\n`update_member_endpoint` already applies to per-member budget - see\nthat endpoint for the precedent.",
+        "operationId": "get_member_model_restrictions_endpoint_v1_teams__team_id__members__user_id__model_restrictions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberModelRestrictionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Member Model Restrictions Endpoint",
+        "tags": [
+          "teams"
+        ]
+      },
+      "put": {
+        "description": "Team-lead-only (same as the team-level PUT above) - a member can view\ntheir own restriction but never set it. 422\n`member_model_restricts_team_denied_model` passes straight through from\n`set_member_model_policy` (already carries its own status_code/code - no\nmanual mapping needed, same as every other error this router lets\npropagate). Fetches the membership row FIRST (404 `NotFoundError` if\n`user_id` doesn't currently hold an active membership on `team_id`) both\nto give a clean 404 before any other work AND to get the membership's\nown id for the audit entry's `target_id` - same convention\n`update_member_endpoint`'s per-membership budget audit already\nestablishes (`target_type=\"team_membership\"`, `target_id=str(membership.\nid)`), not a composite string. `set_member_model_policy` re-checks\nmembership internally too (defense in depth - it's a cheap, already-\nindexed lookup, and that function must also be safe to call from\ncontexts that haven't already fetched the row).",
+        "operationId": "put_member_model_restrictions_endpoint_v1_teams__team_id__members__user_id__model_restrictions_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TeamMemberModelRestrictionsPutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberModelRestrictionsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Put Member Model Restrictions Endpoint",
+        "tags": [
+          "teams"
+        ]
+      }
+    },
+    "/v1/teams/{team_id}/members/{user_id}/restore": {
+      "post": {
+        "description": "Undo `remove_member_endpoint` (added by `0049`) - same role, budget,\nand spend history the removal left in place; no key re-issuance\nneeded, the member's existing keys work again immediately.",
+        "operationId": "restore_member_endpoint_v1_teams__team_id__members__user_id__restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Restore Member Endpoint",
+        "tags": [
           "teams"
         ]
       }
